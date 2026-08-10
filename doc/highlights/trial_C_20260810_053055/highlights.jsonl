@@ -1,0 +1,50 @@
+{"type": "H4", "label": "破産", "round": 12, "player": "P01", "detail": "P01がEntry Fee不足で破産脱落", "game_id": "game01"}
+{"type": "H5", "label": "契約締結", "round": 2, "player": "P06", "detail": "契約提案: C_1d529e48", "game_id": "game01"}
+{"type": "H5", "label": "契約締結", "round": 2, "player": "P06", "detail": "契約提案: C_19204f9f", "game_id": "game01"}
+{"type": "H5", "label": "契約締結", "round": 2, "player": "P03", "detail": "契約提案: C_6ac6c8e9", "game_id": "game01"}
+{"type": "H5", "label": "契約締結", "round": 2, "player": "P06", "detail": "契約提案: C_da232714", "game_id": "game01"}
+{"type": "H5", "label": "契約締結", "round": 4, "player": "P03", "detail": "契約提案: C_d366def1", "game_id": "game01"}
+{"type": "H5", "label": "契約締結", "round": 4, "player": "P07", "detail": "契約提案: C_3d5536e5", "game_id": "game01"}
+{"type": "H5", "label": "契約締結", "round": 4, "player": "P08", "detail": "契約提案: C_4e80a47a", "game_id": "game01"}
+{"type": "H5", "label": "契約締結", "round": 4, "player": "P07", "detail": "契約提案: C_082783d8", "game_id": "game01"}
+{"type": "H5", "label": "契約締結", "round": 4, "player": "P08", "detail": "契約提案: C_ce2654f1", "game_id": "game01"}
+{"type": "H5", "label": "契約締結", "round": 4, "player": "P07", "detail": "契約提案: C_143e7c8c", "game_id": "game01"}
+{"type": "H5", "label": "契約締結", "round": 4, "player": "P02", "detail": "契約提案: C_e66e6159", "game_id": "game01"}
+{"type": "H5", "label": "契約締結", "round": 4, "player": "P07", "detail": "契約提案: C_e521a67a", "game_id": "game01"}
+{"type": "H5", "label": "契約締結", "round": 4, "player": "P08", "detail": "契約提案: C_f1c5c798", "game_id": "game01"}
+{"type": "H5", "label": "契約締結", "round": 4, "player": "P02", "detail": "契約提案: C_dff85c0d", "game_id": "game01"}
+{"type": "H5", "label": "契約締結", "round": 4, "player": "P07", "detail": "契約提案: C_5daf9744", "game_id": "game01"}
+{"type": "H5", "label": "契約締結", "round": 4, "player": "P05", "detail": "契約提案: C_8757e714", "game_id": "game01"}
+{"type": "H5", "label": "契約締結", "round": 4, "player": "P07", "detail": "契約提案: C_654ae888", "game_id": "game01"}
+{"type": "H5", "label": "契約締結", "round": 4, "player": "P02", "detail": "契約提案: C_efb71ae6", "game_id": "game01"}
+{"type": "H5", "label": "契約締結", "round": 4, "player": "P08", "detail": "契約提案: C_31dbb18e", "game_id": "game01"}
+{"type": "H5", "label": "契約締結", "round": 4, "player": "P08", "detail": "契約提案: C_390002dd", "game_id": "game01"}
+{"type": "H5", "label": "契約締結", "round": 4, "player": "P07", "detail": "契約提案: C_3d7a20ac", "game_id": "game01"}
+{"type": "H5", "label": "契約締結", "round": 4, "player": "P06", "detail": "契約提案: C_8afcd0e4", "game_id": "game01"}
+{"type": "H5", "label": "契約締結", "round": 5, "player": "P08", "detail": "契約提案: C_446b31fb", "game_id": "game01"}
+{"type": "H5", "label": "契約締結", "round": 6, "player": "P04", "detail": "契約提案: C_cba8ed8a", "game_id": "game01"}
+{"type": "H5", "label": "契約締結", "round": 6, "player": "P07", "detail": "契約提案: C_1555bcff", "game_id": "game01"}
+{"type": "H5", "label": "契約締結", "round": 6, "player": "P07", "detail": "契約提案: C_e4e0daac", "game_id": "game01"}
+{"type": "H5", "label": "契約締結", "round": 6, "player": "P07", "detail": "契約提案: C_4bd6cfdb", "game_id": "game01"}
+{"type": "H5", "label": "契約締結", "round": 6, "player": "P07", "detail": "契約提案: C_3e746f4f", "game_id": "game01"}
+{"type": "H9", "label": "同ランク山分け", "round": 1, "player": "P04, P06, P08", "detail": "M01で3人が山分け", "game_id": "game01"}
+{"type": "H9", "label": "同ランク山分け", "round": 1, "player": "P02, P05", "detail": "M02で2人が山分け", "game_id": "game01"}
+{"type": "H9", "label": "同ランク山分け", "round": 1, "player": "P01, P03, P07", "detail": "M03で3人が山分け", "game_id": "game01"}
+{"type": "H9", "label": "同ランク山分け", "round": 2, "player": "P01, P02, P08", "detail": "M01で3人が山分け", "game_id": "game01"}
+{"type": "H9", "label": "同ランク山分け", "round": 2, "player": "P04, P05, P07", "detail": "M03で3人が山分け", "game_id": "game01"}
+{"type": "H9", "label": "同ランク山分け", "round": 3, "player": "P06, P07", "detail": "M02で2人が山分け", "game_id": "game01"}
+{"type": "H9", "label": "同ランク山分け", "round": 4, "player": "P02, P06, P07", "detail": "M02で3人が山分け", "game_id": "game01"}
+{"type": "H9", "label": "同ランク山分け", "round": 4, "player": "P03, P05, P08", "detail": "M03で3人が山分け", "game_id": "game01"}
+{"type": "H9", "label": "同ランク山分け", "round": 5, "player": "P01, P04", "detail": "M03で2人が山分け", "game_id": "game01"}
+{"type": "H9", "label": "同ランク山分け", "round": 7, "player": "P01, P03", "detail": "M02で2人が山分け", "game_id": "game01"}
+{"type": "H9", "label": "同ランク山分け", "round": 9, "player": "P02, P04", "detail": "M02で2人が山分け", "game_id": "game01"}
+{"type": "H9", "label": "同ランク山分け", "round": 10, "player": "P01, P04", "detail": "M03で2人が山分け", "game_id": "game01"}
+{"type": "H9", "label": "同ランク山分け", "round": 12, "player": "P05, P08", "detail": "M02で2人が山分け", "game_id": "game01"}
+{"type": "H13", "label": "AUTO COMMIT", "round": 7, "player": "P08", "detail": "P08: AUTO COMMIT", "game_id": "game01"}
+{"type": "H13", "label": "AUTO COMMIT", "round": 8, "player": "P08", "detail": "P08: AUTO COMMIT", "game_id": "game01"}
+{"type": "H13", "label": "AUTO COMMIT", "round": 9, "player": "P08", "detail": "P08: AUTO COMMIT", "game_id": "game01"}
+{"type": "H13", "label": "AUTO COMMIT", "round": 10, "player": "P02", "detail": "P02: AUTO COMMIT", "game_id": "game01"}
+{"type": "H13", "label": "AUTO COMMIT", "round": 10, "player": "P08", "detail": "P08: AUTO COMMIT", "game_id": "game01"}
+{"type": "H13", "label": "AUTO COMMIT", "round": 11, "player": "P08", "detail": "P08: AUTO COMMIT", "game_id": "game01"}
+{"type": "H13", "label": "AUTO COMMIT", "round": 12, "player": "P08", "detail": "P08: AUTO COMMIT", "game_id": "game01"}
+{"type": "H12", "label": "際どい落選", "round": 12, "player": "P05", "detail": "P05: Cash=1,715,937円 (脱落)", "game_id": "game01"}

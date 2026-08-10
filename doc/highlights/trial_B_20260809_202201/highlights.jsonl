@@ -1,0 +1,9 @@
+{"type": "H4", "label": "破産", "round": 1, "player": "P02", "detail": "P02がEntry Fee不足で破産脱落", "game_id": "game01"}
+{"type": "H4", "label": "破産", "round": 3, "player": "P01", "detail": "P01がEntry Fee不足で破産脱落", "game_id": "game01"}
+{"type": "H8", "label": "上位カード無駄撃ち", "round": 2, "player": "P06", "detail": "P06がSTRAIGHT_FLUSHを単独市場M02に投入", "game_id": "game01"}
+{"type": "H9", "label": "同ランク山分け", "round": 2, "player": "P01, P04", "detail": "M01で2人が山分け", "game_id": "game01"}
+{"type": "H9", "label": "同ランク山分け", "round": 6, "player": "P03, P04", "detail": "M02で2人が山分け", "game_id": "game01"}
+{"type": "H14", "label": "キャリーオーバー", "round": 3, "detail": "M01で426,668円がキャリーオーバー", "game_id": "game01"}
+{"type": "H14", "label": "キャリーオーバー", "round": 4, "detail": "M03で426,666円がキャリーオーバー", "game_id": "game01"}
+{"type": "H14", "label": "キャリーオーバー", "round": 5, "detail": "M03で853,332円がキャリーオーバー", "game_id": "game01"}
+{"type": "H12", "label": "際どい生還", "round": 6, "player": "P08", "detail": "P08: Cash=2,120,072円 (生還)", "game_id": "game01"}

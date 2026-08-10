@@ -1,0 +1,11 @@
+.venv/
+logs/
+.env
+__pycache__/
+*.pyc
+.devrelay/
+.devrelay-output/
+.devrelay-output-history/
+.devrelay-files/
+*.pid
+.pytest_cache/

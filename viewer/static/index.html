@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>談合カード 観戦ビューア</title>
+<link rel="stylesheet" href="static/style.css">
+</head>
+<body>
+
+<div class="header">
+  <h1>嘘八百万 —談合カード—</h1>
+  <select id="game-select"></select>
+  <div class="stats" id="header-stats">
+    <span id="round-info">—</span>
+    <span id="survivor-info">—</span>
+    <span id="cost-info">—</span>
+  </div>
+  <label><input type="checkbox" id="auto-refresh" checked> 自動更新</label>
+</div>
+
+<div class="grid" id="player-grid"></div>
+
+<div class="footer" id="footer-messages"></div>
+
+<div class="modal-overlay" id="modal-overlay">
+  <div class="modal">
+    <span class="close" id="modal-close">&times;</span>
+    <h2 id="modal-title">—</h2>
+    <div id="modal-timeline"></div>
+  </div>
+</div>
+
+<script>
+// === 談合カード 観戦ビューア JS ===
+let currentGame = null; // {trial_dir, game_id}
+let refreshInterval = null;
+
+// 感情→絵文字マッピング
+const EMOTION_EMOJI = {
+  '喜': '😊', '怒': '😠', '哀': '😢', '楽': '😌',
+  '焦': '😰', '疑': '🤨', '平静': '😐'
+};
+// 感情→英語名マッピング（画像ファイル名用）
+const EMOTION_EN = {
+  '喜': 'joy', '怒': 'anger', '哀': 'sadness', '楽': 'ease',
+  '焦': 'panic', '疑': 'doubt', '平静': 'neutral'
+};
+function emotionToEmoji(emotion) {
+  return EMOTION_EMOJI[emotion] || '😐';
+}
+// モデル名からベンダーを推定
+function guessVendor(modelName) {
+  const n = (modelName || '').toLowerCase();
+  if (n.includes('claude') || n.includes('haiku') || n.includes('sonnet') || n.includes('opus')) return 'anthropic';
+  if (n.includes('gpt') || n.includes('openai')) return 'openai';
+  if (n.includes('gemini') || n.includes('google')) return 'google';
+  if (n.includes('grok') || n.includes('xai')) return 'xai';
+  if (n.includes('kimi') || n.includes('moonshot')) return 'moonshot';
+  if (n.includes('deepseek')) return 'deepseek';
+  return '';
+}
+// 感情表示: 画像があれば画像、なければ絵文字
+function emotionDisplay(emotion, vendor) {
+  const en = EMOTION_EN[emotion] || 'neutral';
+  const emoji = EMOTION_EMOJI[emotion] || '😐';
+  const vendorSrc = `emotions/${vendor}_${en}.png`;
+  const commonSrc = `emotions/${en}.png`;
+  // img with onerror fallback chain: vendor → common → emoji text
+  return `<img src="${vendorSrc}" alt="${emotion}" title="${emotion}" class="emotion-img" onerror="this.onerror=function(){this.replaceWith(document.createTextNode('${emoji}'))};this.src='${commonSrc}'">`;
+}
+
+// --- 試合一覧の取得 ---
+async function loadGames() {
+  try {
+    const res = await fetch('api/games');
+    const games = await res.json();
+    const sel = document.getElementById('game-select');
+    sel.innerHTML = '';
+    if (!games.length) {
+      sel.innerHTML = '<option>試合なし</option>';
+      return;
+    }
+    games.forEach((g, i) => {
+      const opt = document.createElement('option');
+      opt.value = JSON.stringify({trial_dir: g.trial_dir, game_id: g.game_id});
+      opt.textContent = `${g.trial_dir} / ${g.game_id} (${g.players}P, ${g.total_entries}件)`;
+      sel.appendChild(opt);
+    });
+    // 最新を選択
+    currentGame = JSON.parse(sel.value);
+    loadState();
+  } catch (e) {
+    console.error('loadGames error:', e);
+  }
+}
+
+// --- 試合セレクタ変更 ---
+document.getElementById('game-select').addEventListener('change', (e) => {
+  try {
+    currentGame = JSON.parse(e.target.value);
+    loadState();
+  } catch (err) {}
+});
+
+// --- 状態の取得+描画 ---
+async function loadState() {
+  if (!currentGame) return;
+  try {
+    const url = `api/games/${currentGame.trial_dir}/${currentGame.game_id}/state`;
+    const res = await fetch(url);
+    const state = await res.json();
+    renderState(state);
+  } catch (e) {
+    console.error('loadState error:', e);
+  }
+}
+
+function renderState(state) {
+  // ヘッダ
+  document.getElementById('round-info').textContent = `R${state.current_round}/${state.total_rounds}`;
+  document.getElementById('survivor-info').textContent = `生存 ${state.survivors}/${state.players.length}`;
+  document.getElementById('cost-info').textContent = `$${state.total_cost.toFixed(4)}`;
+
+  // グリッド
+  const grid = document.getElementById('player-grid');
+  grid.innerHTML = '';
+  state.players.forEach(p => {
+    const panel = document.createElement('div');
+    panel.className = 'panel' + (p.status === 'eliminated' ? ' eliminated' : '');
+
+    // 思考中判定（30秒以内にアクティブ）
+    const isThinking = p.stats.last_active_sec_ago !== null && p.stats.last_active_sec_ago < 30;
+    const badgeClass = p.status === 'eliminated' ? 'eliminated' : (isThinking ? 'thinking' : 'alive');
+    const badgeText = p.status === 'eliminated' ? '脱落' : (isThinking ? '思考中' : '生存');
+
+    let strategyText = '';
+    if (p.strategy_summary) {
+      const s = p.strategy_summary;
+      strategyText = [s.target_market, s.current_goal, s.card_plan].filter(Boolean).join(' / ');
+    }
+
+    // 感情表示
+    const vendor = guessVendor(p.model_name || p.model_id || '');
+    const emotionHtml = emotionDisplay(p.emotion || '平静', vendor);
+    const emotionHistory = (p.emotion_history || []).map(e => emotionDisplay(e, vendor)).join('');
+
+    panel.innerHTML = `
+      <div>
+        <span class="pid">${p.player_id}</span>
+        <span class="model">${p.model_name || p.model_id}</span>
+        <span class="badge ${badgeClass}">${badgeText}</span>
+        <span class="emotion-icon">${emotionHtml}</span>
+      </div>
+      <div class="strategy">${strategyText || '—'}</div>
+      <div class="emotion-history" title="感情推移（直近5件）">${emotionHistory || '—'}</div>
+      <div class="stats-row">
+        <span>R${p.latest_round}</span>
+        <span>JSON:${p.stats.valid_json}/${p.stats.calls}</span>
+        <span>DM:${p.stats.dm_count} BC:${p.stats.broadcast_count}</span>
+        <span>ERR:${p.stats.errors}</span>
+        <span>$${p.stats.cost.toFixed(4)}</span>
+      </div>
+    `;
+    panel.addEventListener('click', () => openTimeline(p.player_id, p.model_name));
+    grid.appendChild(panel);
+  });
+
+  // フッタメッセージ
+  const footer = document.getElementById('footer-messages');
+  footer.innerHTML = '';
+  (state.recent_messages || []).forEach(m => {
+    const div = document.createElement('div');
+    div.className = 'msg';
+    div.innerHTML = `<span class="sender">[R${m.round} ${m.sender}]</span> ${escapeHtml(m.message)}`;
+    footer.appendChild(div);
+  });
+}
+
+// --- タイムライン表示 ---
+async function openTimeline(pid, modelName) {
+  if (!currentGame) return;
+  document.getElementById('modal-title').textContent = `${pid} (${modelName || '?'})`;
+  const url = `api/games/${currentGame.trial_dir}/${currentGame.game_id}/players/${pid}/timeline`;
+  try {
+    const res = await fetch(url);
+    const timeline = await res.json();
+    const container = document.getElementById('modal-timeline');
+    container.innerHTML = '';
+    timeline.forEach(item => {
+      const div = document.createElement('div');
+      div.className = 'timeline-item';
+
+      const tlVendor = guessVendor(modelName || '');
+      const itemEmotionHtml = emotionDisplay(item.emotion || '平静', tlVendor);
+      let html = `<span class="emotion-badge">${itemEmotionHtml}</span> <span class="phase-badge">${item.phase} R${item.round}${item.turn ? 'T'+item.turn : ''}</span>`;
+
+      if (item.type === 'action') {
+        html += `<span class="action-type">${item.action_type}</span>`;
+        if (item.content) {
+          html += `<div class="content">${escapeHtml(item.content)}</div>`;
+        }
+      }
+      if (item.strategy) {
+        const s = item.strategy;
+        html += `<div class="content" style="color:#a0a0d0">📋 ${Object.entries(s).map(([k,v]) => k+':'+v).join(' / ')}</div>`;
+      }
+      if (item.error) {
+        html += `<div class="content" style="color:#ef9a9a">⚠ ${escapeHtml(item.error)}</div>`;
+      }
+      html += `<div class="meta">$${item.cost.toFixed(4)} | ${Math.round(item.latency_ms)}ms | in:${item.input_tokens} out:${item.output_tokens}</div>`;
+
+      if (item.reasoning_preview) {
+        html += `<div class="reasoning" onclick="this.classList.toggle('expanded')">${escapeHtml(item.reasoning_preview)}…</div>`;
+      }
+
+      div.innerHTML = html;
+      container.appendChild(div);
+    });
+    // 最新へスクロール
+    container.scrollTop = container.scrollHeight;
+    document.getElementById('modal-overlay').classList.add('active');
+  } catch (e) {
+    console.error('openTimeline error:', e);
+  }
+}
+
+// --- モーダル閉じ ---
+document.getElementById('modal-close').addEventListener('click', () => {
+  document.getElementById('modal-overlay').classList.remove('active');
+});
+document.getElementById('modal-overlay').addEventListener('click', (e) => {
+  if (e.target === e.currentTarget) {
+    document.getElementById('modal-overlay').classList.remove('active');
+  }
+});
+
+// --- ユーティリティ ---
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text || '';
+  return div.innerHTML;
+}
+
+// --- 自動更新 ---
+function startAutoRefresh() {
+  if (refreshInterval) clearInterval(refreshInterval);
+  refreshInterval = setInterval(() => {
+    if (document.getElementById('auto-refresh').checked) {
+      loadState();
+    }
+  }, 2000);
+}
+
+document.getElementById('auto-refresh').addEventListener('change', (e) => {
+  if (!e.target.checked && refreshInterval) {
+    clearInterval(refreshInterval);
+    refreshInterval = null;
+  } else {
+    startAutoRefresh();
+  }
+});
+
+// --- 初期化 ---
+loadGames();
+startAutoRefresh();
+</script>
+</body>
+</html>

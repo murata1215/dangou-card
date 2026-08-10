@@ -1,0 +1,6 @@
+{"type": "H4", "label": "破産", "round": 5, "player": "P01", "detail": "P01がEntry Fee不足で破産脱落", "game_id": "game01"}
+{"type": "H8", "label": "上位カード無駄撃ち", "round": 11, "player": "P08", "detail": "P08がSTRAIGHT_FLUSHを単独市場M03に投入", "game_id": "game01"}
+{"type": "H9", "label": "同ランク山分け", "round": 1, "player": "P05, P07, P08", "detail": "M03で3人が山分け", "game_id": "game01"}
+{"type": "H9", "label": "同ランク山分け", "round": 4, "player": "P04, P05", "detail": "M01で2人が山分け", "game_id": "game01"}
+{"type": "H13", "label": "AUTO COMMIT", "round": 5, "player": "P02", "detail": "P02: AUTO COMMIT", "game_id": "game01"}
+{"type": "H14", "label": "キャリーオーバー", "round": 4, "detail": "M03で426,666円がキャリーオーバー", "game_id": "game01"}
