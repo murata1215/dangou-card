@@ -50,10 +50,11 @@ def run_trial_game(
     config: GameConfig,
     output_dir: Path,
     seed: int = 42,
+    model_key: str | None = None,
 ) -> tuple[GameResult, list[LLMAgent], EventLogger]:
     """1試合を実行する"""
     game_seed = seed + game_index
-    model_info = get_model(HAIKU_MODEL_KEY)
+    model_info = get_model(model_key or HAIKU_MODEL_KEY)
     agents: dict[str, Any] = {}
     llm_agents: list[LLMAgent] = []
 
@@ -946,6 +947,8 @@ def main() -> None:
                         help="既存ログディレクトリからPhase Bレポートを再生成")
     parser.add_argument("--regenerate-c-report", type=str, default=None,
                         help="既存ログディレクトリからPhase Cレポートを再生成")
+    parser.add_argument("--model", type=str, default=None,
+                        help="Phase Aのモデルキーを上書き（例: M5）。デフォルト: L1(Haiku)")
     args = parser.parse_args()
 
     # 修正8: レポート再生成モード
@@ -1053,6 +1056,7 @@ def main() -> None:
             try:
                 result, llm_agents, event_logger = run_trial_game(
                     llm_count, i, config, output_dir, args.seed,
+                    model_key=args.model,
                 )
                 all_results.append((result, llm_agents, event_logger))
                 for agent in llm_agents:

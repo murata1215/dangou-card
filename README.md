@@ -55,7 +55,7 @@ config = GameConfig(survival_cash=2_000_000)  # カスタム
 進行中・完了済みの試合をブラウザで観戦できる FastAPI ビューア（`viewer/`）。
 公開URL `https://dangou-card-viewer.devrelay.io/`（Caddy → 127.0.0.1:9023）。
 
-- `/` … **LP（ランディングページ）**。「▶ 観戦する」→ `/watch`、「📖 敗者の手記を読む」→ ブログ(PixBlog)
+- `/` … **LP（ランディングページ）**。「▶ 観戦する」→ `/watch`、「📖 敗者の手記を読む」→ ブログ(PixBlog)。記事ピックアップは PixBlog `feed.json` から動的取得（取得失敗時は静的フォールバック）
 - `/watch` … 観戦ビューア本体（相対パス依存のため末尾スラッシュ無しで配信）
 - `/api/*` … 試合データAPI
 

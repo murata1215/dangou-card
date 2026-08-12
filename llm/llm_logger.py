@@ -49,6 +49,7 @@ class LLMLogger:
         error: str | None = None,
         error_type: str | None = None,
         emotion: str | None = None,
+        finish_reason: str | None = None,
     ) -> None:
         """
         1回のLLMコールを記録し、即時にファイルへ追記する
@@ -74,6 +75,7 @@ class LLMLogger:
             "error": error,
             "error_type": error_type,
             "emotion": emotion,
+            "finish_reason": finish_reason,
         }
         self._entries.append(entry)
         self._total_cost += cost

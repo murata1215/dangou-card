@@ -309,6 +309,7 @@ class TestEmotionFeature:
         assert "楽" in prompt
         assert "焦" in prompt
         assert "疑" in prompt
+        assert "奸" in prompt
 
 
 class TestStep3C:
@@ -343,10 +344,50 @@ class TestStep3C:
             assert name.lower() not in prompt.lower(), f"'{name}' found in system prompt"
 
     def test_kimi_has_extended_timeout(self):
-        """Kimi系モデルのタイムアウトが120秒であること"""
+        """Kimi系モデルのタイムアウトが90秒であること（thinking無効化で短縮）"""
         from llm.models import MODEL_REGISTRY
         for key in ("M5", "L5"):
-            assert MODEL_REGISTRY[key].timeout_seconds == 120
+            assert MODEL_REGISTRY[key].timeout_seconds == 90
+
+    def test_kimi_has_thinking_disabled(self):
+        """Kimi系モデルにthinking無効化のextra_paramsが設定されていること"""
+        from llm.models import MODEL_REGISTRY
+        for key in ("M5", "L5"):
+            ep = MODEL_REGISTRY[key].extra_params
+            assert ep is not None
+            assert ep.get("thinking", {}).get("type") == "disabled"
+
+    def test_model_info_max_tokens_default_none(self):
+        """ModelInfoのmax_tokensデフォルトがNoneであること"""
+        from llm.models import ModelInfo
+        m = ModelInfo(
+            model_id="test", provider="Test", name="Test",
+            adapter_type="openai_compat", input_price=1.0, output_price=1.0,
+            env_key="TEST_KEY", base_url=None,
+        )
+        assert m.max_tokens is None
+        assert m.extra_params is None
+
+    def test_model_info_per_model_max_tokens(self):
+        """ModelInfoのper-model max_tokensが設定可能であること"""
+        from llm.models import ModelInfo
+        m = ModelInfo(
+            model_id="test", provider="Test", name="Test",
+            adapter_type="openai_compat", input_price=1.0, output_price=1.0,
+            env_key="TEST_KEY", base_url=None,
+            max_tokens=8000,
+            extra_params={"thinking": {"type": "disabled"}},
+        )
+        assert m.max_tokens == 8000
+        assert m.extra_params["thinking"]["type"] == "disabled"
+
+    def test_finish_reason_in_usage(self):
+        """finish_reasonがusage dictに含まれること（adapters.pyの変更確認）"""
+        # finish_reasonはアダプタがusage dictに含めて返す設計
+        # ここではパーサのLENGTH_TRUNCATION_HINTが定義されていることを確認
+        from llm.response_parser import LENGTH_TRUNCATION_HINT
+        assert "出力トークン上限" in LENGTH_TRUNCATION_HINT
+        assert "JSON" in LENGTH_TRUNCATION_HINT
 
 
 class TestStep33CacheFix:

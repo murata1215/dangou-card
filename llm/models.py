@@ -28,6 +28,8 @@ class ModelInfo:
     env_key: str            # 環境変数名（APIキー）
     base_url: str | None    # OpenAI互換のbase_url（Noneなら公式）
     timeout_seconds: int = 60  # APIコールのタイムアウト（秒）。reasoning系は長めに設定
+    max_tokens: int | None = None       # per-model出力トークン上限（None → DEFAULT_MAX_TOKENS）
+    extra_params: dict | None = None    # API固有パラメータ（例: {"thinking": {"type": "disabled"}}）
 
 
 # --- Gemini OpenAI互換エンドポイント ---
@@ -73,7 +75,8 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         adapter_type="openai_compat",
         input_price=0.95, output_price=4.0,
         env_key="KIMI_API_KEY", base_url=MOONSHOT_BASE_URL,
-        timeout_seconds=120,
+        timeout_seconds=90,
+        extra_params={"thinking": {"type": "disabled"}},
     ),
     "M6": ModelInfo(
         model_id="deepseek-chat",
@@ -117,7 +120,8 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         adapter_type="openai_compat",
         input_price=0.95, output_price=4.0,
         env_key="KIMI_API_KEY", base_url=MOONSHOT_BASE_URL,
-        timeout_seconds=120,
+        timeout_seconds=90,
+        extra_params={"thinking": {"type": "disabled"}},
     ),
     "L6": ModelInfo(
         model_id="deepseek-chat",

@@ -1,5 +1,37 @@
 # Changelog
 
+## 2026-08-13: LP の実態修正（参加体数・OGP・ブログタイル動的化）
+
+### 概要
+公開LP `viewer/static/lp.html` の事実誤認と SNS 共有不備を修正。「AI 20体」→ 実参加 **8体** に統一し、OGP を SNS クローラが解決できる絶対URLに直し、ブログ記事タイルを PixBlog フィードから動的取得（失敗時は静的2件にフォールバック）するようにした。
+
+### 変更
+- `viewer/static/lp.html`:
+  - 参加体数 20→8（title / meta description / og:description / kicker / hero sub / 概要カード の計6箇所）。
+  - OGP `og:image` を絶対URL `https://dangou-card-viewer.devrelay.io/static/lp_hero.png` に修正、`og:url` を追加（SNSカード画像の表示不良を解消）。
+  - ブログタイルをハードコード4件から **静的フォールバック2件（開幕・Grok脱落手記）** に置換し、`feed.json?limit=4` 取得成功時に動的タイルへ差し替え（`item.image` 欠落時は `lp_hero.png`）。取得失敗時は静的2件を維持。
+  - `.grid` を `repeat(auto-fill, minmax(240px,1fr))` にして件数可変に対応。
+- `.devrelay-output/lp.html`: 送付用コピー。
+
+## 2026-08-13: Kimi K2.6 長考問題の根治（JSON有効率 23%→97%）
+
+### 概要
+trial_C で Kimi K2.6（M5/L5）が JSON有効率23%・平均レイテンシ99.5s・試合時間の72%を単独占有していた問題を根治。原因は reasoning(thinking) モードが `max_tokens=4000` を内部推論で食い尽くし、JSON回答(content)が空/切断されること。thinking を無効化して解消した。
+
+### 変更
+- `llm/models.py`: `ModelInfo` に per-model の `max_tokens` / `extra_params` を追加。M5/L5 に `extra_params={"thinking": {"type": "disabled"}}`、`timeout_seconds=90`。
+- `llm/adapters.py`: OpenAI互換アダプタで `extra_params` を `extra_body` としてマージ。Anthropic/OpenAI 両方で `finish_reason`（stop_reason / choices.finish_reason）を usage に載せる。
+- `llm/llm_agent.py`: per-model `max_tokens` を使用。`finish_reason=="length"` 検知時は是正リトライに切断ヒントを付与（全モデル共通の防御）。
+- `llm/llm_logger.py`: `finish_reason` をログに記録。
+- `llm/response_parser.py`: `LENGTH_TRUNCATION_HINT` を追加。
+- `scripts/llm_trial.py`: Phase A のモデルを上書きする `--model` 引数を追加。
+- `scripts/kimi_investigation.py`: **新規** 調査スクリプト（thinking有無×max_tokensの比較計測）。
+- テスト: `tests/test_llm.py` に per-model max_tokens / extra_params / finish_reason のテストを追加、Kimi timeout 期待値を 90 に更新。
+
+### 検証
+- 調査（12コール, $0.084）: thinking=disabled で JSON率6/6=100%・平均8.9s。
+- dev検証（6R, M5×1+Random×7, 35コール）: JSON率97%(34/35)・平均レイテンシ8.1s・コスト$0.15（12R換算$0.31）・AUTO COMMIT 0。目標（JSON率90%+/レイテンシ60s以下/コスト$1.5以下）を全達成。
+
 ## 2026-08-13: 観戦ビューアURLに LP（ランディングページ）を新設
 
 ### 概要

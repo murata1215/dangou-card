@@ -29,6 +29,7 @@ from llm.prompt_builder import (
 )
 from llm.response_parser import (
     parse_response, extract_json, ParseError, make_correction_message,
+    LENGTH_TRUNCATION_HINT,
 )
 from llm.llm_logger import LLMLogger
 
@@ -87,6 +88,7 @@ class LLMAgent(PlayerAgent):
         if self._cost_exceeded:
             return "", {"input_tokens": 0, "output_tokens": 0}
 
+        effective_max_tokens = self.model_info.max_tokens or DEFAULT_MAX_TOKENS
         start = time.time()
         error_msg = None
         error_type = None
@@ -94,7 +96,7 @@ class LLMAgent(PlayerAgent):
             text, usage = self.adapter.complete(
                 system=self._system_prompt,
                 messages=[{"role": "user", "content": user_prompt}],
-                max_tokens=DEFAULT_MAX_TOKENS,
+                max_tokens=effective_max_tokens,
                 temperature=DEFAULT_TEMPERATURE,
             )
         except AdapterError as e:
@@ -115,6 +117,7 @@ class LLMAgent(PlayerAgent):
             usage.get("output_tokens", 0),
         )
 
+        finish_reason = usage.get("finish_reason")
         self.llm_logger.log_call(
             player_id=self.player_id,
             model_id=self.model_info.model_id,
@@ -129,6 +132,7 @@ class LLMAgent(PlayerAgent):
             elapsed_ms=elapsed,
             error=error_msg,
             error_type=error_type,
+            finish_reason=finish_reason,
         )
 
         self.total_calls += 1
@@ -198,7 +202,7 @@ class LLMAgent(PlayerAgent):
         # リトライループ
         messages_so_far = user_prompt
         for retry in range(MAX_RETRIES + 1):
-            text, _ = self._call_llm(
+            text, usage = self._call_llm(
                 "negotiation", round_num, messages_so_far, turn=turn,
             )
 
@@ -217,9 +221,11 @@ class LLMAgent(PlayerAgent):
                 return action
             except ParseError as e:
                 if retry < MAX_RETRIES:
-                    messages_so_far = (
-                        user_prompt + "\n\n" + make_correction_message(e)
-                    )
+                    correction = make_correction_message(e)
+                    # finish_reason=length の場合は切断ヒントを追加
+                    if usage.get("finish_reason") == "length":
+                        correction = LENGTH_TRUNCATION_HINT + "\n" + correction
+                    messages_so_far = user_prompt + "\n\n" + correction
                     continue
 
         return PassAction(player_id=self.player_id)
@@ -253,8 +259,9 @@ class LLMAgent(PlayerAgent):
             last_strategy=last_strategy,
         )
 
+        original_prompt = user_prompt
         for retry in range(MAX_RETRIES + 1):
-            text, _ = self._call_llm("commit", round_num, user_prompt)
+            text, usage = self._call_llm("commit", round_num, user_prompt)
 
             if not text:
                 self.auto_commit_count += 1
@@ -276,7 +283,10 @@ class LLMAgent(PlayerAgent):
                 )
             except ParseError as e:
                 if retry < MAX_RETRIES:
-                    user_prompt = user_prompt + "\n\n" + make_correction_message(e)
+                    correction = make_correction_message(e)
+                    if usage.get("finish_reason") == "length":
+                        correction = LENGTH_TRUNCATION_HINT + "\n" + correction
+                    user_prompt = original_prompt + "\n\n" + correction
                     continue
 
         self.auto_commit_count += 1

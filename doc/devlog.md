@@ -168,6 +168,30 @@ v1台本レビューで発見した6箇所の品質問題(役割違反2件・計
 
 ## 2026-08-13
 
+### サイクル6.0: S2課題1 — Kimi長考問題の根治
+
+**狙い**: trial_CでKimi K2.6がJSON有効率23%・平均レイテンシ99.5s・コスト$5.01(試合全体の45%)・時間占有率72%のボトルネック。根本原因を特定し、JSON率90%以上・レイテンシ60s以下・コスト$1.5/game以下を達成する。
+
+**発見**: 根本原因は**reasoning(thinking)トークンがmax_tokens=4000を食い尽くす**こと。Kimi K2.6のthinkingモードではreasoning_contentとcontentがmax_tokensを共有し、4000トークンの大半を内部推論に消費→JSON回答が空/切断。Moonshot公式APIで`"thinking":{"type":"disabled"}`が使える。openai SDKでは`extra_body`経由で送信(直接kwargsは拒否)。K3($15/MTok)はコスト不達で除外。
+
+**実行**: ModelInfoに`max_tokens`+`extra_params`追加、M5/L5に`extra_params={"thinking":{"type":"disabled"}}`設定、OpenAICompatAdapterで`extra_body`マージ+finish_reasonキャプチャ、llm_agentでper-model max_tokens+finish_reason=lengthリトライ、llm_trial.pyに`--model`引数追加。
+
+**検証**: 調査12コール($0.084)でthinking=disabled=6/6=100%JSON・8.9s平均。検証試合(6R dev,M5×1+Random×7,35コール): **JSON率97%(34/35)・平均レイテンシ8.1s・コスト$0.15(12R換算$0.31)・全コールfinish_reason=stop・AUTO COMMIT 0・282秒**。テスト176件パス。
+
+### サイクル6.3: LP修正 — 参加体数・OGP・ブログタイル動的化 (2026-08-13 07:14 JST)
+
+**狙い**: 公開LP(`viewer/static/lp.html`)の事実誤認(20体→8体)修正、OGP画像のSNSクローラー対応(相対→絶対URL)、ブログ記事タイルの未公開記事表示問題の解消。
+
+**実行**: (1) 参加体数「AI 20体」→「AI 8体」を6箇所修正(title/meta description/og:description/kicker/hero sub/Overviewカード)。(2) og:imageを`https://dangou-card-viewer.devrelay.io/static/lp_hero.png`に絶対URL化、og:urlを新設。lp_hero.pngは2400x1260pxでOGP要件(1200x630)を満たす。(3) ハードコード4タイル(未公開のソネット/総括含む)→静的フォールバック2件(公開済みの開幕+Grok、個別記事URL、aria-label付き)+JS fetch(`pixblog.net/u/uso8m/feed.json?limit=4`)で動的差替え。fetch失敗時は静的2件がそのまま残る。CSSグリッドを`auto-fill,minmax(240px,1fr)`に変更し件数可変に自然対応。
+
+**発見**: lp_hero.pngの解像度は2400x1260pxでOGP推奨の1200x630を上回っていた。pixblog feedは現在3件公開(開幕/Grok/500万借金)、CORS許可・published_at降順。
+
+| 指標 | Before | After | 目標 |
+|---|---|---|---|
+| JSON率 | 23% | **97%** | 90%+ |
+| レイテンシ | 99.5s | **8.1s** | 60s以下 |
+| コスト/game | $5.01 | **$0.31** | $1.5以下 |
+
 ### サイクル6.1: 観戦ビューアURLに LP（ランディングページ）を新設
 
 **狙い**: 公開URL `https://dangou-card-viewer.devrelay.io/` を開くといきなり観戦UIが出ていたのを、まず作品の入口=LPに差し替え、「観戦する」と「ブログを読む」の2導線を作る。

@@ -139,7 +139,7 @@ def parse_response(
 
 
 # 有効な感情値の集合
-VALID_EMOTIONS = {"喜", "怒", "哀", "楽", "焦", "疑"}
+VALID_EMOTIONS = {"喜", "怒", "哀", "楽", "焦", "疑", "奸"}
 
 
 def normalize_emotion(strategy: dict[str, Any]) -> dict[str, Any]:
@@ -320,3 +320,10 @@ def make_correction_message(error: ParseError) -> str:
         f"前回の回答にエラーがありました: {error}\n"
         f"修正してください: {error.correction_hint}"
     )
+
+
+LENGTH_TRUNCATION_HINT = (
+    "【重要】前回の回答は出力トークン上限に達し途中で切断されました。"
+    "思考・分析を大幅に短縮し、必ずJSON出力を最後まで完了してください。"
+    "長い説明は不要です。JSONのみ返してください。"
+)

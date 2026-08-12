@@ -134,6 +134,7 @@ class AnthropicAdapter:
                     "output_tokens": response.usage.output_tokens,
                     "cache_creation_input_tokens": getattr(response.usage, "cache_creation_input_tokens", 0) or 0,
                     "cache_read_input_tokens": getattr(response.usage, "cache_read_input_tokens", 0) or 0,
+                    "finish_reason": getattr(response, "stop_reason", None),
                 }
                 return text, usage
 
@@ -202,6 +203,10 @@ class OpenAICompatAdapter:
                     "messages": full_messages,
                     "max_tokens": max_tokens,
                 }
+                # per-model API固有パラメータ (例: thinking制御)
+                # openai SDKは未知のkwargsを拒否するため extra_body で送信
+                if self.model_info.extra_params:
+                    create_kwargs["extra_body"] = self.model_info.extra_params
                 # temperatureフォールバック: 一部モデル(Kimi k2.6等)は特定値のみ許可
                 try:
                     response = client.chat.completions.create(
@@ -218,11 +223,14 @@ class OpenAICompatAdapter:
                 if not text and response.choices:
                     extras = getattr(response.choices[0].message, 'model_extra', None) or {}
                     text = extras.get('reasoning_content', '') or ''
+                # finish_reason キャプチャ（length=max_tokens切断の検知用）
+                finish_reason = response.choices[0].finish_reason if response.choices else None
                 usage = {
                     "input_tokens": getattr(response.usage, "prompt_tokens", 0) or 0,
                     "output_tokens": getattr(response.usage, "completion_tokens", 0) or 0,
                     "cache_read_input_tokens": 0,
                     "cache_creation_input_tokens": 0,
+                    "finish_reason": finish_reason,
                 }
                 return text, usage
 
