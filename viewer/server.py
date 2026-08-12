@@ -17,7 +17,10 @@ from fastapi import FastAPI, Depends, HTTPException, Query, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
-from viewer.log_parser import list_games, get_game_state, get_player_timeline
+from viewer.log_parser import (
+    list_games, get_game_state, get_player_timeline, get_commentary,
+    get_round_states,
+)
 
 # --- 環境変数による設定 ---
 # デフォルトのログディレクトリ
@@ -59,8 +62,14 @@ async def check_token(
 
 
 @app.get("/")
-async def index(_=Depends(check_token)):
-    """メインページ"""
+async def landing(_=Depends(check_token)):
+    """ランディングページ（LP）"""
+    return FileResponse(str(STATIC_DIR / "lp.html"))
+
+
+@app.get("/watch")
+async def watch(_=Depends(check_token)):
+    """観戦ビューア本体（相対パス依存のため末尾スラッシュ無しで配信）"""
     return FileResponse(str(STATIC_DIR / "index.html"))
 
 
@@ -74,6 +83,21 @@ async def api_games(_=Depends(check_token)):
 async def api_game_state(trial_dir: str, game_id: str, _=Depends(check_token)):
     """試合の現在状態サマリを返す"""
     return get_game_state(LOGS_DIR, trial_dir, game_id)
+
+
+@app.get("/api/games/{trial_dir}/{game_id}/commentary")
+async def api_commentary(trial_dir: str, game_id: str, _=Depends(check_token)):
+    """実況台本データを返す"""
+    data = get_commentary(LOGS_DIR, trial_dir, game_id)
+    if data is None:
+        raise HTTPException(status_code=404, detail="Commentary not found")
+    return data
+
+
+@app.get("/api/games/{trial_dir}/{game_id}/rounds")
+async def api_rounds(trial_dir: str, game_id: str, _=Depends(check_token)):
+    """ラウンド別の盤面状況を返す"""
+    return get_round_states(LOGS_DIR, trial_dir, game_id)
 
 
 @app.get("/api/games/{trial_dir}/{game_id}/players/{pid}/timeline")

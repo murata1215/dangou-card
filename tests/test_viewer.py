@@ -13,6 +13,7 @@ import pytest
 from viewer.log_parser import (
     LogCache, list_games, get_game_state, get_player_timeline,
     _extract_strategy, _extract_action, _extract_emotion,
+    get_commentary, get_round_states,
 )
 
 
@@ -125,6 +126,43 @@ class TestGetGameState:
         assert len(state["players"]) >= 1
 
 
+class TestGetRoundStates:
+    """ラウンド状況取得のテスト"""
+
+    def test_get_round_states_with_real_logs(self):
+        """実ログからラウンド別盤面が構築されること"""
+        logs_dir = Path(__file__).resolve().parent.parent / "logs" / "llm"
+        if not logs_dir.exists():
+            pytest.skip("logs/llm/ not found")
+        games = list_games(logs_dir)
+        # eventsログを持つ試合を優先的に選ぶ
+        target = next((g for g in games if g.get("has_events")), None)
+        if target is None:
+            pytest.skip("No games with events found")
+
+        data = get_round_states(logs_dir, target["trial_dir"], target["game_id"])
+        assert "rounds" in data
+        assert "players" in data
+        assert data["rounds"], "rounds should be non-empty"
+
+        # R1に主要キーが揃うこと
+        r1 = data["rounds"].get("1")
+        assert r1 is not None
+        for key in ("markets", "commits", "cash", "holdings", "contracts",
+                    "messages", "eliminated"):
+            assert key in r1
+
+        # debt = cash - free_cash が成立すること（cashがあれば1件検証）
+        for pid, c in r1["cash"].items():
+            if c.get("cash") is not None and c.get("free_cash") is not None:
+                assert c["debt"] == c["cash"] - c["free_cash"]
+                break
+
+        # 手札は12枚以下（提出で減る）
+        for pid, hand in r1["holdings"].items():
+            assert len(hand) <= 12
+
+
 class TestTokenAuth:
     """簡易認証のテスト（サーバー起動あり、httpx使用）"""
 
@@ -235,18 +273,18 @@ class TestEmotionViewer:
         assert _extract_emotion(entry) == "平静"
 
     def test_emotion_en_mapping_complete(self):
-        """7感情すべてに英語名が対応すること（ビューアのEMOTION_ENマッピング検証）"""
+        """8感情すべてに英語名が対応すること（ビューアのEMOTION_ENマッピング検証）"""
         # viewer/static/index.html の EMOTION_EN と同じマッピング
         emotion_en = {
             "喜": "joy", "怒": "anger", "哀": "sadness", "楽": "ease",
-            "焦": "panic", "疑": "doubt", "平静": "neutral",
+            "焦": "panic", "疑": "doubt", "奸": "smirk", "平静": "neutral",
         }
-        # 全7感情がマッピングされている
-        assert len(emotion_en) == 7
+        # 全8感情がマッピングされている
+        assert len(emotion_en) == 8
         # 全英語名がユニーク
-        assert len(set(emotion_en.values())) == 7
+        assert len(set(emotion_en.values())) == 8
         # 有効な感情値すべてにマッピングがある
-        valid_emotions = {"喜", "怒", "哀", "楽", "焦", "疑", "平静"}
+        valid_emotions = {"喜", "怒", "哀", "楽", "焦", "疑", "奸", "平静"}
         assert set(emotion_en.keys()) == valid_emotions
         # 各英語名がファイル名として安全（ASCII小文字のみ）
         for en in emotion_en.values():
@@ -263,3 +301,72 @@ class TestEmotionViewer:
         assert f"emotions/openai_{emotion_en['怒']}.png" == "emotions/openai_anger.png"
         # 共通パス
         assert f"emotions/{emotion_en['平静']}.png" == "emotions/neutral.png"
+
+
+class TestCommentary:
+    """実況台本APIのテスト"""
+
+    def test_commentary_v2_priority(self):
+        """v2が存在すればv2を返す"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trial = Path(tmpdir) / "trial_test"
+            trial.mkdir()
+            # v1
+            v1_dir = trial / "commentary"
+            v1_dir.mkdir(parents=True)
+            (v1_dir / "script.jsonl").write_text(
+                '{"round":1,"speaker":"zundamon","text":"v1 test"}\n',
+                encoding="utf-8",
+            )
+            # v2
+            v2_dir = v1_dir / "v2"
+            v2_dir.mkdir()
+            (v2_dir / "script.jsonl").write_text(
+                '{"round":1,"speaker":"zundamon","text":"v2 test"}\n',
+                encoding="utf-8",
+            )
+            result = get_commentary(Path(tmpdir), "trial_test", "game01")
+            assert result is not None
+            assert result["version"] == "v2"
+            assert result["rounds"]["1"][0]["text"] == "v2 test"
+
+    def test_commentary_v1_fallback(self):
+        """v2なし・v1ありでv1を返す"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trial = Path(tmpdir) / "trial_test"
+            v1_dir = trial / "commentary"
+            v1_dir.mkdir(parents=True)
+            (v1_dir / "script.jsonl").write_text(
+                '{"round":1,"speaker":"metan","text":"v1 only"}\n',
+                encoding="utf-8",
+            )
+            result = get_commentary(Path(tmpdir), "trial_test", "game01")
+            assert result is not None
+            assert result["version"] == "v1"
+            assert result["rounds"]["1"][0]["speaker"] == "metan"
+
+    def test_commentary_none(self):
+        """台本なしでNoneを返す"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trial = Path(tmpdir) / "trial_test"
+            trial.mkdir()
+            result = get_commentary(Path(tmpdir), "trial_test", "game01")
+            assert result is None
+
+    def test_commentary_round_grouping(self):
+        """ラウンドごとにグループ化される"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trial = Path(tmpdir) / "trial_test"
+            v2_dir = trial / "commentary" / "v2"
+            v2_dir.mkdir(parents=True)
+            (v2_dir / "script.jsonl").write_text(
+                '{"round":1,"speaker":"zundamon","text":"R1a"}\n'
+                '{"round":1,"speaker":"metan","text":"R1b"}\n'
+                '{"round":2,"speaker":"zundamon","text":"R2a"}\n',
+                encoding="utf-8",
+            )
+            result = get_commentary(Path(tmpdir), "trial_test", "game01")
+            assert result is not None
+            assert len(result["rounds"]["1"]) == 2
+            assert len(result["rounds"]["2"]) == 1
+            assert result["rounds"]["2"][0]["text"] == "R2a"

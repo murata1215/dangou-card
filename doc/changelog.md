@@ -1,5 +1,37 @@
 # Changelog
 
+## 2026-08-13: 観戦ビューアURLに LP（ランディングページ）を新設
+
+### 概要
+公開URL `https://dangou-card-viewer.devrelay.io/` のトップを観戦UI直表示から **LP** に差し替え、「観戦する」「ブログを読む」の2導線を設けた。
+
+### 変更
+- `viewer/static/lp.html`: **新規** LP（自己完結・インラインCSS・ダークトーン）。ヒーロー＋2大CTA（▶観戦する→`/watch`、📖敗者の手記を読む→PixBlog `pixblog.net/u/uso8m/`）＋概要3カード＋ブログ記事ピックアップ＋OGP。
+- `viewer/static/lp_hero.png`: **新規** ヒーロー画像（既存タイトルバナーを流用）。
+- `viewer/server.py`: `@app.get("/")` を LP 配信に変更、`@app.get("/watch")` を新設（観戦UI本体）。観戦UIは相対パス(`api/...`/`static/...`)依存のため **末尾スラッシュ無し** で配信（`/watch/` だとベースURL解決が崩れる）。
+- `viewer/static/index.html` / `style.css`: ヘッダに `🏠 トップ`（`/`へ戻る）リンクと `.home-link` スタイルを追加。
+- `viewer/README.md`: ルーティング表・画面節を追記。
+- テスト: `tests/test_viewer_lp.py` **新規** 4件（`/`=LP・`/watch`=観戦UI・`/watch`非リダイレクト・`/api/games`=200）。全172件パス。
+
+## 2026-08-12: 7感情目「奸」(ニヤリ/smirk)追加＋カード既定表情
+
+### 概要
+策略・裏切りを表す新表情 smirk（各vendorの `{vendor}_smirk.png`）を、ブログカードとゲーム内感情の両方で活用できるようにした。
+
+### 変更（レベルA: カード）
+- `scripts/blog.py`: `--card-emotion` 既定を `None` に変更。未指定時は lie(LIE DETECTED)/showdown(運命の一手)=smirk、その他=ease に自動分岐（明示指定は全カードで最優先）。
+- `.claude/skills/blog-visual/SKILL.md` / `reference/brand.md`: emotion 一覧に `smirk` と既定分岐を追記。
+
+### 変更（レベルB: ゲーム内感情）
+- `llm/response_parser.py`: `VALID_EMOTIONS` に `"奸"` を追加（6→7感情）。
+- `llm/prompt_builder.py`: emotion 選択肢に `"奸"(策略・ニヤリ・してやったり)` を追加。
+- `viewer/static/index.html`: `EMOTION_EN` に `'奸':'smirk'`、`EMOTION_EMOJI` に `'奸':'😏'` を追加。
+- `viewer/README.md`: 日英対応表・絵文字フォールバックに 奸/smirk/😏 を追記。
+- テスト: `tests/test_viewer.py`(EMOTION_EN 検証を8感情へ)、`tests/test_llm.py`(プロンプトに"奸"を検証)を同期。
+
+### 検証
+- `--card lie` 無指定で smirk が出る（model は ease 維持・明示は最優先）。過去ログ・既存感情は不変。
+
 ## 2026-08-10: 感情表示機能
 
 ### 概要

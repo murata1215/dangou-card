@@ -4,11 +4,17 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>談合カード 観戦ビューア</title>
+<script>
+  // テーマを描画前に適用（チラつき防止）
+  (function(){ try { var t = localStorage.getItem('viewer-theme') || 'dark';
+    document.documentElement.setAttribute('data-theme', t); } catch(e){} })();
+</script>
 <link rel="stylesheet" href="static/style.css">
 </head>
 <body>
 
 <div class="header">
+  <a href="/" class="home-link" title="トップへ戻る">🏠 トップ</a>
   <h1>嘘八百万 —談合カード—</h1>
   <select id="game-select"></select>
   <div class="stats" id="header-stats">
@@ -17,11 +23,100 @@
     <span id="cost-info">—</span>
   </div>
   <label><input type="checkbox" id="auto-refresh" checked> 自動更新</label>
+  <label><input type="checkbox" id="commentary-toggle" checked> 実況</label>
+  <label><input type="checkbox" id="situation-toggle" checked> 状況</label>
+  <button id="theme-toggle" class="theme-toggle" title="テーマ切替">🌙</button>
 </div>
 
 <div class="grid" id="player-grid"></div>
 
+<!-- 実況席 -->
+<div class="commentary-area" id="commentary-area" style="display:none">
+  <div class="commentary-header">
+    <span class="commentary-title">実況席</span>
+    <div class="commentary-round-nav">
+      <button id="commentary-prev">&#9664;</button>
+      <span id="commentary-round-label">R1</span>
+      <button id="commentary-next">&#9654;</button>
+    </div>
+    <button id="commentary-play" class="commentary-btn">&#9654; 再生</button>
+    <button id="commentary-stop" class="commentary-btn" style="display:none">&#9632; 停止</button>
+  </div>
+  <div class="commentary-body">
+    <div class="commentary-chara commentary-zundamon" id="chara-zundamon">
+      <div class="chara-img" id="chara-img-zundamon"></div>
+      <div class="chara-name">ずんだもん</div>
+    </div>
+    <div class="commentary-lines" id="commentary-lines"></div>
+    <div class="commentary-chara commentary-metan" id="chara-metan">
+      <div class="chara-img" id="chara-img-metan"></div>
+      <div class="chara-name">めたん</div>
+    </div>
+  </div>
+</div>
+
+<!-- ラウンド状況 -->
+<div class="situation" id="situation-area" style="display:none">
+  <div class="situation-header">
+    <span class="situation-title">📊 ラウンド状況</span>
+    <div class="situation-round-nav">
+      <button id="sit-prev">&#9664;</button>
+      <span id="sit-round-label">R1</span>
+      <button id="sit-next">&#9654;</button>
+    </div>
+  </div>
+  <div class="situation-body" id="situation-body"></div>
+</div>
+
 <div class="footer" id="footer-messages"></div>
+
+<details class="rules" id="rules-section" open>
+  <summary>📖 ルール解説</summary>
+  <div class="rules-body">
+    <div class="rules-card">
+      <h4>🎯 ゲームの流れ</h4>
+      <p><b id="rule-players">20</b>体のAIが<b>12ラウンド</b>を戦う生存ゲーム。各ラウンドは
+         市場開放→交渉→コミット→精算→財務の順に進行。1ラウンドに市場は3つ。</p>
+    </div>
+    <div class="rules-card">
+      <h4>💰 はじめの借入額（金額選択）</h4>
+      <p>開始前・ルール開示前に <b>120万〜1000万円</b> から自己申告で借入。
+         利息 <b id="rule-interest">1.5</b>%（複利/ラウンド）。借入額は全員に<b>公開</b>される。</p>
+    </div>
+    <div class="rules-card">
+      <h4>🏁 生存条件</h4>
+      <p>12ラウンド完走 かつ <b>借金残高=0</b> かつ <b>現金 <span id="rule-survival">200</span>万円以上</b>。
+         生存者の中で最終資産が高いほど良い。未達・破産・契約違反は脱落。</p>
+    </div>
+    <div class="rules-card">
+      <h4>🃏 使えるカード（役カード12枚）</h4>
+      <p>各ラウンド1枚を市場に出す。使ったカードは<b>消滅</b>、他者への<b>譲渡不可</b>。強い役ほど賞金の取り分が有利。</p>
+      <ul class="rules-cards">
+        <li>ROYAL FLUSH (10) ×1</li><li>STRAIGHT FLUSH (9) ×1</li>
+        <li>FOUR OF A KIND (8) ×1</li><li>FULL HOUSE (7) ×1</li>
+        <li>FLUSH (6) ×1</li><li>STRAIGHT (5) ×1</li>
+        <li>THREE OF A KIND (4) ×1</li><li>TWO PAIR (3) ×1</li>
+        <li>ONE PAIR (2) ×2</li><li>HIGH CARD (1) ×2</li>
+      </ul>
+    </div>
+    <div class="rules-card">
+      <h4>📜 公正証書（契約）</h4>
+      <p>発行料 <b>10万円</b>（提案者負担）。締結すると自動執行・自動監査される。</p>
+      <ul>
+        <li><b>型A（金銭）</b>: 支払い等の約束。条件成立で自動送金。</li>
+        <li><b>型B（行動）</b>: 「この市場に出ない/この役を使う/不参加」等の約束。<b>違反=即脱落</b>。</li>
+      </ul>
+    </div>
+    <div class="rules-card">
+      <h4>🏆 Entry Fee・賞金・通信</h4>
+      <ul>
+        <li>各市場参加に <b id="rule-entry">10</b>万円（賞金プールに加算）。不払い=破産=脱落。</li>
+        <li>総賞金は逓増（本試合 約<b id="rule-prize">1536</b>万円を全12ラウンドに配分）。</li>
+        <li>匿名通信 10万円/通・1ラウンド2通まで。</li>
+      </ul>
+    </div>
+  </div>
+</details>
 
 <div class="modal-overlay" id="modal-overlay">
   <div class="modal">
@@ -35,16 +130,17 @@
 // === 談合カード 観戦ビューア JS ===
 let currentGame = null; // {trial_dir, game_id}
 let refreshInterval = null;
+let lastRenderSig = null; // 直近描画の署名（無変化時は再描画せずちらつき防止）
 
 // 感情→絵文字マッピング
 const EMOTION_EMOJI = {
   '喜': '😊', '怒': '😠', '哀': '😢', '楽': '😌',
-  '焦': '😰', '疑': '🤨', '平静': '😐'
+  '焦': '😰', '疑': '🤨', '奸': '😏', '平静': '😐'
 };
 // 感情→英語名マッピング（画像ファイル名用）
 const EMOTION_EN = {
   '喜': 'joy', '怒': 'anger', '哀': 'sadness', '楽': 'ease',
-  '焦': 'panic', '疑': 'doubt', '平静': 'neutral'
+  '焦': 'panic', '疑': 'doubt', '奸': 'smirk', '平静': 'neutral'
 };
 function emotionToEmoji(emotion) {
   return EMOTION_EMOJI[emotion] || '😐';
@@ -60,13 +156,25 @@ function guessVendor(modelName) {
   if (n.includes('deepseek')) return 'deepseek';
   return '';
 }
+// モデルラベル "M1:Claude Sonnet 5" を seat と name に分割
+function splitModelName(label) {
+  const idx = (label || '').indexOf(':');
+  if (idx >= 0) return { seat: label.slice(0, idx), name: label.slice(idx + 1).trim() };
+  return { seat: '', name: label || '?' };
+}
 // 感情表示: 画像があれば画像、なければ絵文字
+// 平静(neutral)は ease 画像で代用（neutralを置けばそちらを優先）
 function emotionDisplay(emotion, vendor) {
   const en = EMOTION_EN[emotion] || 'neutral';
   const emoji = EMOTION_EMOJI[emotion] || '😐';
-  const vendorSrc = `emotions/${vendor}_${en}.png`;
-  const commonSrc = `emotions/${en}.png`;
-  // img with onerror fallback chain: vendor → common → emoji text
+  const vendorSrc = `static/emotions/${vendor}_${en}.png`;
+  const commonSrc = `static/emotions/${en}.png`;
+  if (en === 'neutral') {
+    // neutral → vendor_ease → neutral(common) → ease(common) → emoji
+    const vendorEase = `static/emotions/${vendor}_ease.png`;
+    const commonEase = `static/emotions/ease.png`;
+    return `<img src="${vendorSrc}" alt="${emotion}" title="${emotion}" class="emotion-img" onerror="this.onerror=function(){this.onerror=function(){this.onerror=function(){this.replaceWith(document.createTextNode('${emoji}'))};this.src='${commonEase}'};this.src='${commonSrc}'};this.src='${vendorEase}'">`;
+  }
   return `<img src="${vendorSrc}" alt="${emotion}" title="${emotion}" class="emotion-img" onerror="this.onerror=function(){this.replaceWith(document.createTextNode('${emoji}'))};this.src='${commonSrc}'">`;
 }
 
@@ -89,6 +197,7 @@ async function loadGames() {
     });
     // 最新を選択
     currentGame = JSON.parse(sel.value);
+    lastRenderSig = null; // 試合切替時は必ず初回描画
     loadState();
   } catch (e) {
     console.error('loadGames error:', e);
@@ -99,6 +208,7 @@ async function loadGames() {
 document.getElementById('game-select').addEventListener('change', (e) => {
   try {
     currentGame = JSON.parse(e.target.value);
+    lastRenderSig = null; // 試合切替時は必ず初回描画
     loadState();
   } catch (err) {}
 });
@@ -116,7 +226,46 @@ async function loadState() {
   }
 }
 
+// 表示に関係する安定フィールドのみから署名を作る（揮発フィールド last_active_sec_ago は除外）
+function computeStateSig(state) {
+  const parts = [state.current_round, state.total_rounds, state.survivors, state.total_cost];
+  state.players.forEach(p => {
+    const isThinking = p.stats.last_active_sec_ago !== null && p.stats.last_active_sec_ago < 30;
+    const s = p.strategy_summary || {};
+    parts.push(p.player_id, p.status, p.model_name || p.model_id,
+      s.target_market, s.current_goal, s.card_plan,
+      p.emotion, p.cash, p.last_message, p.latest_round,
+      p.stats.valid_json, p.stats.calls, p.stats.dm_count, p.stats.broadcast_count,
+      p.stats.errors, p.stats.cost, isThinking);
+  });
+  (state.recent_messages || []).forEach(m => parts.push(m.round, m.sender, m.message));
+  return JSON.stringify(parts);
+}
+
+// ルール解説の試合依存数値を config で一度だけ反映
+let rulesFilled = false;
+function fillRules(cfg) {
+  if (rulesFilled || !cfg) return;
+  const man = (v) => Math.round((v || 0) / 10000);
+  const set = (id, v) => { const el = document.getElementById(id); if (el != null && v != null) el.textContent = v; };
+  set('rule-players', cfg.num_players);
+  set('rule-interest', cfg.interest_rate != null ? (cfg.interest_rate * 100) : null);
+  set('rule-survival', cfg.survival_cash != null ? man(cfg.survival_cash) : null);
+  set('rule-entry', cfg.entry_fee != null ? man(cfg.entry_fee) : null);
+  set('rule-prize', cfg.total_prize != null ? man(cfg.total_prize) : null);
+  rulesFilled = true;
+}
+
 function renderState(state) {
+  fillRules(state.config);
+  if (state.config && state.config.survival_cash != null) currentSurvivalCash = state.config.survival_cash;
+  // 進行中試合: ラウンドが進んだら状況を再取得（次回loadStateで反映）
+  if (situationData && state.current_round > situationMaxRound) situationLoadedKey = null;
+  // 無変化なら再描画しない（自動更新による感情画像のちらつき防止）
+  const sig = computeStateSig(state);
+  if (sig === lastRenderSig) return;
+  lastRenderSig = sig;
+
   // ヘッダ
   document.getElementById('round-info').textContent = `R${state.current_round}/${state.total_rounds}`;
   document.getElementById('survivor-info').textContent = `生存 ${state.survivors}/${state.players.length}`;
@@ -143,17 +292,27 @@ function renderState(state) {
     // 感情表示
     const vendor = guessVendor(p.model_name || p.model_id || '');
     const emotionHtml = emotionDisplay(p.emotion || '平静', vendor);
-    const emotionHistory = (p.emotion_history || []).map(e => emotionDisplay(e, vendor)).join('');
+
+    // モデル名・所持金・最終発言
+    const mm = splitModelName(p.model_name || p.model_id || '');
+    const cashStr = (p.cash != null) ? '¥' + p.cash.toLocaleString() : '—';
+    const lastMsg = p.last_message ? escapeHtml(p.last_message) : '—';
 
     panel.innerHTML = `
-      <div>
-        <span class="pid">${p.player_id}</span>
-        <span class="model">${p.model_name || p.model_id}</span>
-        <span class="badge ${badgeClass}">${badgeText}</span>
-        <span class="emotion-icon">${emotionHtml}</span>
+      <div class="panel-top">
+        <div class="emotion-big">${emotionHtml}</div>
+        <div class="panel-id">
+          <div class="model-large">${escapeHtml(mm.name)}</div>
+          <div class="panel-sub">
+            <span class="pid">${p.player_id}</span>
+            <span class="seat">${escapeHtml(mm.seat)}</span>
+            <span class="badge ${badgeClass}">${badgeText}</span>
+          </div>
+          <div class="cash-large">${cashStr}</div>
+        </div>
       </div>
       <div class="strategy">${strategyText || '—'}</div>
-      <div class="emotion-history" title="感情推移（直近5件）">${emotionHistory || '—'}</div>
+      <div class="last-utterance" title="最終発言">💬 ${lastMsg}</div>
       <div class="stats-row">
         <span>R${p.latest_round}</span>
         <span>JSON:${p.stats.valid_json}/${p.stats.calls}</span>
@@ -261,7 +420,388 @@ document.getElementById('auto-refresh').addEventListener('change', (e) => {
   }
 });
 
+// === 実況席 ===
+let commentaryData = null;
+let commentaryLoadedKey = null; // ロード済みゲームのキー（自動更新での状態リセット防止）
+let commentaryRound = 1;
+let commentaryPlayTimer = null;
+let commentaryPlayIndex = 0;
+const COMMENTARY_PLAY_INTERVAL = 4000;
+
+// キャラ画像の初期化
+function initCharaImages() {
+  const zImg = document.getElementById('chara-img-zundamon');
+  const mImg = document.getElementById('chara-img-metan');
+  // 画像があれば表示、なければ絵文字
+  const zTest = new Image();
+  zTest.onload = () => { zImg.innerHTML = '<img src="static/characters/zundamon.png" alt="ずんだもん">'; };
+  zTest.onerror = () => { zImg.textContent = '\uD83E\uDEDB'; };
+  zTest.src = 'static/characters/zundamon.png';
+  const mTest = new Image();
+  mTest.onload = () => { mImg.innerHTML = '<img src="static/characters/metan.png" alt="めたん">'; };
+  mTest.onerror = () => { mImg.textContent = '\uD83C\uDF80'; };
+  mTest.src = 'static/characters/metan.png';
+}
+
+async function loadCommentary() {
+  if (!currentGame) return;
+  const key = currentGame.trial_dir + '/' + currentGame.game_id;
+  if (key === commentaryLoadedKey) return; // 既にロード済み → 再取得・状態リセットしない
+  const toggle = document.getElementById('commentary-toggle');
+  try {
+    const url = `api/games/${currentGame.trial_dir}/${currentGame.game_id}/commentary`;
+    const res = await fetch(url);
+    if (res.status === 404) {
+      commentaryData = null;
+      document.getElementById('commentary-area').style.display = 'none';
+      return; // keyは設定しない（実況が後から生成される場合に備え再試行を許可）
+    }
+    commentaryData = await res.json();
+    commentaryLoadedKey = key; // 成功時のみロード済みに
+    commentaryRound = 1;
+    document.getElementById('commentary-area').style.display = toggle.checked ? '' : 'none';
+    stopCommentaryPlay();
+    renderCommentary();
+  } catch (e) {
+    commentaryData = null;
+    document.getElementById('commentary-area').style.display = 'none';
+  }
+}
+
+function renderCommentary() {
+  if (!commentaryData) return;
+  const lines = commentaryData.rounds[String(commentaryRound)] || [];
+  document.getElementById('commentary-round-label').textContent = `R${commentaryRound}`;
+  const container = document.getElementById('commentary-lines');
+  container.innerHTML = '';
+  lines.forEach((item, i) => {
+    const div = document.createElement('div');
+    const isZ = item.speaker === 'zundamon';
+    div.className = 'commentary-line ' + (isZ ? 'line-zundamon' : 'line-metan');
+    const name = isZ ? 'ずんだもん' : 'めたん';
+    div.innerHTML = `<span class="line-name">${name}</span><span class="line-text">${escapeHtml(item.text)}</span>`;
+    container.appendChild(div);
+  });
+  // 話者強調をリセット
+  document.getElementById('chara-zundamon').classList.remove('speaking');
+  document.getElementById('chara-metan').classList.remove('speaking');
+}
+
+function renderCommentaryUpTo(index) {
+  if (!commentaryData) return;
+  const lines = commentaryData.rounds[String(commentaryRound)] || [];
+  const container = document.getElementById('commentary-lines');
+  container.innerHTML = '';
+  for (let i = 0; i <= index && i < lines.length; i++) {
+    const item = lines[i];
+    const div = document.createElement('div');
+    const isZ = item.speaker === 'zundamon';
+    div.className = 'commentary-line ' + (isZ ? 'line-zundamon' : 'line-metan');
+    const name = isZ ? 'ずんだもん' : 'めたん';
+    div.innerHTML = `<span class="line-name">${name}</span><span class="line-text">${escapeHtml(item.text)}</span>`;
+    container.appendChild(div);
+  }
+  container.scrollTop = container.scrollHeight;
+  // 話者強調
+  const current = lines[index];
+  document.getElementById('chara-zundamon').classList.toggle('speaking', current && current.speaker === 'zundamon');
+  document.getElementById('chara-metan').classList.toggle('speaking', current && current.speaker === 'metan');
+}
+
+function startCommentaryPlay() {
+  const lines = commentaryData ? (commentaryData.rounds[String(commentaryRound)] || []) : [];
+  if (!lines.length) return;
+  commentaryPlayIndex = 0;
+  document.getElementById('commentary-play').style.display = 'none';
+  document.getElementById('commentary-stop').style.display = '';
+  renderCommentaryUpTo(0);
+  commentaryPlayTimer = setInterval(() => {
+    commentaryPlayIndex++;
+    if (commentaryPlayIndex >= lines.length) {
+      stopCommentaryPlay();
+      return;
+    }
+    renderCommentaryUpTo(commentaryPlayIndex);
+  }, COMMENTARY_PLAY_INTERVAL);
+}
+
+function stopCommentaryPlay() {
+  if (commentaryPlayTimer) {
+    clearInterval(commentaryPlayTimer);
+    commentaryPlayTimer = null;
+  }
+  document.getElementById('commentary-play').style.display = '';
+  document.getElementById('commentary-stop').style.display = 'none';
+  document.getElementById('chara-zundamon').classList.remove('speaking');
+  document.getElementById('chara-metan').classList.remove('speaking');
+  renderCommentary();
+}
+
+// ラウンド切替
+document.getElementById('commentary-prev').addEventListener('click', () => {
+  if (commentaryRound > 1) {
+    commentaryRound--; stopCommentaryPlay(); renderCommentary();
+    if (situationData) setSituationRound(commentaryRound);
+  }
+});
+document.getElementById('commentary-next').addEventListener('click', () => {
+  if (!commentaryData) return;
+  const maxR = Math.max(...Object.keys(commentaryData.rounds).map(Number));
+  if (commentaryRound < maxR) {
+    commentaryRound++; stopCommentaryPlay(); renderCommentary();
+    if (situationData) setSituationRound(commentaryRound);
+  }
+});
+document.getElementById('commentary-play').addEventListener('click', startCommentaryPlay);
+document.getElementById('commentary-stop').addEventListener('click', stopCommentaryPlay);
+
+// 実況トグル
+document.getElementById('commentary-toggle').addEventListener('change', (e) => {
+  const area = document.getElementById('commentary-area');
+  if (commentaryData) {
+    area.style.display = e.target.checked ? '' : 'none';
+  }
+});
+
+// === ラウンド状況 ===
+let situationData = null;
+let situationLoadedKey = null;
+let situationRound = 1;
+let situationMaxRound = 0;
+let currentSurvivalCash = 2000000; // renderStateのconfigから更新
+
+// カードランク情報（強さ順）
+const CARD_INFO = {
+  ROYAL_FLUSH:   { l: 'ROYAL FLUSH',    v: 10 },
+  STRAIGHT_FLUSH:{ l: 'STRAIGHT FLUSH', v: 9 },
+  FOUR_OF_A_KIND:{ l: 'FOUR OF A KIND', v: 8 },
+  FULL_HOUSE:    { l: 'FULL HOUSE',     v: 7 },
+  FLUSH:         { l: 'FLUSH',          v: 6 },
+  STRAIGHT:      { l: 'STRAIGHT',       v: 5 },
+  THREE_OF_A_KIND:{ l: 'THREE OF A KIND', v: 4 },
+  TWO_PAIR:      { l: 'TWO PAIR',       v: 3 },
+  ONE_PAIR:      { l: 'ONE PAIR',       v: 2 },
+  HIGH_CARD:     { l: 'HIGH CARD',      v: 1 },
+};
+// card_id("ONE_PAIR_2")→rankキー("ONE_PAIR")
+function cardRankKey(cardId) {
+  return (cardId || '').replace(/_\d+$/, '');
+}
+function cardInfo(cardId) {
+  return CARD_INFO[cardRankKey(cardId)] || { l: cardId || '?', v: 0 };
+}
+// pid → 短い表示名
+function pidLabel(pid) {
+  const label = (situationData && situationData.seat_map) ? situationData.seat_map[pid] : null;
+  if (!label) return pid;
+  const mm = splitModelName(label);
+  return mm.name || pid;
+}
+function yen(v) { return (v != null) ? '¥' + Number(v).toLocaleString() : '—'; }
+
+// 公正証書の義務(1件)を人間可読文に整形
+function fmtObligation(t) {
+  if (!t) return '';
+  const ob = escapeHtml(pidLabel(t.obligor || '?'));
+  const cp = escapeHtml(pidLabel(t.counterparty || '?'));
+  const d = t.details || {};
+  const r = (t.round_num != null) ? ` <span class="ob-round">R${t.round_num}履行</span>` : '';
+  switch (t.ob_type) {
+    case 'type_a_payment':
+      return `<span class="ob-tag ob-a">型A</span> 💴 <b>${ob}</b>→<b>${cp}</b> ${yen(d.amount)} 支払${r}`;
+    case 'type_b_market':
+      return `<span class="ob-tag ob-b">型B</span> 🎯 <b>${ob}</b> は <b>${escapeHtml(d.market_id || '?')}</b> に参加${r}`;
+    case 'type_b_no_market':
+      return `<span class="ob-tag ob-b">型B</span> 🚫 <b>${ob}</b> は <b>${escapeHtml(d.market_id || '?')}</b> に不参加${r}`;
+    case 'type_b_card': {
+      const ci = CARD_INFO[d.card_rank] || { l: d.card_rank || '?' };
+      return `<span class="ob-tag ob-b">型B</span> 🃏 <b>${ob}</b> は <b>${escapeHtml(ci.l)}</b> を使用${r}`;
+    }
+    default:
+      return `<span class="card-chip">${escapeHtml(String(t.ob_type || '?'))}</span>`;
+  }
+}
+
+async function loadSituation() {
+  if (!currentGame) return;
+  const key = currentGame.trial_dir + '/' + currentGame.game_id;
+  if (key === situationLoadedKey) return;
+  const toggle = document.getElementById('situation-toggle');
+  try {
+    const url = `api/games/${currentGame.trial_dir}/${currentGame.game_id}/rounds`;
+    const res = await fetch(url);
+    const data = await res.json();
+    const roundKeys = Object.keys(data.rounds || {}).map(Number).filter(n => !isNaN(n));
+    if (!roundKeys.length) {
+      situationData = null;
+      document.getElementById('situation-area').style.display = 'none';
+      return; // keyは設定しない（後から生成される場合に再試行）
+    }
+    situationData = data;
+    situationLoadedKey = key;
+    situationMaxRound = Math.max(...roundKeys);
+    situationRound = situationMaxRound; // 最新ラウンドを初期表示
+    document.getElementById('situation-area').style.display = toggle.checked ? '' : 'none';
+    renderSituation();
+  } catch (e) {
+    situationData = null;
+    document.getElementById('situation-area').style.display = 'none';
+  }
+}
+
+function setSituationRound(r) {
+  if (!situationData) return;
+  const keys = Object.keys(situationData.rounds).map(Number).filter(n => !isNaN(n));
+  if (!keys.length) return;
+  const lo = Math.min(...keys), hi = Math.max(...keys);
+  situationRound = Math.max(lo, Math.min(hi, r));
+  renderSituation();
+}
+
+function renderSituation() {
+  if (!situationData) return;
+  document.getElementById('sit-round-label').textContent = `R${situationRound}`;
+  const rd = situationData.rounds[String(situationRound)];
+  const body = document.getElementById('situation-body');
+  body.innerHTML = '';
+  if (!rd) { body.innerHTML = '<div class="sit-card">このラウンドのデータはありません。</div>'; return; }
+
+  const players = situationData.players || [];
+  const elimMap = {};
+  (rd.eliminated || []).forEach(x => { elimMap[x.player_id] = x.reason; });
+
+  // 1) 市場
+  let mHtml = '<div class="sit-card"><h4>🏪 市場の賞金</h4>';
+  (rd.markets || []).forEach(m => {
+    const winners = (m.winners || []).map(w => `<span class="card-chip">${pidLabel(w)}</span>`).join('');
+    const pay = (m.prize_per_winner != null) ? `<span class="sit-win">各 +${yen(m.prize_per_winner)}</span>` : '';
+    const part = (m.participants != null) ? ` / 参加${m.participants}` : '';
+    mHtml += `<div class="sit-row"><b>${m.market_id}</b> 賞金 ${yen(m.prize_pool)}${part}`
+      + (winners ? `<br>勝者 ${winners} ${pay}` : ' <span class="sit-muted">（結果待ち）</span>') + '</div>';
+  });
+  mHtml += '</div>';
+
+  // 2) 資産ランキング
+  const ranked = players.map(pid => {
+    const c = (rd.cash || {})[pid] || {};
+    return { pid, cash: c.cash, debt: c.debt, free: c.free_cash };
+  }).sort((a, b) => (b.cash || -1) - (a.cash || -1));
+  let rHtml = '<div class="sit-card"><h4>💰 資産ランキング</h4>';
+  ranked.forEach((x, i) => {
+    const elim = elimMap[x.pid] !== undefined;
+    const survive = (x.debt === 0 && x.cash != null && x.cash >= currentSurvivalCash);
+    const ok = survive ? ' <span class="sit-ok">✅生還圏</span>' : '';
+    const debtStr = (x.debt != null && x.debt > 0) ? ` <span class="sit-debt">借金${yen(x.debt)}</span>` : '';
+    const elimStr = elim ? ` <span class="sit-elim">脱落(${elimMap[x.pid]})</span>` : '';
+    rHtml += `<div class="sit-row">${i + 1}. <b>${escapeHtml(pidLabel(x.pid))}</b> ${yen(x.cash)}${debtStr}${ok}${elimStr}</div>`;
+  });
+  rHtml += '</div>';
+
+  // 3) 提出カード
+  let cHtml = '<div class="sit-card"><h4>🃏 提出カード</h4>';
+  if ((rd.commits || []).length) {
+    // player順に並べる
+    const byPid = {};
+    (rd.commits || []).forEach(c => { byPid[c.player_id] = c; });
+    players.forEach(pid => {
+      const c = byPid[pid];
+      if (!c) return;
+      const info = cardInfo(c.card);
+      cHtml += `<div class="sit-row"><b>${escapeHtml(pidLabel(pid))}</b> → `
+        + `<span class="card-chip" title="強さ${info.v}">${info.l}</span> @${c.market_id || '?'}</div>`;
+    });
+  } else {
+    cHtml += '<div class="sit-row sit-muted">提出情報なし</div>';
+  }
+  cHtml += '</div>';
+
+  // 4) 手札
+  let hHtml = '<div class="sit-card"><h4>✋ 手札（残り）</h4>';
+  players.forEach(pid => {
+    const cards = (rd.holdings || {})[pid] || [];
+    const chips = cards
+      .map(cid => cardInfo(cid))
+      .sort((a, b) => b.v - a.v)
+      .map(info => `<span class="card-chip" title="強さ${info.v}">${info.l}</span>`)
+      .join('');
+    hHtml += `<div class="sit-row"><b>${escapeHtml(pidLabel(pid))}</b> (${cards.length}) ${chips}</div>`;
+  });
+  hHtml += '</div>';
+
+  // 5) 公正証書
+  let kHtml = '<div class="sit-card"><h4>📜 公正証書（締結条件）</h4>';
+  if ((rd.contracts || []).length) {
+    (rd.contracts || []).forEach(ct => {
+      const parties = (ct.parties || []).map(pidLabel).map(escapeHtml).join(', ');
+      const signedN = (ct.signed_by || []).length, partyN = (ct.parties || []).length;
+      const active = (signedN >= partyN && partyN > 0);
+      const signed = `${signedN}/${partyN}署名${active ? ' ✅成立' : ' …署名待ち'}`;
+      let terms;
+      if (Array.isArray(ct.terms) && ct.terms.length) {
+        terms = '<ul class="ob-list">'
+          + ct.terms.map(t => `<li>${fmtObligation(t)}</li>`).join('') + '</ul>';
+      } else {
+        terms = '<div class="sit-muted ob-none">締結条件の詳細は記録に残っていません</div>';
+      }
+      kHtml += `<div class="sit-row sit-contract"><b>${escapeHtml(pidLabel(ct.proposer))}</b>提案 → ${parties}`
+        + ` <span class="sit-muted">(${signed}, R${ct.round_created}提案)</span>${terms}</div>`;
+    });
+  } else {
+    kHtml += '<div class="sit-row sit-muted">締結なし</div>';
+  }
+  kHtml += '</div>';
+
+  // 6) メッセージ
+  let gHtml = '<div class="sit-card sit-card-wide"><h4>💬 メッセージ（誰→誰）</h4>';
+  const msgs = rd.messages || [];
+  if (msgs.length) {
+    msgs.forEach(m => {
+      const isDm = m.type === 'dm';
+      const to = isDm ? pidLabel(m.to) : '全体';
+      gHtml += `<div class="sit-msg ${isDm ? 'dm' : 'bc'}">`
+        + `<b>${escapeHtml(pidLabel(m.sender))}</b> <span class="arrow">→ ${escapeHtml(to)}</span>: `
+        + `${escapeHtml(m.message)}</div>`;
+    });
+  } else {
+    gHtml += '<div class="sit-row sit-muted">このラウンドのメッセージなし</div>';
+  }
+  gHtml += '</div>';
+
+  body.innerHTML = mHtml + rHtml + cHtml + hHtml + kHtml + gHtml;
+}
+
+// 状況ナビ（単独移動）
+document.getElementById('sit-prev').addEventListener('click', () => setSituationRound(situationRound - 1));
+document.getElementById('sit-next').addEventListener('click', () => setSituationRound(situationRound + 1));
+// 状況トグル
+document.getElementById('situation-toggle').addEventListener('change', (e) => {
+  const area = document.getElementById('situation-area');
+  if (situationData) area.style.display = e.target.checked ? '' : 'none';
+});
+
+// ゲーム変更時にcommentary・状況も読み込む（既存のloadStateの後に呼ぶ）
+const _origLoadState = loadState;
+loadState = async function() {
+  await _origLoadState();
+  await loadCommentary();
+  await loadSituation();
+};
+
+// --- テーマ切替 ---
+function applyTheme(theme) {
+  document.documentElement.setAttribute('data-theme', theme);
+  const btn = document.getElementById('theme-toggle');
+  if (btn) btn.textContent = (theme === 'light') ? '☀️' : '🌙';
+  try { localStorage.setItem('viewer-theme', theme); } catch(e){}
+}
+document.getElementById('theme-toggle').addEventListener('click', () => {
+  const cur = document.documentElement.getAttribute('data-theme') || 'dark';
+  applyTheme(cur === 'light' ? 'dark' : 'light');
+});
+
 // --- 初期化 ---
+applyTheme(document.documentElement.getAttribute('data-theme') || 'dark');
+initCharaImages();
 loadGames();
 startAutoRefresh();
 </script>

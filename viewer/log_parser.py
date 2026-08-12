@@ -217,6 +217,7 @@ def get_game_state(logs_dir: Path, trial_dir_name: str, game_id: str) -> dict[st
         latest_phase = ""
         latest_ts = ""
         strategy_summary = None
+        last_message = None
 
         for e in entries:
             cost += e.get("cost_usd", 0)
@@ -242,11 +243,13 @@ def get_game_state(logs_dir: Path, trial_dir_name: str, game_id: str) -> dict[st
                         dm_count += 1
                     elif at == "broadcast":
                         bc_count += 1
+                        msg = a.get("message", "")
+                        last_message = msg  # 最後のbroadcastを最終発言として保持
                         # メッセージ収集
                         all_messages.append({
                             "sender": pid,
                             "type": "broadcast",
-                            "message": a.get("message", "")[:100],
+                            "message": msg[:100],
                             "round": rnd,
                         })
 
@@ -286,6 +289,8 @@ def get_game_state(logs_dir: Path, trial_dir_name: str, game_id: str) -> dict[st
             "strategy_summary": _truncate_strategy(strategy_summary),
             "emotion": latest_emotion,
             "emotion_history": emotion_history,
+            "cash": None,  # 後段のeventsループでSNAPSHOTから埋める
+            "last_message": (last_message[:120] if last_message else None),
             "stats": {
                 "calls": calls,
                 "valid_json": valid_json,
@@ -300,9 +305,13 @@ def get_game_state(logs_dir: Path, trial_dir_name: str, game_id: str) -> dict[st
     # イベントログから脱落情報を取得
     events_file = trial_dir / f"{game_id}_events.jsonl"
     eliminated: list[str] = []
+    cash_by_pid: dict[str, int] = {}
+    game_config: dict[str, Any] = {}
     if events_file.exists():
         events = _cache.get_entries(events_file)
         for e in events:
+            if e.get("event_type") == "GAME_START":
+                game_config = e.get("data", {}).get("config", {})
             if e.get("event_type") in ("ELIMINATION", "BANKRUPTCY", "FORCED_LIQUIDATION"):
                 pid = e.get("data", {}).get("player_id", "")
                 if pid and pid not in eliminated:
@@ -313,11 +322,18 @@ def get_game_state(logs_dir: Path, trial_dir_name: str, game_id: str) -> dict[st
                     pid = data.get("player_id", "")
                     if pid and pid not in eliminated:
                         eliminated.append(pid)
+            if e.get("event_type") == "SNAPSHOT":
+                # SNAPSHOTから各プレイヤーの最新所持金を取得
+                for pid, sd in e.get("data", {}).get("snapshots", {}).items():
+                    if sd.get("cash") is not None:
+                        cash_by_pid[pid] = sd["cash"]
 
         # プレイヤーの状態を更新
         for p in players:
             if p["player_id"] in eliminated:
                 p["status"] = "eliminated"
+            if p["player_id"] in cash_by_pid:
+                p["cash"] = cash_by_pid[p["player_id"]]
 
     return {
         "current_round": max_round,
@@ -327,6 +343,7 @@ def get_game_state(logs_dir: Path, trial_dir_name: str, game_id: str) -> dict[st
         "total_cost": round(total_cost, 4),
         "eliminated": eliminated,
         "survivors": len(players) - len(eliminated),
+        "config": game_config,
     }
 
 
@@ -412,3 +429,341 @@ def get_player_timeline(
         timeline.append(item)
 
     return timeline
+
+
+def get_commentary(
+    logs_dir: Path, trial_dir_name: str, game_id: str,
+) -> dict[str, Any] | None:
+    """
+    台本データを取得する。v2優先、v1フォールバック。
+
+    Returns:
+        {version, rounds: {"1": [{speaker, text}, ...], ...}} or None
+    """
+    trial_dir = logs_dir / trial_dir_name
+
+    # v2優先 → v1フォールバック
+    v2_path = trial_dir / "commentary" / "v2" / "script.jsonl"
+    v1_path = trial_dir / "commentary" / "script.jsonl"
+
+    if v2_path.exists():
+        path = v2_path
+        version = "v2"
+    elif v1_path.exists():
+        path = v1_path
+        version = "v1"
+    else:
+        return None
+
+    entries = _cache.get_entries(path)
+    if not entries:
+        return None
+
+    # ラウンドごとにグループ化
+    rounds: dict[str, list[dict[str, str]]] = {}
+    for e in entries:
+        rn = str(e.get("round", 0))
+        speaker = e.get("speaker", "unknown")
+        text = e.get("text", "")
+        if rn not in rounds:
+            rounds[rn] = []
+        rounds[rn].append({"speaker": speaker, "text": text})
+
+    return {"version": version, "rounds": rounds}
+
+
+# §3.1 全員同一構成の固定12枚デッキ（card_id）
+FULL_DECK = [
+    "ROYAL_FLUSH_1", "STRAIGHT_FLUSH_1", "FOUR_OF_A_KIND_1", "FULL_HOUSE_1",
+    "FLUSH_1", "STRAIGHT_1", "THREE_OF_A_KIND_1", "TWO_PAIR_1",
+    "ONE_PAIR_1", "ONE_PAIR_2", "HIGH_CARD_1", "HIGH_CARD_2",
+]
+
+
+def _collect_round_messages(
+    trial_dir: Path, game_id: str,
+) -> dict[str, list[dict[str, Any]]]:
+    """
+    LLMログから dm/broadcast をラウンド別に収集する。
+    eventsのNEGOTIATION_ACTIONは本文/宛先を持たないため、LLMログを使う。
+
+    Returns:
+        {"1": [{sender, to?, type, message, turn, round}, ...], ...}
+    """
+    llm_logs_dir = trial_dir / "llm_logs"
+    by_round: dict[str, list[dict[str, Any]]] = {}
+    if not llm_logs_dir.exists():
+        return by_round
+
+    for lf in sorted(llm_logs_dir.glob(f"{game_id}_*_llm_calls.jsonl")):
+        pid = lf.stem.split("_")[1] if "_" in lf.stem else "?"
+        for e in _cache.get_entries(lf):
+            a = _extract_action(e.get("response_text", ""))
+            if not a or not isinstance(a, dict):
+                continue
+            at = a.get("type", "")
+            if at not in ("dm", "broadcast"):
+                continue
+            rn = str(e.get("round_num", 0))
+            rec: dict[str, Any] = {
+                "sender": pid,
+                "type": at,
+                "message": str(a.get("message", ""))[:200],
+                "turn": e.get("turn"),
+                "round": e.get("round_num", 0),
+            }
+            if at == "dm":
+                rec["to"] = a.get("to", "")
+            by_round.setdefault(rn, []).append(rec)
+
+    # ラウンド内は turn 順に並べる（turn 無しは末尾）
+    for rn in by_round:
+        by_round[rn].sort(key=lambda r: (r["turn"] is None, r["turn"] or 0))
+    return by_round
+
+
+def _collect_contract_terms(
+    trial_dir: Path, game_id: str,
+) -> dict[tuple[str, int], list[Any]]:
+    """
+    LLMログから contract_propose の terms を (proposer, round) 別に収集する。
+    同一 (proposer, round) に複数提案があり得るためリストで保持し、順に消費する。
+    """
+    llm_logs_dir = trial_dir / "llm_logs"
+    terms_by_key: dict[tuple[str, int], list[Any]] = {}
+    if not llm_logs_dir.exists():
+        return terms_by_key
+    for lf in sorted(llm_logs_dir.glob(f"{game_id}_*_llm_calls.jsonl")):
+        pid = lf.stem.split("_")[1] if "_" in lf.stem else "?"
+        for e in _cache.get_entries(lf):
+            a = _extract_action(e.get("response_text", ""))
+            if a and isinstance(a, dict) and a.get("type") == "contract_propose":
+                key = (pid, e.get("round_num", 0))
+                terms_by_key.setdefault(key, []).append(a.get("terms", []))
+    return terms_by_key
+
+
+def get_round_states(
+    logs_dir: Path, trial_dir_name: str, game_id: str,
+) -> dict[str, Any]:
+    """
+    ラウンド別の盤面状況を再構成して返す。
+
+    Returns:
+        {
+          total_rounds, players:[pid...], seat_map:{pid:label},
+          rounds: { "R": {markets, commits, cash, holdings, contracts,
+                          messages, eliminated} }
+        }
+    """
+    trial_dir = logs_dir / trial_dir_name
+    seat_map = _load_seat_map(trial_dir, game_id)
+    events_file = trial_dir / f"{game_id}_events.jsonl"
+    messages_by_round = _collect_round_messages(trial_dir, game_id)
+    terms_by_key = _collect_contract_terms(trial_dir, game_id)
+
+    result: dict[str, Any] = {
+        "total_rounds": 12,
+        "players": [],
+        "seat_map": seat_map,
+        "rounds": {},
+    }
+
+    if not events_file.exists():
+        # eventsが無くてもメッセージだけは見せられる
+        for rn, msgs in messages_by_round.items():
+            result["rounds"][rn] = {
+                "markets": [], "commits": [], "cash": {}, "holdings": {},
+                "contracts": [], "messages": msgs, "eliminated": [],
+            }
+        return result
+
+    events = _cache.get_entries(events_file)
+
+    def rnd(r: Any) -> dict[str, Any]:
+        rn = str(r)
+        if rn not in result["rounds"]:
+            result["rounds"][rn] = {
+                "markets": [], "commits": [], "cash": {}, "holdings": {},
+                "contracts": [], "messages": [], "eliminated": [],
+            }
+        return result["rounds"][rn]
+
+    players: list[str] = []
+    # 契約の累積状態 {contract_id: {...}}
+    contracts: dict[str, dict[str, Any]] = {}
+    # カード累積提出 {pid: set(card_id)}
+    committed: dict[str, set[str]] = {}
+    max_round = 0
+
+    for e in events:
+        et = e.get("event_type")
+        data = e.get("data", {})
+        r = e.get("round_num", 0)
+        if isinstance(r, int) and r > max_round:
+            max_round = r
+
+        if et == "LOAN_CHOSEN":
+            pid = data.get("player_id", "")
+            if pid and pid not in players:
+                players.append(pid)
+
+        elif et == "MARKET_OPEN":
+            rd = rnd(r)
+            for m in data.get("markets", []):
+                rd["markets"].append({
+                    "market_id": m.get("market_id"),
+                    "base_prize": m.get("base_prize"),
+                    "carryover": m.get("carryover"),
+                    "prize_pool": m.get("prize_pool"),
+                    "participants": None,
+                    "winners": [],
+                    "prize_per_winner": None,
+                })
+
+        elif et == "MARKET_RESULT":
+            rd = rnd(r)
+            mid = data.get("market_id")
+            target = None
+            for m in rd["markets"]:
+                if m["market_id"] == mid:
+                    target = m
+                    break
+            if target is None:
+                target = {"market_id": mid, "base_prize": None,
+                          "carryover": None, "prize_pool": data.get("total_pool")}
+                rd["markets"].append(target)
+            target["participants"] = data.get("participants")
+            target["winners"] = data.get("winners", [])
+            target["prize_per_winner"] = data.get("prize_per_winner")
+            target["total_pool"] = data.get("total_pool")
+
+        elif et == "REVEAL":
+            rd = rnd(r)
+            rd["commits"] = []  # REVEALが正（rank付き）。COMMIT由来の重複を置換
+            for c in data.get("commits", []):
+                rd["commits"].append({
+                    "player_id": c.get("player_id"),
+                    "market_id": c.get("market_id"),
+                    "card": c.get("card"),
+                    "rank": c.get("rank"),
+                })
+                pid = c.get("player_id", "")
+                card = c.get("card")
+                if pid and card:
+                    committed.setdefault(pid, set()).add(card)
+
+        elif et == "COMMIT":
+            # REVEALが無い場合のフォールバック用にcommittedへ反映
+            pid = data.get("player_id", "")
+            card = data.get("card")
+            rd = rnd(r)
+            if pid and card:
+                committed.setdefault(pid, set()).add(card)
+                if not any(x.get("player_id") == pid and x.get("card") == card
+                           for x in rd["commits"]):
+                    rd["commits"].append({
+                        "player_id": pid, "market_id": data.get("market_id"),
+                        "card": card, "rank": None,
+                    })
+
+        elif et == "SNAPSHOT":
+            rd = rnd(r)
+            for pid, sd in data.get("snapshots", {}).items():
+                cash = sd.get("cash")
+                free = sd.get("free_cash")
+                debt = (cash - free) if (cash is not None and free is not None) else None
+                rd["cash"][pid] = {"cash": cash, "free_cash": free, "debt": debt}
+
+        elif et == "NEGOTIATION_ACTION":
+            act = data.get("action")
+            if act == "contract_propose":
+                cid = data.get("contract_id")
+                proposer = data.get("player_id", "")
+                parties = data.get("parties", [])
+                key = (proposer, r)
+                terms = None
+                if terms_by_key.get(key):
+                    terms = terms_by_key[key].pop(0)
+                if cid:
+                    contracts[cid] = {
+                        "contract_id": cid,
+                        "proposer": proposer,
+                        "parties": parties,
+                        "signed_by": [proposer],
+                        "round_created": r,
+                        "terms": terms,
+                    }
+            elif act == "contract_sign":
+                cid = data.get("contract_id")
+                signer = data.get("player_id", "")
+                c = contracts.get(cid)
+                if c and signer and signer not in c["signed_by"]:
+                    c["signed_by"].append(signer)
+
+        elif et in ("BANKRUPTCY", "FORCED_LIQUIDATION"):
+            rd = rnd(r)
+            rd["eliminated"].append({
+                "player_id": data.get("player_id"),
+                "reason": data.get("reason"),
+            })
+        elif et == "SURVIVAL_CHECK" and data.get("result") == "eliminated":
+            rd = rnd(r)
+            rd["eliminated"].append({
+                "player_id": data.get("player_id"),
+                "reason": "condition_not_met",
+            })
+
+    # プレイヤー順が取れなければ cash から補完
+    if not players:
+        seen: list[str] = []
+        for rn in result["rounds"]:
+            for pid in result["rounds"][rn]["cash"]:
+                if pid not in seen:
+                    seen.append(pid)
+        players = sorted(seen)
+    result["players"] = players
+
+    # 各ラウンドに: メッセージ、契約の累積スナップショット、手札を付与
+    # 手札はラウンド順に累積提出を再計算（committedは最終状態のため作り直す）
+    cum_committed: dict[str, set[str]] = {pid: set() for pid in players}
+    for rn in sorted(result["rounds"].keys(), key=lambda x: int(x)):
+        rd = result["rounds"][rn]
+        r_int = int(rn)
+        # このラウンドの提出を累積へ
+        for c in rd["commits"]:
+            pid = c.get("player_id")
+            card = c.get("card")
+            if pid and card:
+                cum_committed.setdefault(pid, set()).add(card)
+        # 手札 = FULL_DECK − 累積提出（強い順）
+        rd["holdings"] = {
+            pid: [cid for cid in FULL_DECK if cid not in cum_committed.get(pid, set())]
+            for pid in players
+        }
+        # メッセージ
+        rd["messages"] = messages_by_round.get(rn, [])
+        # 契約の「このラウンド時点」スナップショット（round_created ≤ R）
+        rd["contracts"] = [
+            {
+                "contract_id": c["contract_id"],
+                "proposer": c["proposer"],
+                "parties": c["parties"],
+                "signed_by": list(c["signed_by"]),
+                "round_created": c["round_created"],
+                "terms": c["terms"],
+            }
+            for c in contracts.values()
+            if c["round_created"] <= r_int
+        ]
+
+    # eventsに無いがメッセージだけあるラウンドも拾う
+    for rn, msgs in messages_by_round.items():
+        if rn not in result["rounds"]:
+            result["rounds"][rn] = {
+                "markets": [], "commits": [], "cash": {},
+                "holdings": {pid: list(FULL_DECK) for pid in players},
+                "contracts": [], "messages": msgs, "eliminated": [],
+            }
+
+    return result
