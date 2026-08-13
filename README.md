@@ -61,8 +61,19 @@ config = GameConfig(survival_cash=2_000_000)  # カスタム
 
 ```bash
 uv run python -m viewer.server           # 既定 0.0.0.0:9025
-VIEWER_HOST=127.0.0.1 VIEWER_PORT=9023 uv run python -c "from viewer.server import main; main()"  # 公開用
+VIEWER_HOST=127.0.0.1 VIEWER_PORT=9023 uv run python -c "from viewer.server import main; main()"  # 公開用（手動起動）
 ```
+
+公開ビューアは **user systemd unit `dangou-viewer.service`** で常駐化しており（`Restart=always` + linger 有効）、
+クラッシュ・マシン再起動後も自動復帰する。手動起動は不要。
+
+```bash
+systemctl --user status dangou-viewer.service   # 稼働確認
+systemctl --user restart dangou-viewer.service  # 再起動
+journalctl --user -u dangou-viewer.service -f   # ログ追尾
+```
+
+unit 定義: `~/.config/systemd/user/dangou-viewer.service`（`ExecStart` は `.venv/bin/python -c "from viewer.server import main; main()"`、`VIEWER_HOST=127.0.0.1` / `VIEWER_PORT=9023`）。
 
 詳細は `viewer/README.md` を参照。
 

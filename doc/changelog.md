@@ -1,5 +1,21 @@
 # Changelog
 
+## 2026-08-13: 公開LP復旧＋観戦ビューア常駐化（user systemd）
+
+### 概要
+公開LP `https://dangou-card-viewer.devrelay.io/` が「Under Construction」フォールバック表示になっている報告を受け調査。原因は viewer サーバ（127.0.0.1:9023）の停止（nohup 常駐プロセスの自然死）で、Caddy が upstream 不達フォールバックを返していた（LP の HTML/画像/`feed.json` 自体は健全）。恒久対策として **user systemd で常駐化**し、クラッシュ・再起動後の自動復帰を実現した。
+
+### 変更
+- **新規**: `~/.config/systemd/user/dangou-viewer.service`（リポジトリ外）。`ExecStart=.venv/bin/python -c "from viewer.server import main; main()"`、`Environment=VIEWER_HOST=127.0.0.1 / VIEWER_PORT=9023`、`Restart=always` / `RestartSec=3`、`WantedBy=default.target`。linger（Linger=yes）済みでマシン再起動後も自動起動。
+- `README.md`: 観戦ビューアの起動を systemd 常駐運用に更新（status/restart/journalctl の運用コマンドを追記）。
+- `doc/devlog.md`: サイクル7.1 を追記。
+- viewer のアプリコード（`viewer/server.py` / `viewer/static/lp.html`）は無変更。
+
+### 検証
+- `systemctl --user is-active`＝active / `is-enabled`＝enabled。
+- ローカル `127.0.0.1:9023`＝200、公開LP＝200、LP本文に「観戦する／敗者の手記」表示（Under Construction でない）。
+- クラッシュ耐性: `systemctl --user kill` → 数秒で MainPID が入れ替わり自動再起動・local=200。
+
 ## 2026-08-13: LP の実態修正（参加体数・OGP・ブログタイル動的化）
 
 ### 概要
