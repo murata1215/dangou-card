@@ -1,0 +1,31 @@
+{% extends "_base.html" %}
+
+{% block style %}
+.q-wrap{position:absolute; inset:60px; display:flex; flex-direction:column;
+  align-items:center; justify-content:center; text-align:center}
+.q-mark{position:absolute; left:40px; top:0; font-size:260px; font-weight:900;
+  color:var(--accent); opacity:.18; line-height:1}
+.q-text{font-size:{{ quote_fs }}px; font-weight:700; line-height:1.5; padding:0 20px;
+  max-width:900px; overflow-wrap:anywhere; line-break:normal}
+.q-speaker{position:absolute; left:0; right:0; bottom:0; display:flex;
+  flex-direction:column; align-items:center; gap:8px}
+.q-face{width:150px; height:150px}
+.q-name{font-size:34px; font-weight:700; color:var(--accent-hi)}
+.q-ctx{font-size:26px; color:var(--subtext)}
+{% endblock %}
+
+{% block deco %}
+<div class="q-mark">&#8220;</div>
+{% endblock %}
+
+{% block body %}
+<div class="q-wrap">
+  <div class="q-text">{{ quote }}</div>
+  <div class="q-speaker">
+    <div class="q-face face"><img src="{{ face_uri }}" alt=""></div>
+    <div class="q-name">{{ pid }}{% if name %}　{{ name }}{% endif %}</div>
+    {% if context %}<div class="q-ctx">{{ context }}</div>{% endif %}
+  </div>
+</div>
+<div class="footer">嘘八百万 —談合カード—</div>
+{% endblock %}

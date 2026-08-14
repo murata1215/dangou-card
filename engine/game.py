@@ -6,14 +6,18 @@ Market Open → Negotiation → Commit → Settlement → Finance
 の順で12ラウンドを実行する。
 """
 
+import uuid
 from typing import Any
 
 from engine.config import GameConfig
 from engine.models import (
-    PlayerState, Market, MarketCommit, Contract, Bounty,
+    PlayerState, Market, MarketCommit, MarketResult, Contract, ContractStatus, Bounty,
     CardRank, Card, Action, PassAction, TransferAction, RepayAction,
     ContractProposeAction, ContractSignAction, AnonymousBroadcastAction,
     BountyPostAction, BountyCancelAction, MarketCommitAction,
+    DoubleUpDeposit,
+    CardTradeProposal, CardTradeStatus,
+    CardTradeProposeAction, CardTradeAcceptAction, CardTradeRejectAction,
 )
 from engine.events import EventLogger
 from engine.rng import GameRng
@@ -41,9 +45,13 @@ class GameResult:
         self,
         players: dict[str, PlayerState],
         round_count: int,
+        round_snapshots: list[dict] | None = None,
+        double_up_deposits: list[DoubleUpDeposit] | None = None,
     ):
         self.players = players
         self.round_count = round_count
+        self.round_snapshots = round_snapshots or []
+        self.double_up_deposits = double_up_deposits or []
 
         # 生還者: is_alive=True かつ 脱落理由なし
         self.survivors = sorted(
@@ -100,6 +108,19 @@ class Game:
         self._action_counts: dict[str, int] = {}
         self._anon_broadcast_counts: dict[str, int] = {}
         self._round_messages: list[dict] = []  # ラウンド内のメッセージ履歴（Bot交渉用）
+
+        # S2: 霧のラウンドで使用されたカードID集合
+        self._fog_card_ids: set[str] = set()
+
+        # S2: 倍掛け預託リスト
+        self.double_up_deposits: list[DoubleUpDeposit] = []
+
+        # S2: ラウンドスナップショット（指標収集用）
+        self._round_snapshots: list[dict] = []
+
+        # S2: カードトレード提案リスト（v0.7 §3）
+        self.trade_proposals: list[CardTradeProposal] = []
+        self._trade_counts: dict[str, int] = {}  # ラウンド内トレード回数
 
     def run(self) -> GameResult:
         """
@@ -185,6 +206,7 @@ class Game:
         self.pending_repayments = {}
         self._action_counts = {pid: 0 for pid in self.players}
         self._anon_broadcast_counts = {pid: 0 for pid in self.players}
+        self._trade_counts = {pid: 0 for pid in self.players}
         self._round_messages = []  # ラウンド開始時にクリア
 
         alive_ids = [pid for pid, p in self.players.items() if p.is_alive]
@@ -204,7 +226,7 @@ class Game:
                     continue
 
                 agent = self.agents[pid]
-                visible_state = self._build_visible_state(round_num)
+                visible_state = self._build_visible_state(round_num, for_player_id=pid)
 
                 action = agent.negotiate(p, round_num, turn, visible_state)
 
@@ -246,6 +268,11 @@ class Game:
                     "turn": turn,
                 })
                 break
+
+        # ラウンド末: 未受諾のトレード提案を自動失効（v0.7.1）
+        for tp in self.trade_proposals:
+            if tp.status == CardTradeStatus.PROPOSED and tp.round_proposed == round_num:
+                tp.status = CardTradeStatus.EXPIRED
 
     def _execute_negotiation_action(
         self, action: Action, pid: str, round_num: int, turn: int,
@@ -378,6 +405,144 @@ class Game:
                     })
                     break
 
+        elif isinstance(action, CardTradeProposeAction):
+            # カードトレード提案（v0.7 §3 / v0.7.1 ブロードキャスト対応）
+            if not self.config.card_trade_enabled:
+                return
+            if round_num > self.config.card_trade_last_round:
+                return
+            if self._trade_counts.get(pid, 0) >= self.config.card_trade_max_per_round:
+                return
+
+            offer_id = f"O_{uuid.uuid4().hex[:8]}"
+            created_ids = []
+
+            for target_pid in action.with_players:
+                target = self.players.get(target_pid)
+                if target is None or not target.is_alive:
+                    continue
+                # 受取カード所持チェック（持っていない宛先はスキップ）
+                try:
+                    recv_rank = CardRank[action.receive_card]
+                except KeyError:
+                    continue
+                if not any(c.rank == recv_rank for c in target.hand):
+                    continue
+
+                trade_id = f"T_{uuid.uuid4().hex[:8]}"
+                proposal = CardTradeProposal(
+                    trade_id=trade_id,
+                    offer_id=offer_id,
+                    proposer=pid,
+                    with_player=target_pid,
+                    give_card_rank=action.give_card,
+                    receive_card_rank=action.receive_card,
+                    cash_amount=action.cash_amount,
+                    round_proposed=round_num,
+                )
+                self.trade_proposals.append(proposal)
+                created_ids.append(trade_id)
+
+            if created_ids:
+                self._trade_counts[pid] = self._trade_counts.get(pid, 0) + 1
+                self.logger.log("NEGOTIATION_ACTION", round_num, "negotiation", data={
+                    "player_id": pid, "action": "card_trade_propose",
+                    "offer_id": offer_id,
+                    "trade_ids": created_ids,
+                    "with_players": action.with_players,
+                    "success": True, "turn": turn,
+                })
+
+        elif isinstance(action, CardTradeAcceptAction):
+            # カードトレード受諾（v0.7 §3）
+            if not self.config.card_trade_enabled:
+                return
+            # 提案を検索
+            proposal = None
+            for tp in self.trade_proposals:
+                if tp.trade_id == action.trade_id and tp.status == CardTradeStatus.PROPOSED:
+                    proposal = tp
+                    break
+            if proposal is None:
+                return
+            if pid != proposal.with_player:
+                return
+            if round_num > self.config.card_trade_last_round:
+                return
+            if self._trade_counts.get(pid, 0) >= self.config.card_trade_max_per_round:
+                return
+            # 提案者の枠は propose 時に消費済み — accept 時には再チェックしない
+
+            proposer_state = self.players[proposal.proposer]
+            accepter_state = self.players[pid]
+            if not proposer_state.is_alive or not accepter_state.is_alive:
+                proposal.status = CardTradeStatus.EXPIRED
+                return
+
+            # カード再検証（提案後にカードを使った可能性）
+            give_rank = CardRank[proposal.give_card_rank]
+            recv_rank = CardRank[proposal.receive_card_rank]
+            give_card = next((c for c in proposer_state.hand if c.rank == give_rank), None)
+            recv_card = next((c for c in accepter_state.hand if c.rank == recv_rank), None)
+            if give_card is None or recv_card is None:
+                proposal.status = CardTradeStatus.EXPIRED
+                return
+
+            # 現金再検証
+            if proposal.cash_amount > 0 and proposal.cash_amount > proposer_state.free_cash:
+                proposal.status = CardTradeStatus.EXPIRED
+                return
+            if proposal.cash_amount < 0 and abs(proposal.cash_amount) > accepter_state.free_cash:
+                proposal.status = CardTradeStatus.EXPIRED
+                return
+
+            # アトミック実行: カード交換
+            proposer_state = player_ops.swap_card(proposer_state, give_card, recv_card)
+            accepter_state = player_ops.swap_card(accepter_state, recv_card, give_card)
+
+            # 現金移動
+            if proposal.cash_amount > 0:
+                proposer_state = player_ops.pay(proposer_state, proposal.cash_amount)
+                accepter_state = player_ops.receive(accepter_state, proposal.cash_amount)
+            elif proposal.cash_amount < 0:
+                accepter_state = player_ops.pay(accepter_state, abs(proposal.cash_amount))
+                proposer_state = player_ops.receive(proposer_state, abs(proposal.cash_amount))
+
+            self.players[proposal.proposer] = proposer_state
+            self.players[pid] = accepter_state
+            proposal.status = CardTradeStatus.ACCEPTED
+            self._trade_counts[pid] = self._trade_counts.get(pid, 0) + 1
+            # 提案者の枠は propose 時に消費済み — accept で再加算しない
+
+            # 同一 offer_id の残りの提案を EXPIRED に（v0.7.1 ブロードキャスト）
+            if proposal.offer_id:
+                for tp in self.trade_proposals:
+                    if (tp.offer_id == proposal.offer_id
+                            and tp.trade_id != proposal.trade_id
+                            and tp.status == CardTradeStatus.PROPOSED):
+                        tp.status = CardTradeStatus.EXPIRED
+
+            self.logger.log("NEGOTIATION_ACTION", round_num, "negotiation", data={
+                "player_id": pid, "action": "card_trade_accept",
+                "trade_id": proposal.trade_id, "with": proposal.proposer,
+                "success": True, "turn": turn,
+            })
+
+        elif isinstance(action, CardTradeRejectAction):
+            # カードトレード拒否（v0.7.1）
+            if not self.config.card_trade_enabled:
+                return
+            for tp in self.trade_proposals:
+                if tp.trade_id == action.trade_id and tp.status == CardTradeStatus.PROPOSED:
+                    if pid == tp.with_player:
+                        tp.status = CardTradeStatus.REJECTED
+                        self.logger.log("NEGOTIATION_ACTION", round_num, "negotiation", data={
+                            "player_id": pid, "action": "card_trade_reject",
+                            "trade_id": tp.trade_id, "proposer": tp.proposer,
+                            "success": True, "turn": turn,
+                        })
+                    break
+
         elif hasattr(action, 'message'):
             # dm, broadcast: ログ + メッセージ履歴に蓄積
             from engine.models import DmAction, BroadcastAction
@@ -497,13 +662,13 @@ class Game:
                 })
 
     def _phase_settlement(self, round_num: int) -> None:
-        """Phase 4: Reveal & Settlement（§5.2）"""
+        """Phase 4: Reveal & Settlement（§5.2）+ S2倍掛け処理"""
         (
             self.players,
             self.contracts,
             self.bounties,
             new_carryovers,
-            _market_results,
+            market_results,
         ) = settlement_ops.execute_settlement(
             self.players,
             self._current_markets,
@@ -515,6 +680,35 @@ class Game:
             self.logger,
         )
 
+        # S2: 霧のラウンドで使用されたカードを記録
+        if round_num in self.config.fog_rounds:
+            for c in self._current_commits:
+                self._fog_card_ids.add(c.card.card_id)
+
+        # S2: 倍掛け処理
+        du_success = 0
+        du_fail = 0
+        du_solo_success = 0
+        if self.config.double_up_enabled:
+            du_success, du_fail, du_solo_success = self._process_double_up(
+                round_num, market_results,
+            )
+
+        # S2: ラウンドスナップショット記録
+        surge_count = sum(1 for mr in market_results if mr.surged)
+        alive_count = sum(1 for p in self.players.values() if p.is_alive)
+        self._round_snapshots.append({
+            "round": round_num,
+            "alive_count": alive_count,
+            "total_assets": sum(p.cash for p in self.players.values() if p.is_alive),
+            "total_debt": sum(p.debt_balance for p in self.players.values() if p.is_alive),
+            "surge_count": surge_count,
+            "double_up_success": du_success,
+            "double_up_fail": du_fail,
+            "double_up_solo_success": du_solo_success,
+            "active_deposits": len([d for d in self.double_up_deposits if not d.resolved]),
+        })
+
         # キャリーオーバー更新
         if round_num < self.config.num_rounds:
             # R12以外: キャリーオーバーを次ラウンドへ
@@ -522,6 +716,130 @@ class Game:
         else:
             # R12: キャリーオーバーは消滅（§4.7）
             self.carryovers = {}
+
+    def _process_double_up(
+        self, round_num: int, market_results: list[MarketResult],
+    ) -> tuple[int, int, int]:
+        """
+        S2: 倍掛け処理
+
+        1. 前ラウンドの預託を解決（今ラウンドの市場結果で判定）
+        2. 今ラウンドの勝者に倍掛け選択を提示（R12以外）
+
+        Returns:
+            (成功数, 失敗数, 空き巣成功数)
+        """
+        du_success = 0
+        du_fail = 0
+        du_solo_success = 0
+
+        # 今ラウンドの市場勝者を特定（player_id → 獲得額マップ）
+        round_winners: dict[str, int] = {}
+        # 空き巣市場かどうかのマップ（market_id → participants==1）
+        solo_markets: set[str] = set()
+        # 勝者がどの市場で勝ったか
+        winner_markets: dict[str, list[str]] = {}
+
+        for mr in market_results:
+            if len(mr.participants) == 1:
+                solo_markets.add(mr.market_id)
+            for winner_id in mr.winners:
+                round_winners[winner_id] = round_winners.get(winner_id, 0) + mr.prize_per_winner
+                if winner_id not in winner_markets:
+                    winner_markets[winner_id] = []
+                winner_markets[winner_id].append(mr.market_id)
+
+        # Step 1: 前ラウンドの預託を解決
+        for dep in self.double_up_deposits:
+            if dep.resolved or dep.success_round != round_num:
+                continue
+            dep.resolved = True
+            p = self.players[dep.player_id]
+            if not p.is_alive:
+                # 脱落済みなら没収
+                self.logger.log("DOUBLE_UP_RESOLVED", round_num, "settlement", data={
+                    "player_id": dep.player_id, "result": "forfeit_eliminated",
+                    "deposit": dep.deposit_amount,
+                })
+                du_fail += 1
+                continue
+
+            if dep.player_id in round_winners and round_winners[dep.player_id] > 0:
+                # 成功: 2倍払い出し
+                payout = dep.deposit_amount * 2
+                dep.success = True
+                # 空き巣チェック: 成功市場が全て空き巣だったか
+                won_markets = winner_markets.get(dep.player_id, [])
+                all_solo = all(m in solo_markets for m in won_markets)
+                dep.from_solo_market = all_solo
+                if all_solo:
+                    du_solo_success += 1
+
+                p = player_ops.receive(p, payout)
+                self.players[dep.player_id] = p
+                self.logger.log("DOUBLE_UP_RESOLVED", round_num, "settlement", data={
+                    "player_id": dep.player_id, "result": "success",
+                    "deposit": dep.deposit_amount, "payout": payout,
+                    "from_solo_market": all_solo,
+                })
+                du_success += 1
+            else:
+                # 失敗: 没収
+                self.logger.log("DOUBLE_UP_RESOLVED", round_num, "settlement", data={
+                    "player_id": dep.player_id, "result": "forfeit",
+                    "deposit": dep.deposit_amount,
+                })
+                du_fail += 1
+
+        # Step 2: 今ラウンドの勝者に倍掛け選択を提示（R12以外、R11が最後）
+        if round_num < self.config.num_rounds:
+            visible_state = self._build_visible_state(round_num)
+            for winner_id, prize_won in round_winners.items():
+                p = self.players[winner_id]
+                if not p.is_alive or prize_won <= 0:
+                    continue
+
+                # 成功した倍掛けの2倍払い出し分は強制TAKE（連鎖禁止）
+                # → 元の市場賞金のみが倍掛け対象
+                # 今の prize_won には2倍払い出し分が含まれうるので、
+                # 元の市場賞金のみを算出
+                du_payout_this_round = 0
+                for dep in self.double_up_deposits:
+                    if (dep.resolved and dep.success
+                            and dep.success_round == round_num
+                            and dep.player_id == winner_id):
+                        du_payout_this_round += dep.deposit_amount * 2
+
+                eligible_prize = prize_won - du_payout_this_round
+                if eligible_prize <= 0:
+                    continue
+
+                agent = self.agents[winner_id]
+                try:
+                    wants_double = agent.choose_double_up(
+                        p, eligible_prize, round_num, visible_state,
+                    )
+                except Exception:
+                    wants_double = False
+
+                if wants_double:
+                    # 賞金を回収して預託
+                    p = player_ops.pay(p, eligible_prize)
+                    self.players[winner_id] = p
+                    deposit = DoubleUpDeposit(
+                        player_id=winner_id,
+                        deposit_amount=eligible_prize,
+                        deposited_round=round_num,
+                        success_round=round_num + 1,
+                    )
+                    self.double_up_deposits.append(deposit)
+                    self.logger.log("DOUBLE_UP_CHOSEN", round_num, "settlement", data={
+                        "player_id": winner_id,
+                        "deposit": eligible_prize,
+                        "success_round": round_num + 1,
+                    })
+
+        return du_success, du_fail, du_solo_success
 
     def _phase_finance(self, round_num: int) -> None:
         """Phase 5: Finance（§5.3）"""
@@ -538,7 +856,11 @@ class Game:
 
     def _finalize(self) -> GameResult:
         """ゲーム終了処理"""
-        result = GameResult(self.players, self.current_round)
+        result = GameResult(
+            self.players, self.current_round,
+            round_snapshots=self._round_snapshots,
+            double_up_deposits=self.double_up_deposits,
+        )
 
         self.logger.log("GAME_END", self.current_round, "end", data={
             "survivors": [
@@ -554,13 +876,15 @@ class Game:
 
         return result
 
-    def _build_visible_state(self, round_num: int) -> dict:
+    def _build_visible_state(self, round_num: int, for_player_id: str | None = None) -> dict:
         """
         公開情報の辞書を構築する（§8）
 
         エージェントに渡す情報。秘匿情報は含まない。
+        for_player_id が指定された場合、そのプレイヤーが当事者である
+        提案中（PROPOSED）契約を contracts_pending に含める（§6.4: 内容は当事者のみ）。
         """
-        return {
+        state = {
             "round_num": round_num,
             "markets": [
                 {"market_id": m.market_id, "prize_pool": m.prize_pool}
@@ -573,7 +897,10 @@ class Game:
                 pid: p.initial_loan for pid, p in self.players.items()
             },
             "used_cards": {
-                pid: [c.card_id for c in p.used_cards]
+                pid: [
+                    "FOG" if c.card_id in self._fog_card_ids else c.card_id
+                    for c in p.used_cards
+                ]
                 for pid, p in self.players.items()
             },
             "contracts_public": [
@@ -591,4 +918,67 @@ class Game:
                 for b in self.bounties
             ],
             "messages": list(self._round_messages),
+            "double_ups": [
+                {"player_id": d.player_id, "deposit": d.deposit_amount,
+                 "success_round": d.success_round}
+                for d in self.double_up_deposits if not d.resolved
+            ],
         }
+
+        # 当事者向け: 提案中の契約（当事者のみ閲覧可能）
+        if for_player_id is not None:
+            state["contracts_pending"] = [
+                {
+                    "contract_id": c.contract_id,
+                    "proposer": c.proposer,
+                    "parties": c.parties,
+                    "signed_by": list(c.signed_by),
+                    "round_created": c.round_created,
+                    "obligations": [
+                        {
+                            "obligor": ob.obligor,
+                            "counterparty": ob.counterparty,
+                            "ob_type": ob.ob_type.value,
+                            "round_num": ob.round_num,
+                            "details": dict(ob.details),
+                        }
+                        for ob in c.obligations
+                    ],
+                }
+                for c in self.contracts
+                if c.status == ContractStatus.PROPOSED
+                and for_player_id in c.parties
+            ]
+
+            # カードトレード提案（当事者のみ可視, v0.7.1: 受信者に他宛先非公開）
+            pending_trades = []
+            for tp in self.trade_proposals:
+                if tp.status != CardTradeStatus.PROPOSED:
+                    continue
+                if for_player_id not in (tp.proposer, tp.with_player):
+                    continue
+                entry: dict = {
+                    "trade_id": tp.trade_id,
+                    "proposer": tp.proposer,
+                    "with_player": tp.with_player,
+                    "give_card_rank": tp.give_card_rank,
+                    "receive_card_rank": tp.receive_card_rank,
+                    "cash_amount": tp.cash_amount,
+                    "round_proposed": tp.round_proposed,
+                }
+                # 提案者にのみ offer_id・全宛先・各宛先ステータスを公開
+                if for_player_id == tp.proposer and tp.offer_id:
+                    entry["offer_id"] = tp.offer_id
+                    entry["all_targets"] = [
+                        t.with_player for t in self.trade_proposals
+                        if t.offer_id == tp.offer_id
+                    ]
+                    entry["target_statuses"] = {
+                        t.with_player: t.status.value
+                        for t in self.trade_proposals
+                        if t.offer_id == tp.offer_id
+                    }
+                pending_trades.append(entry)
+            state["trades_pending"] = pending_trades
+
+        return state

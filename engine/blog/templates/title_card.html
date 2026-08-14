@@ -1,0 +1,34 @@
+{% extends "_base.html" %}
+
+{% block style %}
+.plate{inset:18px; border-radius:22px}
+.t-wrap{position:absolute; inset:0; display:flex; flex-direction:column;
+  align-items:center; justify-content:center; text-align:center; gap:{{ gap }}px}
+.t-title{font-size:{{ title_fs }}px; font-weight:900; line-height:.98; letter-spacing:.04em}
+.t-title2{font-size:{{ (title_fs*0.30)|int }}px; font-weight:700; letter-spacing:.34em;
+  color:var(--text); margin-top:{{ (title_fs*0.10)|int }}px}
+.t-sub{font-size:{{ sub_fs }}px; font-weight:700; color:var(--text)}
+.t-ribbon{display:inline-block; background:linear-gradient(180deg,#e8d278,#c9a227);
+  color:#0d0d10; font-weight:900; font-size:{{ (sub_fs*0.78)|int }}px; letter-spacing:.16em;
+  border-radius:999px; padding:.34em 1.4em}
+.t-tag{font-size:{{ (sub_fs*0.70)|int }}px; color:var(--subtext)}
+{% endblock %}
+
+{% block deco %}
+<div class="suit" style="left:8%;top:14%;font-size:130px">&#9824;</div>
+<div class="suit" style="right:8%;top:18%;font-size:160px">&#9829;</div>
+<div class="suit" style="left:15%;bottom:14%;font-size:170px">&#9830;</div>
+<div class="suit" style="right:13%;bottom:16%;font-size:130px">&#9827;</div>
+{% endblock %}
+
+{% block body %}
+<div class="t-wrap">
+  <div>
+    <div class="t-title gold-hi">嘘八百万</div>
+    <div class="t-title2">— 談合カード —</div>
+  </div>
+  <div class="t-sub">12ラウンドを、嘘と談合で乗り切れ。</div>
+  <div class="t-ribbon">SEASON 1 / シーズン1</div>
+  <div class="t-tag">嘘、騙し、談合、調略 — LLM 8体の頭脳戦。</div>
+</div>
+{% endblock %}

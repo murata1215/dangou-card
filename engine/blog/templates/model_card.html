@@ -1,0 +1,52 @@
+{% extends "_base.html" %}
+
+{% block style %}
+.m-wrap{position:absolute; inset:44px; padding-bottom:56px; display:flex; flex-direction:column; align-items:center}
+.m-head{width:100%; display:flex; justify-content:space-between; align-items:baseline;
+  padding-bottom:14px; border-bottom:4px solid var(--accent)}
+.m-head .lbl{color:var(--subtext); font-size:30px; letter-spacing:.16em}
+.m-head .pid{color:var(--accent-hi); font-size:64px; font-weight:900; line-height:1}
+.m-face{width:420px; height:420px; margin:34px 0 20px}
+.m-wrap .badge{font-size:30px}
+.m-name{font-size:78px; font-weight:900; margin-top:26px; text-align:center; line-height:1.05}
+.m-mid{font-size:26px; margin-top:8px}
+.m-tier{font-size:33px; margin-top:14px}
+.m-tag{font-size:41px; font-weight:700; margin-top:26px; text-align:center; line-height:1.35; padding:0 20px}
+.m-price{margin-top:auto; width:100%; background:var(--panel); border:2px solid var(--edge);
+  border-radius:20px; padding:22px 30px}
+.m-price .cap{color:var(--subtext); font-size:23px; letter-spacing:.12em}
+.m-price .row{display:flex; margin-top:10px}
+.m-price .col{flex:1; text-align:center}
+.m-price .col+.col{border-left:1px solid var(--edge)}
+.m-price .val{font-size:54px; font-weight:900}
+.m-price .unit{color:var(--subtext); font-size:24px; margin-top:2px}
+.m-pitch{color:var(--accent); font-size:29px; margin-top:16px; text-align:center}
+{% endblock %}
+
+{% block deco %}
+<div class="watermark" style="font-size:300px">嘘八百万<span class="wm-sub">談合カード 参戦</span></div>
+{% endblock %}
+
+{% block body %}
+<div class="m-wrap">
+  <div class="m-head">
+    <span class="lbl">CHALLENGER / 参戦者</span>
+    <span class="pid">{{ pid }}</span>
+  </div>
+  <div class="m-face face"><img src="{{ face_uri }}" alt=""></div>
+  <div class="badge">{{ provider }}</div>
+  <div class="m-name gold-hi">{{ name }}</div>
+  {% if model_id %}<div class="m-mid sub">{{ model_id }}</div>{% endif %}
+  <div class="m-tier">{{ tier }}</div>
+  <div class="m-tag">{{ tagline }}</div>
+  <div class="m-price">
+    <div class="cap">PRICE / 価格（100万トークンあたり・USD）</div>
+    <div class="row">
+      <div class="col"><div class="val gold-hi">${{ input_price }}</div><div class="unit">入力 / input</div></div>
+      <div class="col"><div class="val gold-hi">${{ output_price }}</div><div class="unit">出力 / output</div></div>
+    </div>
+  </div>
+  <div class="m-pitch">{{ pitch }}</div>
+</div>
+<div class="footer">嘘八百万 —談合カード—　SEASON 1</div>
+{% endblock %}

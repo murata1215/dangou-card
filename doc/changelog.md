@@ -1,5 +1,39 @@
 # Changelog
 
+## 2026-08-14: 立ち絵透明化スクリプトの閾値修正（108/45）
+
+### 概要
+`scripts/transparentize_emotions.py`（キャラ立ち絵42枚の白背景透明化）の閾値が指示値と異なっていたため修正・再変換。
+
+### 変更
+- `LUMA_THRESH`: 240→108、`SAT_THRESH`: 30→45（`BLUR_SIGMA=1.2`/`TRIM_PADDING=4`は変更なし）
+- `viewer/static/emotions_alpha/`: 42枚を新閾値で再生成（コンタクトシート含む）
+- 元画像 `viewer/static/emotions/` とバックアップ `viewer/static/emotions_backup_20260814/` は読み取り専用のまま変更なし
+
+### 検証
+- 42/42枚変換成功。透明比率の極端値: `xai_panic.png`=15.0%、`xai_sadness.png`=14.5%（<20%の「残りすぎ」フラグ、他は正常範囲）
+- 下端20%領域の不透明画素比率を旧閾値(240/30)と新閾値(108/45)で比較。平均43.8%→35.6%（-8.3pp）に減少し、足元の影(グレー領域)が全体傾向として除去される方向に改善。個別には増加するケースもあり(暗い髪・服の再取り込み等)、Bot判定ではなく目視確認が必要
+
+## 2026-08-14: S2 v0.7/v0.7.1 実装 — 強制返済・カードトレード・市場高騰の全員参加要件
+
+### 概要
+Season 2 仕様書 v0.7 の新規メカニクス（強制最低返済・カードトレード）と v0.7.1（ブロードキャスト提案・拒否アクション）を実装。あわせて正式契約が交渉プロンプトに表示されないバグを修正し、市場高騰の判定ロジックに少人数時の全員参加要件を追加した。
+
+### 変更
+- **正式契約バグ修正**: `engine/game.py` `_build_visible_state()` に `for_player_id` を追加し、PROPOSED状態の契約を当事者にのみ `contracts_pending` として公開。`llm/prompt_builder.py` に「提案中の正式契約」セクションを追加（原因調査: `doc/contract_investigation_report.md`）
+- **強制返済（v0.7 §2）**: `engine/config.py` に `mandatory_repay_enabled`/`mandatory_repay_k`、`engine/player.py` に `compute_mandatory_repayment(debt, remaining, k)`（`ceil(debt/(remaining+k))`）、`engine/finance.py` の Finance フェイズに Step 2 として挿入
+- **カードトレード（v0.7 §3 / v0.7.1）**: `engine/models.py` に `CardTradeProposal`/`CardTradeStatus`/`CardTradeProposeAction`（複数宛先 `with_players`）/`CardTradeAcceptAction`/`CardTradeRejectAction`、`engine/actions.py` にバリデーション、`engine/game.py` に `trade_proposals` 管理（ブロードキャスト展開・`offer_id`束ね・1件受諾で残り自動EXPIRED・ラウンド末失効）、`engine/player.py` に `swap_card()`。可視性: 受信者には `offer_id`/`all_targets`/`target_statuses` を非公開
+- **fog_rounds 修正**: S2プリセット（`default_8_s2()`, `baseline_v1_s2()`）の `fog_rounds` を `[4,8]`→`[]`（v0.7 §10.2: 霧のラウンド削除）
+- **市場高騰の全員参加要件**: `engine/config.py` に `surge_full_participation_max_alive: int = 0`（S2プリセットで4）、`engine/settlement.py` に `_should_surge()` を切り出し。生存者数が閾値以下なら「全員参加」判定、それ以外は従来の `len(mc) > alive_count/2`
+- テスト: `tests/test_prompt_pending_contracts.py`(6件)、`tests/test_mandatory_repay.py`(8件)、`tests/test_card_trade.py`(16件)、`tests/test_s2_rules.py`(7件追加)を新規/更新。全247件通過
+- 調査レポート: `doc/turn_order_investigation.md`（交渉フェイズは逐次処理・毎巡ランダムシャッフル・「早い者勝ち」は既存実装で担保）、`doc/surge_condition_investigation.md`（76%案は高騰を事実上ゼロ化する危険と判定し不採用）
+- シミュレーション: `scripts/simulate_mandatory_repay.py`（4条件×1,000試合、k推奨=2）、`scripts/simulate_surge_change.py`（少人数全員参加あり/なし、各1,000試合）
+
+### 検証
+- v0.7: `doc/v0_7_verify_report.md`。強制返済の計算式・端数処理・破産判定、カードトレードの2アクション制・可視性・アトミック実行を仕様書と照合し一致確認
+- v0.7.1: `doc/v0_7_1_verify_report.md`。ブロードキャスト可視性・god view記録・4ステータス(PROPOSED/ACCEPTED/REJECTED/EXPIRED)を確認
+- 市場高騰: `doc/surge_condition_change_report.md`。5人以上は完全に不変、4人30.3%→1.3%、3人83.6%→9.8%。平均生還者数は4.92→4.91でほぼ不変
+
 ## 2026-08-13: 公開LP復旧＋観戦ビューア常駐化（user systemd）
 
 ### 概要

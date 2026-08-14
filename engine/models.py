@@ -112,6 +112,97 @@ class MarketResult(BaseModel):
     total_pool: int
     """Entry Fee加算後の総賞金プール"""
 
+    surged: bool = False
+    """S2: 市場高騰が発動したか"""
+
+
+# =============================================================================
+# S2: 倍掛け（§S2.4）
+# =============================================================================
+
+class DoubleUpDeposit(BaseModel):
+    """
+    倍掛け預託（§S2.4）
+
+    賞金獲得者がTAKEではなく倍掛けを選択した場合に生成。
+    次ラウンドで市場賞金を1円でも獲得すれば2倍、不獲得なら没収。
+    """
+    player_id: str
+    """預託者のプレイヤーID"""
+
+    deposit_amount: int
+    """預託額（元の賞金額）"""
+
+    deposited_round: int
+    """預託したラウンド"""
+
+    success_round: int
+    """成功判定ラウンド（deposited_round + 1）"""
+
+    resolved: bool = False
+    """解決済みフラグ"""
+
+    success: bool = False
+    """成功フラグ"""
+
+    from_solo_market: bool = False
+    """成功時に空き巣（参加者1人）市場で成功したか（指標B用）"""
+
+
+# =============================================================================
+# S2: カードトレード（v0.7 §3）
+# =============================================================================
+
+class CardTradeStatus(str, Enum):
+    """カードトレード提案のステータス"""
+    PROPOSED = "proposed"
+    """提案中（受諾待ち）"""
+
+    ACCEPTED = "accepted"
+    """受諾済み（交換完了）"""
+
+    REJECTED = "rejected"
+    """拒否された"""
+
+    EXPIRED = "expired"
+    """失効（条件未充足・ラウンド末・同一offer受諾等）"""
+
+
+class CardTradeProposal(BaseModel):
+    """
+    カードトレード提案（v0.7 §3 / v0.7.1 ブロードキャスト対応）
+
+    1枚⇄1枚交換。オプションで現金を付与可能。
+    提案→受諾の2アクション制。受諾時にアトミック実行。
+    ブロードキャスト提案では同一 offer_id で複数の提案が束ねられる。
+    """
+    trade_id: str
+    """トレードID（個別提案ごとにユニーク）"""
+
+    offer_id: str = ""
+    """ブロードキャスト提案の束ID（空文字は単独提案）"""
+
+    proposer: str
+    """提案者のプレイヤーID"""
+
+    with_player: str
+    """相手プレイヤーID"""
+
+    give_card_rank: str
+    """提案者が差し出すカードランク名"""
+
+    receive_card_rank: str
+    """提案者が受け取るカードランク名"""
+
+    cash_amount: int = 0
+    """現金移動（正=提案者→相手、負=相手→提案者）"""
+
+    round_proposed: int
+    """提案されたラウンド"""
+
+    status: CardTradeStatus = CardTradeStatus.PROPOSED
+    """トレードステータス"""
+
 
 # =============================================================================
 # プレイヤー関連（§2）
@@ -474,12 +565,62 @@ class PassAction(BaseModel):
     player_id: str
 
 
+class CardTradeProposeAction(BaseModel):
+    """
+    カードトレード提案アクション（v0.7 §3 / v0.7.1 ブロードキャスト対応）
+
+    1枚⇄1枚交換を提案する。相手の受諾で成立。
+    with_players はリストで複数宛先を指定可能（ブロードキャスト提案）。
+    """
+    type: Literal["card_trade_propose"] = "card_trade_propose"
+    player_id: str
+
+    with_players: list[str]
+    """相手プレイヤーIDのリスト（ブロードキャスト提案対応）"""
+
+    give_card: str
+    """差し出すカードのランク名"""
+
+    receive_card: str
+    """受け取りたいカードのランク名"""
+
+    cash_amount: int = 0
+    """現金移動（正=自分→相手、負=相手→自分）"""
+
+
+class CardTradeAcceptAction(BaseModel):
+    """
+    カードトレード受諾アクション（v0.7 §3）
+
+    提案中のトレードを受諾する。
+    """
+    type: Literal["card_trade_accept"] = "card_trade_accept"
+    player_id: str
+
+    trade_id: str
+    """受諾するトレードのID"""
+
+
+class CardTradeRejectAction(BaseModel):
+    """
+    カードトレード拒否アクション（v0.7.1）
+
+    提案中のトレードを拒否する。回数枠を消費しない。
+    """
+    type: Literal["card_trade_reject"] = "card_trade_reject"
+    player_id: str
+
+    trade_id: str
+    """拒否するトレードのID"""
+
+
 # アクションのUnion型（discriminated union）
 Action = Annotated[
     DmAction | BroadcastAction | MarketCommitAction |
     ContractProposeAction | ContractSignAction |
     AnonymousBroadcastAction | BountyPostAction | BountyCancelAction |
-    TransferAction | RepayAction | PassAction,
+    TransferAction | RepayAction | PassAction |
+    CardTradeProposeAction | CardTradeAcceptAction | CardTradeRejectAction,
     Field(discriminator="type")
 ]
 

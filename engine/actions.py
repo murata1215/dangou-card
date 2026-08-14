@@ -11,7 +11,8 @@ from engine.models import (
     Action, DmAction, BroadcastAction, MarketCommitAction,
     ContractProposeAction, ContractSignAction, AnonymousBroadcastAction,
     BountyPostAction, BountyCancelAction, TransferAction, RepayAction,
-    PassAction, PlayerState, CardRank,
+    PassAction, CardTradeProposeAction, CardTradeAcceptAction, CardTradeRejectAction,
+    PlayerState, CardRank,
 )
 from engine.config import GameConfig
 
@@ -149,5 +150,35 @@ def validate_action(
         if not has:
             return ActionResult(False, f"Card {rank_name} not in hand")
         return ActionResult(True)
+
+    if isinstance(action, CardTradeProposeAction):
+        # カードトレード提案: 有効化・カード所持・FreeCash・宛先数上限
+        if not config.card_trade_enabled:
+            return ActionResult(False, "Card trade is disabled")
+        if not action.with_players:
+            return ActionResult(False, "No target players specified")
+        if len(action.with_players) > config.card_trade_broadcast_max:
+            return ActionResult(False, f"Too many targets: {len(action.with_players)} > {config.card_trade_broadcast_max}")
+        try:
+            give_rank = CardRank[action.give_card]
+        except KeyError:
+            return ActionResult(False, f"Invalid card rank: {action.give_card}")
+        if not any(c.rank == give_rank for c in player.hand):
+            return ActionResult(False, f"Card {action.give_card} not in hand")
+        try:
+            CardRank[action.receive_card]
+        except KeyError:
+            return ActionResult(False, f"Invalid card rank: {action.receive_card}")
+        if action.cash_amount > 0 and action.cash_amount > player.free_cash:
+            return ActionResult(False, "Insufficient free cash for trade payment")
+        return ActionResult(True)
+
+    if isinstance(action, CardTradeAcceptAction):
+        # カードトレード受諾: trade_id の存在チェックは execute 側で行う
+        return ActionResult(True)
+
+    if isinstance(action, CardTradeRejectAction):
+        # カードトレード拒否: 回数枠を消費しない
+        return ActionResult(True, consumes_action=False)
 
     return ActionResult(False, "Unknown action type")

@@ -33,6 +33,10 @@ def generate_markets(
     # 当該ラウンドの総賞金（0-indexed）
     round_total = config.prize_tiers[round_num - 1]
 
+    # S2: 最終市場 — R12の基本賞金をN倍（§S2.3）
+    if round_num == config.num_rounds and config.final_market_multiplier > 1:
+        round_total *= config.final_market_multiplier
+
     # 3市場への配分
     if config.market_distribution == "equal":
         # 均等配分（端数は最初の市場に付与）
@@ -68,6 +72,7 @@ def resolve_market(
     market: Market,
     commits: list[MarketCommit],
     entry_fee: int,
+    surge: bool = False,
 ) -> MarketResult:
     """
     市場の勝敗を判定し結果を返す（§4.5, §4.6）
@@ -91,6 +96,10 @@ def resolve_market(
 
     # Entry Feeをプールに加算（§4.2）
     total_pool = market.prize_pool + entry_fee * num_participants
+
+    # S2: 市場高騰 — プール2倍（§S2.2）
+    if surge:
+        total_pool *= 2
 
     if num_participants == 0:
         # 参加者0: キャリーオーバー（§4.7）
@@ -117,4 +126,5 @@ def resolve_market(
         winners=winners,
         prize_per_winner=prize_per_winner,
         total_pool=total_pool,
+        surged=surge,
     )

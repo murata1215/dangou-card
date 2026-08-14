@@ -80,6 +80,30 @@ class PlayerAgent(ABC):
         """
         ...
 
+    def choose_double_up(
+        self,
+        player_state: PlayerState,
+        prize_won: int,
+        round_num: int,
+        visible_state: dict,
+    ) -> bool:
+        """
+        S2: 倍掛け選択（§S2.4）
+
+        市場賞金獲得後、TAKEかDOUBLEかを選択する。
+        デフォルトはTAKE（False）。サブクラスでオーバーライド可能。
+
+        Args:
+            player_state: 自分のプレイヤー状態
+            prize_won: 獲得した賞金額
+            round_num: 現在のラウンド番号
+            visible_state: 公開情報の辞書
+
+        Returns:
+            True=DOUBLE, False=TAKE
+        """
+        return False
+
 
 class StubAgent(PlayerAgent):
     """

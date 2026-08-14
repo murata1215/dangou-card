@@ -168,6 +168,52 @@ def repay_debt(player: PlayerState, amount: int) -> PlayerState:
     })
 
 
+def compute_mandatory_repayment(debt_balance: int, remaining_rounds: int, k: int = 0) -> int:
+    """
+    強制最低返済額を計算する（v0.7 §2.2）
+
+    式: ceil(debt_balance ÷ (remaining_rounds + k))
+    R12（remaining=1, k=0）の場合は debt_balance 全額。
+
+    Args:
+        debt_balance: 利息計上後の借金残高
+        remaining_rounds: 残り返済回数（R1終了時=12, R12終了時=1）
+        k: 緩和パラメータ（0=完全均等、大きいほど序盤が軽い）
+
+    Returns:
+        最低返済額（切り上げ）
+    """
+    divisor = remaining_rounds + k
+    if divisor <= 0:
+        return debt_balance
+    return math.ceil(debt_balance / divisor)
+
+
+def swap_card(player: PlayerState, give_card: Card, receive_card: Card) -> PlayerState:
+    """
+    手札のカードを交換する（v0.7 §3）
+
+    give_card を手札から除去し、receive_card を手札に追加する。
+    手札の総枚数は変化しない。
+
+    Args:
+        player: プレイヤー状態
+        give_card: 差し出すカード
+        receive_card: 受け取るカード
+
+    Returns:
+        更新されたPlayerState
+
+    Raises:
+        ValueError: give_card が手札にない場合
+    """
+    new_hand = [c for c in player.hand if c.card_id != give_card.card_id]
+    if len(new_hand) == len(player.hand):
+        raise ValueError(f"{player.player_id} does not have card {give_card.card_id}")
+    new_hand.append(receive_card)
+    return player.model_copy(update={"hand": new_hand})
+
+
 def eliminate(
     player: PlayerState,
     reason: str,

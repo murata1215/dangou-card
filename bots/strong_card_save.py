@@ -54,3 +54,8 @@ class StrongCardSaveBot(BotAgent):
             market_id=market.market_id,
             card_rank=card.rank.name,
         )
+
+    def choose_double_up(self, player_state: PlayerState, prize_won: int,
+                         round_num: int, visible_state: dict) -> bool:
+        """序盤（R1-8）のみDOUBLE — 強カードが残っているので次Rも勝てる見込み"""
+        return round_num <= SCS_EARLY_ROUNDS

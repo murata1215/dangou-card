@@ -1,0 +1,46 @@
+{% extends "_base.html" %}
+
+{% block style %}
+.plate{inset:16px}
+.r-wrap{position:relative; padding:40px 44px 64px}
+.r-head{text-align:center; padding-bottom:18px; border-bottom:4px solid var(--accent)}
+.r-head .t{font-size:62px; font-weight:900}
+.r-head .s{font-size:26px; letter-spacing:.10em; color:var(--subtext); margin-top:8px}
+.r-row{display:flex; align-items:center; gap:22px; margin-top:16px;
+  background:var(--panel); border:1px solid var(--edge); border-radius:16px; padding:16px 26px}
+.r-row.survived{background:#12241b; border-color:var(--survive)}
+.r-rank{font-size:52px; font-weight:900; color:var(--accent); width:60px; text-align:center; flex:none}
+.r-face{width:72px; height:72px; flex:none}
+.r-id{flex:1; min-width:0}
+.r-id .pid{font-size:27px; font-weight:700; color:var(--accent)}
+.r-id .nm{font-size:36px; font-weight:700; margin-top:2px}
+.r-res{text-align:right; flex:none}
+.r-res .tag{font-size:40px; font-weight:900}
+.r-res .det{font-size:29px; color:var(--subtext); margin-top:2px}
+.r-survive{color:var(--survive)}
+.r-danger{color:var(--danger)}
+{% endblock %}
+
+{% block body %}
+<div class="r-wrap">
+  <div class="r-head">
+    <div class="t gold-hi">最終順位</div>
+    <div class="s">FINAL STANDINGS ・ 生還ライン 現金200万円＋借金0</div>
+  </div>
+  {% for row in rows %}
+  <div class="r-row {{ row.result }}">
+    <div class="r-rank">{{ row.rank }}</div>
+    <div class="r-face face {{ 'ring-survive' if row.result=='survived' else 'ring-danger' }}"><img src="{{ row.face_uri }}" alt=""></div>
+    <div class="r-id">
+      <div class="pid">{{ row.pid }}</div>
+      <div class="nm">{{ row.name }}</div>
+    </div>
+    <div class="r-res">
+      <div class="tag {{ 'r-survive' if row.result=='survived' else 'r-danger' }}">{{ row.sym }} {{ row.jp }}</div>
+      <div class="det">{{ row.detail }}</div>
+    </div>
+  </div>
+  {% endfor %}
+  <div class="footer" style="position:static;margin-top:34px">嘘八百万 —談合カード—　SEASON 1</div>
+</div>
+{% endblock %}

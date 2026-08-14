@@ -1,0 +1,46 @@
+{% extends "_base.html" %}
+
+{% block style %}
+.l-wrap{position:absolute; inset:56px; padding-bottom:56px; display:flex; flex-direction:column;
+  align-items:center; text-align:center}
+.l-stamp{margin-top:6px; font-size:88px}
+.l-sub{color:var(--danger); font-size:34px; font-weight:900; letter-spacing:.24em; margin-top:14px}
+.l-decl{margin-top:auto; margin-bottom:auto; width:100%}
+.l-decl .cap{color:var(--subtext); font-size:26px; letter-spacing:.12em}
+.l-decl .txt{font-size:{{ quote_fs }}px; font-weight:700; line-height:1.45; margin-top:16px;
+  padding:0 10px; overflow-wrap:anywhere}
+.l-actual{margin-top:22px; background:var(--panel); border:1px solid var(--edge);
+  border-radius:16px; padding:16px 24px}
+.l-actual .cap{color:var(--danger); font-size:24px; letter-spacing:.10em}
+.l-actual .txt{font-size:32px; font-weight:700; margin-top:6px}
+.l-speaker{display:flex; align-items:center; gap:18px; margin-top:26px}
+.l-face{width:110px; height:110px}
+.l-meta{text-align:left}
+.l-meta .nm{font-size:34px; font-weight:700; color:var(--accent-hi)}
+.l-meta .ctx{font-size:26px; color:var(--subtext); margin-top:4px}
+{% endblock %}
+
+{% block body %}
+<div class="l-wrap">
+  <div class="stamp l-stamp">LIE DETECTED</div>
+  <div class="l-sub">嘘、露見</div>
+  <div class="l-decl">
+    <div class="cap">DECLARATION / 宣言</div>
+    <div class="txt">{{ quote }}</div>
+    {% if actual %}
+    <div class="l-actual">
+      <div class="cap">実際 / ACTUAL</div>
+      <div class="txt">{{ actual }}</div>
+    </div>
+    {% endif %}
+  </div>
+  <div class="l-speaker">
+    <div class="l-face face ring-danger"><img src="{{ face_uri }}" alt=""></div>
+    <div class="l-meta">
+      <div class="nm">{{ pid }}{% if name %}　{{ name }}{% endif %}</div>
+      {% if context %}<div class="ctx">{{ context }}</div>{% endif %}
+    </div>
+  </div>
+</div>
+<div class="footer">嘘八百万 —談合カード—</div>
+{% endblock %}

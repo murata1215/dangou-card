@@ -59,8 +59,41 @@ def execute_finance(
             "new_debt": p.debt_balance,
         })
 
+    # --- Step 2: 強制最低返済（v0.7 §2） ---
+    if config.mandatory_repay_enabled:
+        for pid, p in list(players.items()):
+            if not p.is_alive or p.debt_balance <= 0:
+                continue
+            remaining = config.num_rounds - round_num + 1
+            min_repay = player_ops.compute_mandatory_repayment(
+                p.debt_balance, remaining, config.mandatory_repay_k,
+            )
+            if p.cash < min_repay:
+                # 返済不能 → 破産脱落
+                logger.log("MANDATORY_REPAY_FAILED", round_num, "finance", data={
+                    "player_id": pid,
+                    "required": min_repay,
+                    "cash": p.cash,
+                    "debt": p.debt_balance,
+                })
+                p, contracts, record = elim_ops.forced_liquidation(
+                    p, "bankruptcy", round_num, contracts,
+                )
+                players[pid] = p
+                logger.log("FORCED_LIQUIDATION", round_num, "finance", data=record)
+            else:
+                # 返済実行
+                p = player_ops.repay_debt(p, min_repay)
+                players[pid] = p
+                logger.log("MANDATORY_REPAY", round_num, "finance", data={
+                    "player_id": pid,
+                    "amount": min_repay,
+                    "new_cash": p.cash,
+                    "new_debt": p.debt_balance,
+                })
+
     if round_num < config.num_rounds:
-        # --- R1-11: 任意返済 ---
+        # --- Step 3: 任意返済 ---
         for pid, amount in pending_repayments.items():
             if pid not in players:
                 continue

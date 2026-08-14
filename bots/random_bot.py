@@ -40,3 +40,8 @@ class RandomBot(BotAgent):
             market_id=market.market_id,
             card_rank=card.rank.name,
         )
+
+    def choose_double_up(self, player_state: PlayerState, prize_won: int,
+                         round_num: int, visible_state: dict) -> bool:
+        """50%の確率でDOUBLE"""
+        return self.rng.random() < 0.5

@@ -105,3 +105,8 @@ class HoneyPotBot(BotAgent):
             market_id=target_id,
             card_rank=card.rank.name,
         )
+
+    def choose_double_up(self, player_state: PlayerState, prize_won: int,
+                         round_num: int, visible_state: dict) -> bool:
+        """偶数ラウンドのみDOUBLE"""
+        return round_num % 2 == 0

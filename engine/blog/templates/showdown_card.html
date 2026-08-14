@@ -1,0 +1,49 @@
+{% extends "_base.html" %}
+
+{% block style %}
+.s-wrap{position:absolute; inset:56px; display:flex; flex-direction:column;
+  align-items:center; text-align:center}
+.s-round{color:var(--accent); font-size:34px; font-weight:900; letter-spacing:.22em}
+.s-title{font-size:76px; font-weight:900; margin-top:6px}
+.s-arena{display:flex; align-items:center; justify-content:center; gap:24px;
+  margin:auto 0; width:100%}
+.s-side{display:flex; flex-direction:column; align-items:center; flex:1; min-width:0}
+.s-face{width:280px; height:280px}
+.s-pid{font-size:30px; font-weight:700; color:var(--accent); margin-top:18px}
+.s-name{font-size:40px; font-weight:700; margin-top:4px; line-height:1.05}
+.s-vs{font-size:120px; font-weight:900; color:var(--danger); flex:none; line-height:1}
+.s-stake{width:100%; background:var(--panel); border:2px solid var(--edge);
+  border-radius:20px; padding:22px 30px; margin-top:8px}
+.s-stake .cap{color:var(--subtext); font-size:24px; letter-spacing:.12em}
+.s-stake .val{font-size:64px; font-weight:900; color:var(--accent-hi); margin-top:6px}
+{% endblock %}
+
+{% block deco %}
+<div class="suit" style="left:6%;top:10%;font-size:150px">&#9824;</div>
+<div class="suit" style="right:6%;bottom:24%;font-size:150px">&#9829;</div>
+{% endblock %}
+
+{% block body %}
+<div class="s-wrap">
+  <div class="s-round">ROUND {{ round_num }}</div>
+  <div class="s-title gold-hi">運命の一手</div>
+  <div class="s-arena">
+    <div class="s-side">
+      <div class="s-face face"><img src="{{ left.face_uri }}" alt=""></div>
+      <div class="s-pid">{{ left.pid }}</div>
+      <div class="s-name">{{ left.name }}</div>
+    </div>
+    <div class="s-vs">VS</div>
+    <div class="s-side">
+      <div class="s-face face"><img src="{{ right.face_uri }}" alt=""></div>
+      <div class="s-pid">{{ right.pid }}</div>
+      <div class="s-name">{{ right.name }}</div>
+    </div>
+  </div>
+  <div class="s-stake">
+    <div class="cap">STAKE / 一人当たり</div>
+    <div class="val">{{ stake }}</div>
+  </div>
+</div>
+<div class="footer">嘘八百万 —談合カード—</div>
+{% endblock %}

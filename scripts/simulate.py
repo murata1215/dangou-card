@@ -124,9 +124,27 @@ def run_single_game(args: tuple) -> dict[str, Any]:
         games_dir.mkdir(parents=True, exist_ok=True)
         logger.save_jsonl(games_dir / f"game_{game_index + 1:04d}.jsonl")
 
+    # S2: プレイヤー別倍掛け統計
+    player_du_stats: dict[str, dict[str, int]] = {}
+    for dep in result.double_up_deposits:
+        pid_du = dep.player_id
+        if pid_du not in player_du_stats:
+            player_du_stats[pid_du] = {"count": 0, "success": 0, "forfeited": 0, "solo_success": 0}
+        player_du_stats[pid_du]["count"] += 1
+        if dep.resolved and dep.success:
+            player_du_stats[pid_du]["success"] += 1
+            if dep.from_solo_market:
+                player_du_stats[pid_du]["solo_success"] += 1
+        elif dep.resolved and not dep.success:
+            player_du_stats[pid_du]["forfeited"] += dep.deposit_amount
+
+    # 生還者順位
+    survivor_ranks = {p.player_id: i + 1 for i, p in enumerate(result.survivors)}
+
     # 結果を行データに変換
     rows: list[dict[str, Any]] = []
     for pid, p in result.players.items():
+        du = player_du_stats.get(pid, {})
         rows.append({
             "game_id": game_index + 1,
             "seed": game_seed,
@@ -138,12 +156,19 @@ def run_single_game(args: tuple) -> dict[str, Any]:
             "survived": p.is_alive,
             "elimination_reason": p.elimination_reason or "",
             "elimination_round": p.elimination_round or "",
+            "final_rank": survivor_ranks.get(pid, 0),
+            "double_up_count": du.get("count", 0),
+            "double_up_success": du.get("success", 0),
+            "double_up_forfeited": du.get("forfeited", 0),
+            "double_up_solo_success": du.get("solo_success", 0),
         })
 
     return {
         "game_id": game_index + 1,
         "rows": rows,
         "num_survivors": len(result.survivors),
+        "round_snapshots": result.round_snapshots,
+        "double_up_deposits": result.double_up_deposits,
     }
 
 
@@ -329,6 +354,9 @@ def main() -> None:
     parser.add_argument("--prize-schedule", type=str, default="tiered",
                         choices=["tiered", "flat"],
                         help="賞金スケジュール: tiered(逓増, 既定) / flat(均等)")
+    parser.add_argument("--ruleset", type=str, default="S1",
+                        choices=["S1", "S2"],
+                        help="ルールセット: S1(Season 1, 既定) / S2(Season 2)")
     args = parser.parse_args()
 
     # nice 10で実行（本番サーバー同居対策）
@@ -345,6 +373,15 @@ def main() -> None:
 
     # 設定生成
     config = create_config_for_roster(roster)
+
+    # S2ルールセットの適用
+    if args.ruleset == "S2":
+        config = config.model_copy(update={
+            "fog_rounds": [4, 8],
+            "surge_enabled": True,
+            "final_market_multiplier": 3,
+            "double_up_enabled": True,
+        })
 
     # 賞金倍率の適用
     if args.prize_scale != 1.0:
@@ -372,6 +409,7 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"=== 談合カード シミュレーション ===")
+    print(f"ルールセット: {args.ruleset}")
     print(f"試合数: {args.games}")
     print(f"ベースseed: {args.seed}")
     print(f"プレイヤー数: {config.num_players}")
@@ -411,7 +449,9 @@ def main() -> None:
     fieldnames = [
         "game_id", "seed", "player_id", "bot_type", "initial_loan",
         "final_cash", "final_debt", "survived", "elimination_reason",
-        "elimination_round",
+        "elimination_round", "final_rank",
+        "double_up_count", "double_up_success", "double_up_forfeited",
+        "double_up_solo_success",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)

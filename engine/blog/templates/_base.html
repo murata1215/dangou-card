@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<style>
+{% include "base.css" %}
+{% block style %}{% endblock %}
+</style>
+</head>
+<body>
+<div class="card" style="width:{{ width }}px;{% if height %}height:{{ height }}px{% else %}height:auto{% endif %}">
+  <div class="plate"></div>
+  {% block deco %}{% endblock %}
+  {% block body %}{% endblock %}
+</div>
+</body>
+</html>

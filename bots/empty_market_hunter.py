@@ -63,3 +63,8 @@ class EmptyMarketHunterBot(BotAgent):
             market_id=target_id,
             card_rank=card.rank.name,
         )
+
+    def choose_double_up(self, player_state: PlayerState, prize_won: int,
+                         round_num: int, visible_state: dict) -> bool:
+        """常にDOUBLE — 空き巣成功で次Rも勝てる自信"""
+        return True

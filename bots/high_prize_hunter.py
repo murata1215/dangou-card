@@ -59,3 +59,8 @@ class HighPrizeHunterBot(BotAgent):
             market_id=market.market_id,
             card_rank=card.rank.name,
         )
+
+    def choose_double_up(self, player_state: PlayerState, prize_won: int,
+                         round_num: int, visible_state: dict) -> bool:
+        """高額賞金（50万以上）のみDOUBLE"""
+        return prize_won >= 500_000

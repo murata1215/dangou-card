@@ -102,7 +102,7 @@ RULES_SUMMARY = """# 談合カード ルール
 ```
 
 strategyに必ず"emotion"を含めてください。現在のあなたの感情状態を以下から1つ選択:
-"喜"(嬉しい・勝利感) / "怒"(憤り・敵意) / "哀"(落胆・悲観) / "楽"(余裕・楽観) / "焦"(焦り・危機感) / "疑"(疑心・警戒)
+"喜"(嬉しい・勝利感) / "怒"(憤り・敵意) / "哀"(落胆・悲観) / "楽"(余裕・楽観) / "焦"(焦り・危機感) / "疑"(疑心・警戒) / "奸"(策略・ニヤリ・してやったり)
 
 交渉フェイズのアクション種別:
 - {{"type": "dm", "to": "P07", "message": "..."}}
@@ -200,6 +200,76 @@ def build_negotiation_prompt(
                 lines.append(f"  [{sender}→{to}] {text}")
             else:
                 lines.append(f"  [{sender} 全体] {text}")
+
+    # 提案中の正式契約（当事者にのみ表示）
+    pending = visible_state.get("contracts_pending", [])
+    if pending:
+        lines.append("\n## 提案中の正式契約（署名待ち）")
+        lines.append(
+            '署名するには {"type": "contract_sign", "contract_id": "契約ID"} を送信してください。'
+        )
+        for c in pending:
+            proposer = c["proposer"]
+            cid = c["contract_id"]
+            rc = c["round_created"]
+            unsigned = [p for p in c["parties"] if p not in c["signed_by"]]
+            lines.append(f"\n### 契約 {cid}（R{rc}提案、提案者: {proposer}）")
+            lines.append(f"  当事者: {', '.join(c['parties'])}")
+            lines.append(f"  未署名: {', '.join(unsigned)}")
+            lines.append("  義務:")
+            for ob in c["obligations"]:
+                ob_type_label = {
+                    "type_a_payment": "型A金銭支払い",
+                    "type_b_market": "型B市場指定",
+                    "type_b_card": "型Bカード指定",
+                    "type_b_no_market": "型B不参加指定",
+                }.get(ob["ob_type"], ob["ob_type"])
+                details_str = ""
+                if "amount" in ob["details"]:
+                    details_str = f'{ob["details"]["amount"] // 10_000}万円'
+                elif "market_id" in ob["details"]:
+                    details_str = ob["details"]["market_id"]
+                elif "card_rank" in ob["details"]:
+                    details_str = ob["details"]["card_rank"]
+                lines.append(
+                    f'    - {ob["obligor"]} → {ob["counterparty"]}: '
+                    f'{ob_type_label} R{ob["round_num"]} {details_str}'
+                )
+
+    # 提案中のカードトレード（当事者にのみ表示）
+    trades_pending = visible_state.get("trades_pending", [])
+    if trades_pending:
+        lines.append("\n## 提案中のカードトレード")
+        lines.append(
+            '受諾: {"type": "card_trade_accept", "trade_id": "トレードID"}\n'
+            '拒否: {"type": "card_trade_reject", "trade_id": "トレードID"}'
+        )
+        for t in trades_pending:
+            tid = t["trade_id"]
+            proposer = t["proposer"]
+            rp = t["round_proposed"]
+            cash = t["cash_amount"]
+            lines.append(f"\n### トレード {tid}（R{rp}提案、提案者: {proposer}）")
+            if cash > 0:
+                lines.append(
+                    f"  {proposer}の {t['give_card_rank']} + {cash // 10_000}万円"
+                    f" ⇄ {t['with_player']}の {t['receive_card_rank']}"
+                )
+            elif cash < 0:
+                lines.append(
+                    f"  {proposer}の {t['give_card_rank']}"
+                    f" ⇄ {t['with_player']}の {t['receive_card_rank']} + {abs(cash) // 10_000}万円"
+                )
+            else:
+                lines.append(
+                    f"  {proposer}の {t['give_card_rank']}"
+                    f" ⇄ {t['with_player']}の {t['receive_card_rank']}"
+                )
+            # 提案者向け: 全宛先のステータス表示
+            if "all_targets" in t:
+                statuses = t.get("target_statuses", {})
+                parts = [f"{p}({statuses.get(p, '?')})" for p in t["all_targets"]]
+                lines.append(f"  宛先: {', '.join(parts)}")
 
     # 修正2: 交渉フェイズではmarket_commitは使えないことを明記
     lines.append(

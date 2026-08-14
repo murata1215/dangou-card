@@ -69,6 +69,40 @@ class GameConfig(BaseModel):
     anon_bounty_surcharge: float = 0.10
     """匿名報奨の手数料率（§7.2: +10%）"""
 
+    # --- Season 2 拡張 ---
+    fog_rounds: list[int] = []
+    """霧のラウンド（S2: [4, 8]）— 使用カード非公開"""
+
+    surge_enabled: bool = False
+    """市場高騰の有効フラグ（S2: True）— 参加者>生存者/2でプール2倍"""
+
+    surge_full_participation_max_alive: int = 0
+    """市場高騰の全員参加要件の境界人数。この人数以下では全員参加を要求する（0で従来挙動）"""
+
+    final_market_multiplier: int = 1
+    """最終市場の基本賞金倍率（S2: 3）— R12基本賞金をN倍"""
+
+    double_up_enabled: bool = False
+    """倍掛けの有効フラグ（S2: True）— TAKE or 2倍賭け"""
+
+    mandatory_repay_enabled: bool = False
+    """強制最低返済の有効フラグ（S2: True）— v0.7 §2"""
+
+    mandatory_repay_k: int = 0
+    """強制返済の緩和パラメータ k（§2.2: k=0 で完全均等返済）"""
+
+    card_trade_enabled: bool = False
+    """カードトレードの有効フラグ（S2: True）— v0.7 §3"""
+
+    card_trade_max_per_round: int = 1
+    """1プレイヤーあたり1ラウンドのトレード上限（§3.6）"""
+
+    card_trade_last_round: int = 11
+    """トレード可能な最終ラウンド（§3.6: R12は不可）"""
+
+    card_trade_broadcast_max: int = 5
+    """ブロードキャスト提案の宛先数上限（v0.7.1）"""
+
     # --- 交渉 ---
     negotiation_max_actions: int = 10
     """Negotiationの1プレイヤーあたり最大アクション数（§5.1: 10回、passは非カウント）"""
@@ -133,6 +167,25 @@ class GameConfig(BaseModel):
         )
 
     @classmethod
+    def default_8_s2(cls) -> "GameConfig":
+        """
+        8人版S2設定を返す
+
+        default_8()ベースにSeason 2拡張を全有効化。
+        """
+        base = cls.default_8()
+        return base.model_copy(update={
+            "fog_rounds": [],
+            "surge_enabled": True,
+            "surge_full_participation_max_alive": 4,
+            "final_market_multiplier": 3,
+            "double_up_enabled": True,
+            "mandatory_repay_enabled": True,
+            "mandatory_repay_k": 0,
+            "card_trade_enabled": True,
+        })
+
+    @classmethod
     def baseline_v1(cls, num_players: int = 8) -> "GameConfig":
         """
         RULESET_BASELINE_V1: Bot実験で確定した標準設定
@@ -152,3 +205,22 @@ class GameConfig(BaseModel):
             prize_tiers=flat_tiers,
             survival_cash=2_000_000,
         )
+
+    @classmethod
+    def baseline_v1_s2(cls, num_players: int = 8) -> "GameConfig":
+        """
+        RULESET_BASELINE_V1 + Season 2拡張
+
+        baseline_v1ベースにS2メカニクスを全有効化。
+        """
+        base = cls.baseline_v1(num_players)
+        return base.model_copy(update={
+            "fog_rounds": [],
+            "surge_enabled": True,
+            "surge_full_participation_max_alive": 4,
+            "final_market_multiplier": 3,
+            "double_up_enabled": True,
+            "mandatory_repay_enabled": True,
+            "mandatory_repay_k": 0,
+            "card_trade_enabled": True,
+        })

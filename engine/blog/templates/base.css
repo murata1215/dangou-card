@@ -1,0 +1,75 @@
+/* 嘘八百万 —談合カード— ブログ用カード共通スタイル（カイジ風・黒/濃紺/金） */
+:root{
+  --bg:#0d0d10; --bg2:#141419; --panel:#1a1a20; --edge:#3c3c48;
+  --accent:#c9a227; --accent-hi:#e8d278; --text:#e8e8ec; --subtext:#96969f;
+  --survive:#2ea06a; --danger:#b03a3a;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{background:transparent}
+body{
+  font-family:'Noto Sans CJK JP','Noto Sans JP','Yu Gothic',sans-serif;
+  color:var(--text);
+  -webkit-font-smoothing:antialiased;
+  text-rendering:geometricPrecision;
+}
+
+/* --- カード土台 --- */
+.card{
+  position:relative;
+  overflow:hidden;
+  background:
+    radial-gradient(130% 90% at 50% -10%, #1b1b23 0%, #101015 48%, #08080b 100%);
+}
+/* 内側の枠 */
+.plate{
+  position:absolute; inset:22px;
+  border:2px solid var(--edge); border-radius:26px;
+  box-shadow:inset 0 0 0 1px rgba(201,162,39,.18), inset 0 0 120px rgba(0,0,0,.55);
+  pointer-events:none;
+}
+/* トランプのスート装飾（薄く散らす） */
+.suit{position:absolute; color:var(--accent); opacity:.05; font-weight:900; line-height:1; pointer-events:none}
+/* 斜めの大きな透かし文字 */
+.watermark{
+  position:absolute; left:50%; top:50%;
+  transform:translate(-50%,-50%) rotate(-16deg);
+  font-weight:900; color:var(--accent); opacity:.05;
+  white-space:nowrap; pointer-events:none; text-align:center; width:200%;
+}
+.watermark .wm-sub{display:block; font-size:.32em; letter-spacing:.1em; opacity:.9; margin-top:.1em}
+
+/* --- 文字色ユーティリティ --- */
+.gold{color:var(--accent)}
+.gold-hi{color:var(--accent-hi)}
+.gold-grad{
+  background:linear-gradient(180deg,#f6e6a0 0%,#e8d278 35%,#c9a227 70%,#9c7c1e 100%);
+  -webkit-background-clip:text; background-clip:text; color:transparent;
+}
+.sub{color:var(--subtext)}
+
+/* --- 部品 --- */
+.badge{
+  display:inline-flex; align-items:center; justify-content:center;
+  border:2px solid var(--accent); border-radius:999px; color:var(--accent);
+  letter-spacing:.14em; padding:.34em 1.15em; font-size:30px;
+}
+.face{
+  background:#f5f5f5; border-radius:24px; overflow:hidden; position:relative;
+  box-shadow:0 0 0 4px var(--accent), 0 14px 44px rgba(0,0,0,.55);
+}
+.face.ring-survive{box-shadow:0 0 0 4px var(--survive), 0 14px 44px rgba(0,0,0,.55)}
+.face.ring-danger{box-shadow:0 0 0 4px var(--danger), 0 14px 44px rgba(0,0,0,.55)}
+.face img{width:100%; height:100%; object-fit:cover; display:block}
+.footer{
+  position:absolute; left:0; right:0; bottom:28px; text-align:center;
+  color:var(--subtext); font-size:24px; letter-spacing:.09em;
+}
+
+/* 赤スタンプ（LIE DETECTED / 破産 等） */
+.stamp{
+  display:inline-block; border:6px solid var(--danger); color:var(--danger);
+  border-radius:14px; font-weight:900; letter-spacing:.12em;
+  padding:.12em .5em; transform:rotate(-9deg);
+  box-shadow:0 0 0 2px rgba(176,58,58,.25); text-transform:uppercase;
+  opacity:.92;
+}

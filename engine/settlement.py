@@ -20,6 +20,26 @@ from engine import elimination as elim_ops
 from engine import player as player_ops
 
 
+def _should_surge(num_participants: int, alive_count: int, config: GameConfig) -> bool:
+    """
+    市場高騰の発動判定（§S2.2 + 少人数時の全員参加要件）
+
+    - surge_enabled=False → 常にFalse
+    - alive_count <= surge_full_participation_max_alive → 全員参加のみ高騰
+    - それ以外 → 参加者 > 生存者/2 で高騰（現行どおり）
+
+    Args:
+        num_participants: その市場への参加者数
+        alive_count: 現在の生存者数
+        config: ゲーム設定
+    """
+    if not config.surge_enabled:
+        return False
+    if alive_count <= config.surge_full_participation_max_alive:
+        return num_participants == alive_count
+    return num_participants > alive_count / 2
+
+
 def execute_settlement(
     players: dict[str, PlayerState],
     markets: list[Market],
@@ -69,12 +89,16 @@ def execute_settlement(
     # =========================================================================
     # Step 1: Reveal — 全市場の参加者・使用カードを公開
     # =========================================================================
+    # S2: 霧のラウンド — カード情報をマスク（§S2.1）
+    is_fog = round_num in config.fog_rounds
     logger.log("REVEAL", round_num, "settlement", step=1, data={
         "commits": [
             {"player_id": c.player_id, "market_id": c.market_id,
-             "card": c.card.card_id, "rank": c.card.rank.name}
+             "card": "FOG" if is_fog else c.card.card_id,
+             "rank": "FOG" if is_fog else c.card.rank.name}
             for c in commits
         ],
+        "fog": is_fog,
     })
 
     # =========================================================================
@@ -87,10 +111,17 @@ def execute_settlement(
     for c in commits:
         commits_by_market.setdefault(c.market_id, []).append(c)
 
+    # S2: 市場高騰判定用 — 生存者数を取得（§S2.2）
+    alive_count = sum(
+        1 for p in players.values()
+        if p.is_alive and p.player_id not in eliminated_this_settlement
+    )
+
     market_results: list[MarketResult] = []
     for market in markets:
         mc = commits_by_market.get(market.market_id, [])
-        result = market_ops.resolve_market(market, mc, config.entry_fee)
+        is_surge = _should_surge(len(mc), alive_count, config)
+        result = market_ops.resolve_market(market, mc, config.entry_fee, surge=is_surge)
         market_results.append(result)
 
         if not result.winners:
@@ -118,6 +149,7 @@ def execute_settlement(
             "prize_per_winner": result.prize_per_winner,
             "total_pool": result.total_pool,
             "carryover": carryovers.get(market.market_id, 0),
+            "surged": is_surge,
         })
 
     # =========================================================================
