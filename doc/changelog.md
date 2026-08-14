@@ -1,5 +1,24 @@
 # Changelog
 
+## 2026-08-14: 高騰境界値変更・S2設定統一・LLM対応拡充（カードトレード/倍掛け）・ソロ市場除外バグ修正
+
+### 概要
+市場高騰の境界人数調整に始まり、S2設定の二重管理解消、LLMエージェントに欠落していた2アクション（カードトレード・倍掛け）の実装、実際のLLM短時間試行（6体×6R×S2）、そして試行結果から発見した倍掛けのソロ市場除外バグの修正までを連続実施。
+
+### 変更
+- **高騰境界人数変更**: `engine/config.py` の `surge_full_participation_max_alive` を S2プリセット（`default_8_s2()`, `baseline_v1_s2()`）で 4→3 に変更。4人生存時の高騰率30.3%→1.3%が厳しすぎた問題への対処（`doc/surge_condition_change_report.md` に追記）
+- **S2設定の単一ソース化**: `scripts/simulate.py`/`scripts/simulate_s2_comparison.py`/`scripts/llm_trial.py` が個別にS2設定を組み立てていた（v0.6相当の古い設定が混入）のを `GameConfig.baseline_v1_s2()` プリセットに統一。`llm_trial.py` に `--ruleset S1/S2`・`--roster` オプション追加
+- **カードトレードのLLM対応**: `llm/response_parser.py` に `card_trade_propose/accept/reject` のパース処理、`llm/prompt_builder.py` にルール説明・書式を追加。従来LLMエージェントはこのアクションを一切発行できなかった（テスト: `tests/test_response_parser_card_trade.py` 新規13件）
+- **倍掛け(double_up)のLLM対応**: `llm/llm_agent.py` に `choose_double_up()` を新規実装（`llm/prompt_builder.py` の `build_double_up_prompt()` でプロンプト生成→JSON抽出→DOUBLE/TAKE判定、パース失敗時はTAKEにフォールバック+警告ログ）。従来はBotのみ選択可能でLLMは常に既定値だった（テスト: `tests/test_double_up_llm.py` 新規13件）
+- **LLM短時間試行の実施**: 6体（M6,L6,M5,L2,L1,M3）×6R×S2で実API試行（$0.59、1120秒）。カードトレード・倍掛けが実際に発火することを確認（`doc/llm_short_trial_plan.md`/`doc/llm_short_trial_report.md`）
+- **倍掛けソロ市場除外バグ修正**: 試行結果を精査した結果（`doc/double_up_bug_investigation.md`）、仕様§6.2「単独参加市場での賞金獲得は倍掛けの成功判定に含めない」が未実装と判明。`engine/game.py` の `_process_double_up` を2パス方式に変更し、ソロ市場を除外した `non_solo_winners` で成功判定するよう修正。`tests/test_s2_rules.py` に `TestDoubleUpSoloExclusion` 5件を追加
+- 全281件テストパス
+
+### 検証
+- 高騰境界値: シミュレーションで4人時30.3%への復元、5人以上は不変を確認
+- 倍掛けバグ修正: 1,000試合Botシミュレーションでソロ市場成功0件・成功率45.2%（健全な水準）を確認
+- 倍掛けバグ調査ではもう1件（「パース失敗」疑義）を検証した結果、実際はマークダウンコードブロックのパースが正常動作しており誤記と判明（バグではない）
+
 ## 2026-08-14: 立ち絵透明化スクリプトの閾値修正（108/45）
 
 ### 概要

@@ -117,9 +117,18 @@ strategyに必ず"emotion"を含めてください。現在のあなたの感情
   ※ob_type: type_a_payment(金銭支払) / type_b_market(市場指定) / type_b_card(カード指定) / type_b_no_market(不参加指定)
 - {{"type": "contract_sign", "contract_id": "..."}}
 - {{"type": "bounty_post", "amount": 500000, "bounty_type": "achievement", "condition_type": "market_win_against", "condition": {{"target_player": "P07"}}, "round_num": 5}}
+- {{"type": "card_trade_propose", "with_players": ["P07"], "give_card": "ONE_PAIR", "receive_card": "FLUSH", "cash_amount": 0}}
+  ※with_playersは最大5人のリスト（ブロードキャスト提案）。cash_amount: 正=自分が払う、負=相手が払う、0=カード交換のみ
+  ※1ラウンド1回まで。R12は不可。受諾した相手と即時交換成立、他の宛先は自動失効。拒否に理由は添えられない
 
 コミットフェイズのアクション:
 - {{"type": "market_commit", "market_id": "M01", "card": "ONE_PAIR"}}
+
+## Season 2 追加ルール（有効時のみ適用）
+- **市場高騰**: 同一市場への参加者数が生存者数の半分を超えると、その市場の賞金プールが2倍になる（3人以下の場合は全員参加のみ発動）
+- **強制最低返済**: 毎ラウンドのFinanceで「借金残高 ÷ 残りラウンド数」が自動返済される。返済を先送りできないため、計画的な資金管理が必要
+- **カードトレード**: Negotiation中に他プレイヤーとカード交換を提案できる（1ラウンド1回まで、R12は不可）。複数宛先へのブロードキャスト提案が可能で、最初に受諾した相手と即時交換される
+- **倍掛け**: 市場賞金を獲得した直後にTAKE（即時受領）かDOUBLE（預託）を選択。DOUBLEを選ぶと賞金を預託し、次ラウンドで市場賞金を獲得すれば預託額の2倍を受領。獲得できなければ全額没収。参加者が自分1人だけの市場（空き巣）での賞金は成功判定に含めない。R11が最後の選択機会（R12は自動TAKE）。選択と預託額は全員に公開される
 """
 
 
@@ -341,6 +350,66 @@ def build_commit_prompt(
     lines.append(
         f"\n交渉で合意・宣言した内容と整合するコミットを検討してください。"
         f'\nJSON形式で回答: {{"strategy": {{...}}, "action": {{"type": "market_commit", "market_id": "M01", "card": "ONE_PAIR"}}}}'
+    )
+
+    return "\n".join(lines)
+
+
+def build_double_up_prompt(
+    player_state: PlayerState,
+    prize_won: int,
+    round_num: int,
+    visible_state: dict[str, Any],
+    config: GameConfig,
+) -> str:
+    """
+    倍掛け選択用のユーザープロンプト
+
+    Settlement Phase で市場賞金を獲得した直後に呼ばれる。
+    TAKE（即時受領）か DOUBLE（預託して次R勝利で2倍）を選択させる。
+    """
+    lines: list[str] = []
+    remaining = config.num_rounds - round_num
+    lines.append(f"=== ラウンド{round_num} / 倍掛け選択 ===\n")
+    lines.append(f"あなたは市場賞金 **{prize_won // 10_000}万円** を獲得しました。")
+    lines.append(f"TAKE（即時受領）か DOUBLE（倍掛け）を選んでください。\n")
+
+    lines.append("## 倍掛けルール")
+    lines.append(f"- DOUBLE を選ぶと賞金 {prize_won // 10_000}万円を預託します")
+    lines.append(f"- **成功条件**: 次ラウンド（R{round_num + 1}）で市場賞金を1円以上獲得すること")
+    lines.append(f"  - ただし参加者が自分1人だけの市場（空き巣）での賞金は成功判定に含まれません")
+    lines.append(f"- **成功時**: 預託額の2倍 = **{prize_won * 2 // 10_000}万円** を受領")
+    lines.append(f"- **失敗時**: 預託額 {prize_won // 10_000}万円が**全額没収**されます")
+    lines.append(f"- TAKE を選ぶと {prize_won // 10_000}万円をそのまま受け取ります")
+    lines.append(f"- あなたの選択と預託額は全プレイヤーに公開されます")
+
+    lines.append(f"\n## あなたの状態（{player_state.player_id}）")
+    lines.append(f"  現金: {player_state.cash // 10_000}万円（賞金反映後）")
+    lines.append(f"  借金: {player_state.debt_balance // 10_000}万円")
+    free_cash = max(0, player_state.cash - player_state.debt_balance)
+    lines.append(f"  Free Cash: {free_cash // 10_000}万円")
+    hand_names = [c.rank.name for c in sorted(player_state.hand, key=lambda c: c.rank.value)]
+    lines.append(f"  残りカード: {', '.join(hand_names)}（{len(hand_names)}枚）")
+    lines.append(f"  残りラウンド: {remaining}")
+
+    # 他プレイヤーの倍掛け状況
+    double_ups = visible_state.get("double_ups", [])
+    if double_ups:
+        lines.append("\n## 他プレイヤーの倍掛け中預託")
+        for du in double_ups:
+            lines.append(
+                f"  {du['player_id']}: 預託{du['deposit'] // 10_000}万円"
+                f"（R{du['success_round']}で判定）"
+            )
+
+    # 生存者数
+    alive = visible_state.get("alive_players", [])
+    lines.append(f"\n生存者: {len(alive)}人（{', '.join(sorted(alive))}）")
+
+    lines.append(
+        f'\n以下のJSON形式で回答してください:\n'
+        f'{{"strategy": {{"reason": "判断理由", "emotion": "楽"}}, '
+        f'"choice": "DOUBLE" または "TAKE"}}'
     )
 
     return "\n".join(lines)

@@ -7,6 +7,7 @@ engine/models.pyのAction型に変換する。
 """
 
 import json
+import logging
 import re
 from typing import Any
 
@@ -14,8 +15,11 @@ from engine.models import (
     Action, PassAction, DmAction, BroadcastAction, MarketCommitAction,
     TransferAction, RepayAction, ContractProposeAction, ContractSignAction,
     AnonymousBroadcastAction, BountyPostAction, BountyCancelAction,
+    CardTradeProposeAction, CardTradeAcceptAction, CardTradeRejectAction,
     CardRank,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class ParseError(Exception):
@@ -310,7 +314,72 @@ def _convert_action(
             bounty_id=str(data.get("bounty_id", "")),
         )
 
-    # 不明なアクション → passにフォールバック
+    # カードトレード提案
+    if action_type == "card_trade_propose":
+        with_players = data.get("with_players", data.get("with", []))
+        if not with_players or not isinstance(with_players, list):
+            raise ParseError(
+                "card_trade_proposeにwith_playersリストが必要です",
+                '例: {"type": "card_trade_propose", "with_players": ["P07"], '
+                '"give_card": "ONE_PAIR", "receive_card": "FLUSH", "cash_amount": 0}'
+            )
+        give_card = str(data.get("give_card", "")).upper().replace(" ", "_")
+        receive_card = str(data.get("receive_card", "")).upper().replace(" ", "_")
+        try:
+            CardRank[give_card]
+        except KeyError:
+            valid = ", ".join(r.name for r in CardRank)
+            raise ParseError(
+                f"無効な差出カード名: {give_card}",
+                f"有効なカード名: {valid}"
+            )
+        try:
+            CardRank[receive_card]
+        except KeyError:
+            valid = ", ".join(r.name for r in CardRank)
+            raise ParseError(
+                f"無効な受取カード名: {receive_card}",
+                f"有効なカード名: {valid}"
+            )
+        return CardTradeProposeAction(
+            player_id=player_id,
+            with_players=with_players,
+            give_card=give_card,
+            receive_card=receive_card,
+            cash_amount=int(data.get("cash_amount", data.get("cash", 0))),
+        )
+
+    # カードトレード受諾
+    if action_type == "card_trade_accept":
+        trade_id = data.get("trade_id", "")
+        if not trade_id:
+            raise ParseError(
+                "card_trade_acceptにtrade_idが必要です",
+                '例: {"type": "card_trade_accept", "trade_id": "T_abc123"}'
+            )
+        return CardTradeAcceptAction(
+            player_id=player_id,
+            trade_id=str(trade_id),
+        )
+
+    # カードトレード拒否
+    if action_type == "card_trade_reject":
+        trade_id = data.get("trade_id", "")
+        if not trade_id:
+            raise ParseError(
+                "card_trade_rejectにtrade_idが必要です",
+                '例: {"type": "card_trade_reject", "trade_id": "T_abc123"}'
+            )
+        return CardTradeRejectAction(
+            player_id=player_id,
+            trade_id=str(trade_id),
+        )
+
+    # 不明なアクション → 警告付きでpassにフォールバック
+    logger.warning(
+        "Unknown action type '%s' from %s, falling back to pass",
+        action_type, player_id,
+    )
     return PassAction(player_id=player_id)
 
 

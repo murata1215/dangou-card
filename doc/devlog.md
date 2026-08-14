@@ -287,7 +287,7 @@ S1(v0.5凍結版, trial_C: Claude Sonnet 5が唯一の生還者・優勝)を土�
 
 ---
 
-### 2026-08-14 17:00 JST — 正式契約（公正証書）利用実態調査
+### 2026-08-14 02:00 JST — 正式契約（公正証書）利用実態調査
 
 Season 1 LLM 本戦（Phase C: trial_C_053055）における正式契約の利用実態を調査。
 
@@ -304,7 +304,7 @@ Season 1 LLM 本戦（Phase C: trial_C_053055）における正式契約の利�
 
 ---
 
-### 2026-08-14 18:30 JST — 交渉プロンプトへの提案中契約表示（バグ修正）+ v0.7 記述訂正
+### 2026-08-14 03:30 JST — 交渉プロンプトへの提案中契約表示（バグ修正）+ v0.7 記述訂正
 
 上記調査で判明したインフラ欠陥を修正。
 
@@ -321,7 +321,7 @@ Season 1 LLM 本戦（Phase C: trial_C_053055）における正式契約の利�
 
 ---
 
-### 2026-08-14 21:00 JST — v0.7 実装: 強制返済 + カードトレード + fog_rounds 修正
+### 2026-08-14 06:00 JST — v0.7 実装: 強制返済 + カードトレード + fog_rounds 修正
 
 Season 2 仕様書 v0.7 の新規メカニクスを engine に実装。
 
@@ -515,4 +515,214 @@ v0.7 の強制返済 k パラメータの影響を計測。`baseline_v1_s2(8)` �
 
 **成果物**: `viewer/static/emotions_alpha/`（42枚+コンタクトシート）、`viewer/static/emotions_backup_20260814/`（元画像バックアップ、読み取り専用として保存）
 
-**成果物**: `doc/surge_condition_change_report.md`, `scripts/simulate_surge_change.py`
+---
+
+### 2026-08-14 16:36 JST — 高騰条件: 境界人数を4→3に変更
+
+`surge_full_participation_max_alive=4` で4人生存時の高騰率が 30.3% → 1.3% と厳しくなりすぎたため、境界人数を **4 → 3** に変更。
+
+**変更内容**:
+- `engine/config.py`: `default_8_s2()` と `baseline_v1_s2()` の `surge_full_participation_max_alive` を `4` → `3` に変更
+- `_should_surge()` ロジック自体は変更なし（パラメータ値のみ）
+- テスト修正: 境界値4を前提とした2件を `model_copy(update={"surge_full_participation_max_alive": 4})` で明示的にパラメータを渡す形に変更（S2プリセット依存を外した）
+- テスト追加: 境界値3のケース3件（4人3参加→高騰、3人3参加→高騰、3人2参加→非高騰）
+- 全250件パス（247→250）
+
+**シミュレーション結果**（1,000試合、baseline_v1_s2(8)、max_alive=3）:
+
+| 生存者数 | 従来(max=0) | max=4 | max=3(今回) |
+|---|---|---|---|
+| 8人 | 23.1% | 23.1% | 23.1% |
+| 7人 | 48.1% | 48.1% | 48.1% |
+| 6人 | 26.1% | 26.1% | 26.1% |
+| 5人 | 65.5% | 65.5% | 65.5% |
+| **4人** | **30.3%** | **1.3%** | **30.3%** ✅ |
+| **3人** | **83.6%** | **9.8%** | **9.8%** |
+
+- 4人時: 30.3%に完全復元 ✅
+- 3人以下: 全員参加要件により引き続き抑制 ✅
+
+**成果物**: `doc/surge_condition_change_report.md`（追記）
+
+---
+
+### 2026-08-14 17:30 JST — devlog 時刻表記の修正（UTC→JST 3件）
+
+3エントリの見出し時刻が UTC のまま記録されていたため、JST に修正。
+
+| 修正前 | 修正後 |
+|---|---|
+| 17:00 JST | 02:00 JST |
+| 18:30 JST | 03:30 JST |
+| 21:00 JST | 06:00 JST |
+
+外部のチャット送信時刻との突合で確認済み。修正後、全エントリが時系列の単調増加になることを検証済み。
+
+---
+
+### 2026-08-14 17:50 JST — 調査: simulate.py の S2 設定が v0.6 のままである問題
+
+`simulate.py --ruleset S2` および `simulate_s2_comparison.py` が `baseline_v1_s2()` プリセットを使用せず、v0.6 相当の S2 設定を独自に構築していた問題を調査。
+
+**発見**:
+- `fog_rounds=[4,8]`（v0.7 で廃止済み）のまま
+- `mandatory_repay_enabled`、`card_trade_enabled`、`surge_full_participation_max_alive` が欠落（default の False/0 のまま）
+- 賞金体系・生還条件も `baseline_v1_s2()` と異なる
+
+**影響**: `simulate.py --ruleset S2` / `simulate_s2_comparison.py` の過去結果は不完全な S2 設定で取得されたもの。ただし `simulate_mandatory_repay.py` / `simulate_surge_change.py` は `baseline_v1_s2()` を使用しており正しい。LLM 本戦 (Phase C) は S1 で実行されており問題なし。
+
+**修正方針（未実施）**: プリセット関数 (`baseline_v1_s2()`) への統一を推奨。`llm_trial.py` への `--ruleset S2` 対応追加も必要。
+
+**成果物**: `doc/simulate_s2_stale_investigation.md`
+
+---
+
+### 2026-08-14 18:05 JST — S2 設定を単一ソース（プリセット関数）に統一
+
+調査（`doc/simulate_s2_stale_investigation.md`）で判明した S2 設定の二重管理を解消。
+
+**修正内容**:
+- `scripts/simulate.py`: S2 時の独自 `model_copy` 上書き（fog_rounds=[4,8] 等 v0.6 相当）を廃止。`GameConfig.baseline_v1_s2(len(roster))` を直接使用するよう変更
+- `scripts/simulate_s2_comparison.py`: `_create_config()` を `baseline_v1()` / `baseline_v1_s2()` プリセットに差し替え
+- `scripts/llm_trial.py`: `--ruleset S1/S2` オプションを追加。S2 時は `baseline_v1_s2()` を使用（既定 S1、既存挙動不変）
+- 全250件テストパス、10試合完走確認済み
+
+**原則**: 各スクリプトは S2 設定を独自に構築せず、`engine/config.py` のプリセット関数を単一の設定ソースとする。今後 S2 パラメータが追加された場合もプリセット関数のみを更新すれば全スクリプトに反映される。
+
+---
+
+### 2026-08-14 18:31 JST — 調査: LLM 短時間試行の実行方法
+
+v0.7 カードトレードの LLM 試行を計画するための事前調査。
+
+**重大発見（Season 1 正式契約問題と同種のインフラ欠陥）**:
+1. `llm/response_parser.py`: `card_trade_propose` / `card_trade_accept` / `card_trade_reject` のパース処理がない（PassAction にフォールバック）
+2. `llm/prompt_builder.py`: RULES_SUMMARY にカードトレード提案のアクション書式が記載されていない
+
+→ S2 を有効にしても**カードトレードは LLM では提案も応答も不可能**。試行前に修正が必須。
+
+**その他の確認事項**:
+- 全12モデル (M1-M6, L1-L6) の一覧確認。6社6キー全て .env 設定済み
+- 想定6体（DeepSeek V3×2, Kimi K2.6, GPT-4.1 Mini, Haiku 4.5, Gemini Flash）は M6+L6+M5+L2+L1+M3 で指定可能
+- `--preset dev` / `--rounds 6` / `--ruleset S2` で6R×S2 実行可能
+- Kimi thinking 無効化は models.py の extra_params で対応済み
+- 6体×6R の推定: ~420コール、$3-5、2-4時間
+- PHASE_C_ROSTER はハードコード。num_players=8 もハードコード。修正必要
+
+**成果物**: `doc/llm_short_trial_plan.md`
+
+---
+
+### 2026-08-14 18:51 JST — LLM ↔ エンジン間の欠落アクション修正
+
+全14アクションを棚卸しし、カードトレード3件のparser+prompt欠落を修正。Season 1 正式契約問題（contract_id がプロンプトに含まれず承諾0件）と同種のインフラ欠陥。
+
+**棚卸し結果**（14アクション中、欠落3件を修正）:
+
+| Action | parser | prompt | 修正 |
+|---|---|---|---|
+| card_trade_propose | ✗→✓ | ✗→✓ | 追加 |
+| card_trade_accept | ✗→✓ | (動的表示済み) | パーサー追加 |
+| card_trade_reject | ✗→✓ | (動的表示済み) | パーサー追加 |
+
+**修正内容**:
+- `llm/response_parser.py`: card_trade_propose/accept/reject のパース処理追加。未知アクション名で警告ログ出力（従来は暗黙 pass）
+- `llm/prompt_builder.py`: RULES_SUMMARY にカードトレード提案書式追加 + Season 2 追加ルール説明（市場高騰・強制最低返済・カードトレード）
+- `scripts/llm_trial.py`: `--roster` CLI オプション追加（Phase C のロスターをカンマ区切りで指定可能）。num_players をロスター長から動的に設定
+- `tests/test_response_parser_card_trade.py`: 新規13件（カードトレード3種のパース + バリデーション + 未知アクション警告）
+- 全263件テストパス（250→263）
+
+**プロンプト検証**: trade_id (`T_test123`) がプロンプトに表示されること、accept/reject の書式が表示されることを確認済み。Season 1 の contract_id 問題を繰り返さない。
+
+**スコープ外**: 倍掛け（choose_double_up は Settlement コールバック、LLM agent 未実装だが別件）
+
+---
+
+### 2026-08-14 19:33 JST — 倍掛け（double_up）を LLM から選択可能に
+
+LLM エージェントが倍掛け（TAKE / DOUBLE）を選択できるよう実装。基底クラスのデフォルト False（常に TAKE）を継承していたため、S2 の倍掛け機能が LLM では一度も発動しない状態だった。
+
+**実装内容**:
+- `llm/prompt_builder.py`: `build_double_up_prompt()` 新規関数。獲得賞金額、成功条件（次R市場勝利、ソロ市場除外）、失敗時ペナルティ（全額没収）、残りカード、他プレイヤーの倍掛け状況を提示。RULES_SUMMARY に倍掛け説明を追加
+- `llm/llm_agent.py`: `choose_double_up()` オーバーライド。LLM に JSON (`{"choice": "DOUBLE" or "TAKE"}`) を問い合わせ。パース失敗・コスト超過時は TAKE にフォールバック + 警告ログ
+- `tests/test_double_up_llm.py`: 新規13件（プロンプト生成6件 + パース動作7件、モック使用）
+- 全276件テストパス（263→276）
+
+**棚卸し表（全アクション + 倍掛け選択、完全版）**:
+
+| 機会 | engine | LLM agent | prompt | 状態 |
+|---|---|---|---|---|
+| 14 Negotiation アクション | ✓ | ✓ parser | ✓ RULES_SUMMARY | 全件OK |
+| market_commit | ✓ | ✓ parser | ✓ | OK |
+| choose_double_up | ✓ | ✓ オーバーライド | ✓ build_double_up_prompt + RULES_SUMMARY | **今回修正** |
+
+---
+
+### 2026-08-14 21:23 JST — LLM 短時間試行（6体 x 6R x S2）
+
+v0.7/v0.7.1 S2 新機能の LLM 生死判定。6体（DeepSeek V3 x2, Kimi K2.6, GPT-4.1 Mini, Haiku 4.5, Gemini Flash）x 6R x S2。
+
+**実行結果**: 18.7分、$0.59、205コール。生還: P01 (GPT-4.1 Mini), P05 (DeepSeek V3)。
+
+**S2 機能の生死判定**:
+
+| 機能 | 判定 | 詳細 |
+|---|---|---|
+| カードトレード | **未発火** | 0件。どのモデルも提案しなかった。12R本戦で再検証必要 |
+| 倍掛け | **発火** | DOUBLE 8回/TAKE 9回。GPT-4.1 Mini が4連続 DOUBLE 全成功。理由付き判断が機能 |
+| 強制返済 | **発火** | 全R で発動（27件）。Kimi が R4 で返済不能→脱落 |
+| 市場高騰 | **未発火** | 6人 x 3市場では確率的に低い |
+
+**Kimi 安定化確認**: JSON 率 96%（S1: 23%）、レイテンシ 10.0s（S1: 99.5s）。thinking 無効化が有効。
+
+**注目発見**: ソロ市場での倍掛け成功が3件（from_solo_market=true）。仕様§6.2 との整合確認が必要（engine 側の論点）。
+
+**成果物**: `doc/llm_short_trial_report.md`
+
+---
+
+### 2026-08-14 21:38 JST — 調査: 倍掛けのパース失敗とソロ市場判定の検証
+
+LLM 短時間試行（trial_C_20260814_210120）のログを精査し、3つの論点を調査。
+
+**論点A: パース失敗とフォールバックの矛盾 → バグではない**
+- P03 (Kimi) は正常な JSON (`{"choice": "DOUBLE"}`) を返しており、パースに成功
+- マークダウンコードブロックでラップされていたが `extract_json()` が対応済み
+- 全プレイヤーの全倍掛けレスポンスを原文確認。パース失敗は0件
+- レポートの「parse fail」注記が誤り
+
+**論点B: ソロ市場での倍掛け成功 → バグ（実装漏れ）**
+- 仕様書 §6.2: 「単独参加市場での賞金獲得は、倍掛けの成功判定に含めない」
+- engine `_process_double_up` L767: `round_winners` にソロ市場賞金が含まれたまま判定
+- `from_solo_market` フラグは判定後のメトリクス記録用で、判定自体に影響しない
+- R5/R6 の3件が本来は失敗すべき（過剰支払い合計 222万円）
+- 修正方針: `round_winners` 構築時にソロ市場を除外（2パス必要）
+
+**論点C: 借入額0円 → バグではない**
+- `LOAN_CHOSEN` イベントに `loan_amount` が正しく記録されている
+- レポート集計の解釈違い
+
+**成果物**: `doc/double_up_bug_investigation.md`
+
+---
+
+### 2026-08-14 22:00 JST — 倍掛け成功判定からソロ市場を除外（バグ修正）
+
+仕様書 §6.2「単独参加市場での賞金獲得は倍掛けの成功判定に含めない」が未実装だったバグを修正。
+
+**修正内容**:
+- `engine/game.py`: `_process_double_up` の勝者集計を2パスに分離。パス1でソロ市場を特定、パス2で `non_solo_winners`（ソロ除外）を構築。成功判定を `round_winners` → `non_solo_winners` に変更
+- `round_winners` は Step 2 の倍掛け選択提示用に維持（全賞金が対象）
+- `from_solo_market` フラグの記録は維持（事後検証用）
+- テスト5件追加（ソロのみ→失敗、複数人→成功、混合→成功、全ソロ→失敗、賞金なし→失敗）
+- 全281件テストパス（276→281）
+
+**シミュレーション検証**（1,000試合、baseline_v1_s2(8)）:
+- 倍掛け 18,796回: 成功 8,504回(45.2%), 失敗 10,292回(54.8%)
+- ソロ市場成功: **0回**（修正前は from_solo_market=true の成功が存在していた）
+- 成功率 45.2% は合理的な水準であり、極端に成立しにくくなっていない
+
+**直前試行の該当3件の検証**:
+- R5 P01 (deposit=10万, from_solo_market=true): 修正後は**失敗**（全市場 participants=1）
+- R5 P05 (deposit=42万, from_solo_market=true): 修正後は**失敗**（同上）
+- R6 P01 (deposit=22万, from_solo_market=true): 修正後は**失敗**（同上）

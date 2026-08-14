@@ -735,16 +735,24 @@ class Game:
 
         # 今ラウンドの市場勝者を特定（player_id → 獲得額マップ）
         round_winners: dict[str, int] = {}
+        # ソロ市場を除外した勝者マップ（倍掛け成功判定用, §6.2）
+        non_solo_winners: dict[str, int] = {}
         # 空き巣市場かどうかのマップ（market_id → participants==1）
         solo_markets: set[str] = set()
         # 勝者がどの市場で勝ったか
         winner_markets: dict[str, list[str]] = {}
 
+        # パス1: ソロ市場の特定
         for mr in market_results:
             if len(mr.participants) == 1:
                 solo_markets.add(mr.market_id)
+
+        # パス2: 勝者集計
+        for mr in market_results:
             for winner_id in mr.winners:
                 round_winners[winner_id] = round_winners.get(winner_id, 0) + mr.prize_per_winner
+                if mr.market_id not in solo_markets:
+                    non_solo_winners[winner_id] = non_solo_winners.get(winner_id, 0) + mr.prize_per_winner
                 if winner_id not in winner_markets:
                     winner_markets[winner_id] = []
                 winner_markets[winner_id].append(mr.market_id)
@@ -764,7 +772,7 @@ class Game:
                 du_fail += 1
                 continue
 
-            if dep.player_id in round_winners and round_winners[dep.player_id] > 0:
+            if dep.player_id in non_solo_winners and non_solo_winners[dep.player_id] > 0:
                 # 成功: 2倍払い出し
                 payout = dep.deposit_amount * 2
                 dep.success = True

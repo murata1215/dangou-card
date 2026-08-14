@@ -177,7 +177,7 @@ class GameConfig(BaseModel):
         return base.model_copy(update={
             "fog_rounds": [],
             "surge_enabled": True,
-            "surge_full_participation_max_alive": 4,
+            "surge_full_participation_max_alive": 3,
             "final_market_multiplier": 3,
             "double_up_enabled": True,
             "mandatory_repay_enabled": True,
@@ -217,7 +217,7 @@ class GameConfig(BaseModel):
         return base.model_copy(update={
             "fog_rounds": [],
             "surge_enabled": True,
-            "surge_full_participation_max_alive": 4,
+            "surge_full_participation_max_alive": 3,
             "final_market_multiplier": 3,
             "double_up_enabled": True,
             "mandatory_repay_enabled": True,

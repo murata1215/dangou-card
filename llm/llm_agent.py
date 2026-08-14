@@ -26,6 +26,7 @@ from llm.constants import (
 from llm.prompt_builder import (
     build_system_prompt, build_loan_prompt,
     build_negotiation_prompt, build_commit_prompt,
+    build_double_up_prompt,
 )
 from llm.response_parser import (
     parse_response, extract_json, ParseError, make_correction_message,
@@ -291,3 +292,61 @@ class LLMAgent(PlayerAgent):
 
         self.auto_commit_count += 1
         raise ValueError("Failed to get valid commit from LLM")
+
+    def choose_double_up(
+        self,
+        player_state: PlayerState,
+        prize_won: int,
+        round_num: int,
+        visible_state: dict,
+    ) -> bool:
+        """
+        S2: 倍掛け選択をLLMに判断させる
+
+        TAKE（False）/ DOUBLE（True）を返す。
+        パース失敗・コスト超過時は安全側の TAKE にフォールバック。
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+
+        if self._cost_exceeded or self._config is None:
+            return False
+
+        user_prompt = build_double_up_prompt(
+            player_state, prize_won, round_num, visible_state, self._config,
+        )
+
+        text, _ = self._call_llm("double_up", round_num, user_prompt)
+        if not text:
+            return False
+
+        data = extract_json(text)
+        if data:
+            self.valid_json_count += 1
+            # strategy があればログに記録
+            strategy = data.get("strategy")
+            if strategy and isinstance(strategy, dict):
+                self.strategy_history.append({
+                    "round": round_num, "turn": None, "strategy": strategy,
+                })
+                self._update_last_log_emotion(strategy)
+
+            choice = str(data.get("choice", "")).upper().strip()
+            if choice == "DOUBLE":
+                return True
+            if choice == "TAKE":
+                return False
+
+            # choice が DOUBLE/TAKE 以外の場合
+            logger.warning(
+                "Invalid double_up choice '%s' from %s R%d, defaulting to TAKE",
+                choice, self.player_id, round_num,
+            )
+            return False
+
+        # JSON パース失敗
+        logger.warning(
+            "Failed to parse double_up response from %s R%d, defaulting to TAKE",
+            self.player_id, round_num,
+        )
+        return False

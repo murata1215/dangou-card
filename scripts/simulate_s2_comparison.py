@@ -143,28 +143,11 @@ def run_batch(
 
 
 def _create_config(roster: list[str], ruleset: str) -> GameConfig:
-    """ロスター+ルールセットからGameConfigを生成"""
+    """ロスター+ルールセットからGameConfigを生成（プリセット関数を単一ソースとする）"""
     num = len(roster)
-    ratio = num / 20
-    base_tiers = [1_200_000] * 4 + [1_600_000] * 4 + [2_000_000] * 4
-    scaled_tiers = [int(t * ratio) for t in base_tiers]
-    total = sum(scaled_tiers)
-
-    config = GameConfig(
-        num_players=num,
-        total_prize=total,
-        prize_tiers=scaled_tiers,
-    )
-
     if ruleset == "S2":
-        config = config.model_copy(update={
-            "fog_rounds": [4, 8],
-            "surge_enabled": True,
-            "final_market_multiplier": 3,
-            "double_up_enabled": True,
-        })
-
-    return config
+        return GameConfig.baseline_v1_s2(num)
+    return GameConfig.baseline_v1(num)
 
 
 def generate_comparison_report(

@@ -8,7 +8,7 @@ S2ルールでのゲーム完走・再現性を検証する。
 import pytest
 from engine.config import GameConfig
 from engine.models import (
-    Market, MarketCommit, Card, CardRank, PlayerState, DoubleUpDeposit,
+    Market, MarketCommit, MarketResult, Card, CardRank, PlayerState, DoubleUpDeposit,
 )
 from engine import market as market_ops
 from engine.game import Game, GameResult
@@ -113,17 +113,41 @@ class TestMarketSurge:
 class TestSurgeFullParticipation:
     """少人数時の全員参加高騰要件（surge_full_participation_max_alive）のテスト"""
 
-    def test_4_alive_all_participate_surge(self):
-        """生存4人・同一市場4人 → 高騰する"""
+    def test_4_alive_all_participate_surge_with_max4(self):
+        """生存4人・同一市場4人 → 高騰する（max_alive=4明示）"""
         from engine.settlement import _should_surge
-        config = GameConfig.default_8_s2()  # surge_full_participation_max_alive=4
+        config = GameConfig.default_8_s2().model_copy(update={
+            "surge_full_participation_max_alive": 4,
+        })
         assert _should_surge(4, 4, config) is True
 
-    def test_4_alive_3_participate_no_surge(self):
-        """生存4人・同一市場3人 → 高騰しない（現行なら高騰していた）"""
+    def test_4_alive_3_participate_no_surge_with_max4(self):
+        """生存4人・同一市場3人 → 高騰しない（max_alive=4明示）"""
+        from engine.settlement import _should_surge
+        config = GameConfig.default_8_s2().model_copy(update={
+            "surge_full_participation_max_alive": 4,
+        })
+        assert _should_surge(3, 4, config) is False
+
+    # --- 境界人数3（S2プリセットのデフォルト値）---
+
+    def test_4_alive_3_participate_surge_with_max3(self):
+        """生存4人・同一市場3人 → 高騰する（max_alive=3: 通常判定 3>2）"""
+        from engine.settlement import _should_surge
+        config = GameConfig.default_8_s2()  # surge_full_participation_max_alive=3
+        assert _should_surge(3, 4, config) is True
+
+    def test_3_alive_3_participate_surge_with_max3(self):
+        """生存3人・同一市場3人 → 高騰する（max_alive=3: 全員参加 3==3）"""
         from engine.settlement import _should_surge
         config = GameConfig.default_8_s2()
-        assert _should_surge(3, 4, config) is False
+        assert _should_surge(3, 3, config) is True
+
+    def test_3_alive_2_participate_no_surge_with_max3(self):
+        """生存3人・同一市場2人 → 高騰しない（max_alive=3: 全員参加 2!=3）"""
+        from engine.settlement import _should_surge
+        config = GameConfig.default_8_s2()
+        assert _should_surge(2, 3, config) is False
 
     def test_3_alive_all_participate_surge(self):
         """生存3人・同一市場3人 → 高騰する"""
@@ -252,6 +276,122 @@ class TestDoubleUp:
             assert dep.resolved is True, (
                 f"Unresolved deposit: {dep.player_id} R{dep.deposited_round}"
             )
+
+
+class TestDoubleUpSoloExclusion:
+    """倍掛け成功判定からのソロ市場除外テスト（§6.2）"""
+
+    def _make_game_with_player(self, player_id: str = "P01") -> Game:
+        """プレイヤーが初期化済みの Game を作成"""
+        config = GameConfig.default_8_s2()
+        agents = _make_bot_agents()
+        game = Game(config=config, agents=agents, seed=1)
+        # プレイヤーを手動初期化（run() を呼ばずにテストするため）
+        from engine import player as player_ops
+        for pid in agents:
+            game.players[pid] = player_ops.create_player(pid, 3_000_000)
+        return game
+
+    def _make_market_result(self, market_id: str, winner: str, prize: int,
+                            num_participants: int) -> MarketResult:
+        """テスト用 MarketResult を生成"""
+        participants = []
+        for i in range(num_participants):
+            pid = winner if i == 0 else f"P{i+1:02d}"
+            card = Card(rank=CardRank.HIGH_CARD, card_id=f"c_{pid}_{market_id}")
+            participants.append(
+                MarketCommit(player_id=pid, market_id=market_id, card=card)
+            )
+        return MarketResult(
+            market_id=market_id,
+            participants=participants,
+            winners=[winner],
+            prize_per_winner=prize,
+            total_pool=prize,
+        )
+
+    def test_solo_market_only_fails(self):
+        """ソロ市場のみで賞金獲得 → 倍掛け失敗"""
+        game = self._make_game_with_player()
+        dep = DoubleUpDeposit(
+            player_id="P01", deposit_amount=100_000,
+            deposited_round=1, success_round=2,
+        )
+        game.double_up_deposits.append(dep)
+
+        results = [self._make_market_result("M01", "P01", 500_000, 1)]
+        game._process_double_up(2, results)
+
+        assert dep.resolved is True
+        assert dep.success is False, "ソロ市場のみでの賞金獲得は倍掛け失敗すべき"
+
+    def test_non_solo_market_succeeds(self):
+        """複数人市場で賞金獲得 → 倍掛け成功"""
+        game = self._make_game_with_player()
+        dep = DoubleUpDeposit(
+            player_id="P01", deposit_amount=100_000,
+            deposited_round=1, success_round=2,
+        )
+        game.double_up_deposits.append(dep)
+
+        results = [self._make_market_result("M01", "P01", 500_000, 3)]
+        game._process_double_up(2, results)
+
+        assert dep.resolved is True
+        assert dep.success is True, "複数人市場での賞金獲得は倍掛け成功すべき"
+
+    def test_mixed_markets_succeeds(self):
+        """ソロ市場+複数人市場の両方で獲得 → 倍掛け成功"""
+        game = self._make_game_with_player()
+        dep = DoubleUpDeposit(
+            player_id="P01", deposit_amount=100_000,
+            deposited_round=1, success_round=2,
+        )
+        game.double_up_deposits.append(dep)
+
+        results = [
+            self._make_market_result("M01", "P01", 300_000, 1),  # ソロ
+            self._make_market_result("M02", "P01", 200_000, 2),  # 複数人
+        ]
+        game._process_double_up(2, results)
+
+        assert dep.resolved is True
+        assert dep.success is True, "複数人市場で獲得があれば成功すべき"
+        assert dep.from_solo_market is False
+
+    def test_all_solo_markets_fails(self):
+        """全市場がソロ市場 → 倍掛け失敗"""
+        game = self._make_game_with_player()
+        dep = DoubleUpDeposit(
+            player_id="P01", deposit_amount=200_000,
+            deposited_round=1, success_round=2,
+        )
+        game.double_up_deposits.append(dep)
+
+        results = [
+            self._make_market_result("M01", "P01", 300_000, 1),  # ソロ
+            self._make_market_result("M02", "P01", 200_000, 1),  # ソロ
+            self._make_market_result("M03", "P02", 100_000, 1),  # 別プレイヤー
+        ]
+        game._process_double_up(2, results)
+
+        assert dep.resolved is True
+        assert dep.success is False, "全市場ソロでは倍掛け失敗すべき"
+
+    def test_no_prize_fails(self):
+        """賞金獲得なし → 倍掛け失敗"""
+        game = self._make_game_with_player()
+        dep = DoubleUpDeposit(
+            player_id="P01", deposit_amount=100_000,
+            deposited_round=1, success_round=2,
+        )
+        game.double_up_deposits.append(dep)
+
+        results = [self._make_market_result("M01", "P02", 500_000, 3)]
+        game._process_double_up(2, results)
+
+        assert dep.resolved is True
+        assert dep.success is False
 
 
 # === S2ゲーム完走・再現性 ===

@@ -372,16 +372,10 @@ def main() -> None:
         roster = list(DEFAULT_ROSTER)
 
     # 設定生成
-    config = create_config_for_roster(roster)
-
-    # S2ルールセットの適用
     if args.ruleset == "S2":
-        config = config.model_copy(update={
-            "fog_rounds": [4, 8],
-            "surge_enabled": True,
-            "final_market_multiplier": 3,
-            "double_up_enabled": True,
-        })
+        config = GameConfig.baseline_v1_s2(len(roster))
+    else:
+        config = create_config_for_roster(roster)
 
     # 賞金倍率の適用
     if args.prize_scale != 1.0:

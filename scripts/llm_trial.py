@@ -949,6 +949,11 @@ def main() -> None:
                         help="既存ログディレクトリからPhase Cレポートを再生成")
     parser.add_argument("--model", type=str, default=None,
                         help="Phase Aのモデルキーを上書き（例: M5）。デフォルト: L1(Haiku)")
+    parser.add_argument("--ruleset", type=str, default="S1",
+                        choices=["S1", "S2"],
+                        help="ルールセット: S1(Season 1, 既定) / S2(Season 2)")
+    parser.add_argument("--roster", type=str, default=None,
+                        help='Phase C ロスター（カンマ区切り、例: "M6,L6,M5,L2,L1,M3"）')
     args = parser.parse_args()
 
     # 修正8: レポート再生成モード
@@ -963,7 +968,15 @@ def main() -> None:
     if not args.phase:
         parser.error("--phase A, B or C is required (unless --regenerate-report)")
 
-    config = GameConfig.baseline_v1(num_players=8)
+    # Phase C ロスター決定（--roster指定 or デフォルト）
+    phase_c_roster = args.roster.split(",") if args.roster else PHASE_C_ROSTER
+    # Phase C はロスター長、A/B は8人固定
+    num_players = len(phase_c_roster) if args.phase == "C" else 8
+
+    if args.ruleset == "S2":
+        config = GameConfig.baseline_v1_s2(num_players=num_players)
+    else:
+        config = GameConfig.baseline_v1(num_players=num_players)
 
     # 修正5: presetの適用
     if args.preset == "dev":
@@ -1006,8 +1019,8 @@ def main() -> None:
         print(f"構成: Haiku×{llm_count} + Random×{config.num_players - llm_count}")
     else:  # Phase C
         num_games = games_override or 1
-        print(f"=== Step 3C: 全LLM戦（6社8モデル） ===")
-        print(f"ロスター: {', '.join(PHASE_C_ROSTER)}")
+        print(f"=== Step 3C: 全LLM戦（{len(phase_c_roster)}体） ===")
+        print(f"ロスター: {', '.join(phase_c_roster)}")
 
     print(f"試合数: {num_games}, {config.num_rounds}R, 交渉{config.negotiation_max_turns}巡")
     print(f"コスト上限: エージェント${COST_LIMIT_PER_GAME}, 全体${COST_LIMIT_TOTAL}")
@@ -1023,7 +1036,7 @@ def main() -> None:
             print(f"試合 {i + 1}/{num_games} 実行中...")
             try:
                 result, llm_agents, event_logger, seat_map = run_trial_game_c(
-                    PHASE_C_ROSTER, i, config, output_dir, args.seed,
+                    phase_c_roster, i, config, output_dir, args.seed,
                 )
                 all_results_c.append((result, llm_agents, event_logger, seat_map))
                 # 進捗表示
