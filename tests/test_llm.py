@@ -936,3 +936,205 @@ class TestStep32Fixes:
             assert len(lines) == 2  # 2行に増えている
 
             logger.close()
+
+
+class TestUsageCapture:
+    """Stage 1: 各アダプタが reasoning_tokens / cached_tokens を正しく捕捉することを検証"""
+
+    def test_anthropic_usage_thinking_tokens(self):
+        """Anthropic SDK の thinking_tokens が統一キー reasoning_tokens で取得されること"""
+        from llm.adapters import _dump_usage_raw
+
+        # Anthropic SDK の output_tokens_details.thinking_tokens をシミュレート
+        class FakeOTD:
+            thinking_tokens = 500
+
+        class FakeUsage:
+            input_tokens = 1000
+            output_tokens = 800
+            cache_creation_input_tokens = 0
+            cache_read_input_tokens = 50
+            output_tokens_details = FakeOTD()
+            def model_dump(self):
+                return {"input_tokens": 1000, "output_tokens": 800,
+                        "output_tokens_details": {"thinking_tokens": 500}}
+
+        usage_obj = FakeUsage()
+        _otd = getattr(usage_obj, "output_tokens_details", None)
+        usage = {
+            "input_tokens": usage_obj.input_tokens,
+            "output_tokens": usage_obj.output_tokens,
+            "cache_creation_input_tokens": getattr(usage_obj, "cache_creation_input_tokens", 0) or 0,
+            "cache_read_input_tokens": getattr(usage_obj, "cache_read_input_tokens", 0) or 0,
+            "reasoning_tokens": getattr(_otd, "thinking_tokens", 0) or 0,
+        }
+        assert usage["reasoning_tokens"] == 500
+        assert usage["cache_read_input_tokens"] == 50
+
+    def test_openai_compat_usage_reasoning_tokens(self):
+        """OpenAI互換の reasoning_tokens が捕捉されること"""
+        class FakeCTD:
+            reasoning_tokens = 300
+        class FakePTD:
+            cached_tokens = 0
+            cache_write_tokens = 0
+        class FakeUsage:
+            prompt_tokens = 2000
+            completion_tokens = 600
+            completion_tokens_details = FakeCTD()
+            prompt_tokens_details = FakePTD()
+
+        usage_obj = FakeUsage()
+        _ctd = getattr(usage_obj, "completion_tokens_details", None)
+        _ptd = getattr(usage_obj, "prompt_tokens_details", None)
+        usage = {
+            "input_tokens": getattr(usage_obj, "prompt_tokens", 0) or 0,
+            "output_tokens": getattr(usage_obj, "completion_tokens", 0) or 0,
+            "cache_read_input_tokens": getattr(_ptd, "cached_tokens", 0) or 0,
+            "cache_creation_input_tokens": getattr(_ptd, "cache_write_tokens", 0) or 0,
+            "reasoning_tokens": getattr(_ctd, "reasoning_tokens", 0) or 0,
+        }
+        assert usage["reasoning_tokens"] == 300
+
+    def test_openai_compat_usage_cached_tokens(self):
+        """OpenAI互換の cached_tokens / cache_write_tokens が捕捉されること"""
+        class FakeCTD:
+            reasoning_tokens = 0
+        class FakePTD:
+            cached_tokens = 1000
+            cache_write_tokens = 200
+        class FakeUsage:
+            prompt_tokens = 3000
+            completion_tokens = 400
+            completion_tokens_details = FakeCTD()
+            prompt_tokens_details = FakePTD()
+
+        usage_obj = FakeUsage()
+        _ctd = getattr(usage_obj, "completion_tokens_details", None)
+        _ptd = getattr(usage_obj, "prompt_tokens_details", None)
+        usage = {
+            "cache_read_input_tokens": getattr(_ptd, "cached_tokens", 0) or 0,
+            "cache_creation_input_tokens": getattr(_ptd, "cache_write_tokens", 0) or 0,
+            "reasoning_tokens": getattr(_ctd, "reasoning_tokens", 0) or 0,
+        }
+        assert usage["cache_read_input_tokens"] == 1000
+        assert usage["cache_creation_input_tokens"] == 200
+        assert usage["reasoning_tokens"] == 0
+
+    def test_usage_details_none_fallback(self):
+        """details が None の場合、reasoning/cache 系が全て 0 にフォールバックすること（回帰）"""
+        class FakeUsage:
+            prompt_tokens = 500
+            completion_tokens = 100
+            completion_tokens_details = None
+            prompt_tokens_details = None
+
+        usage_obj = FakeUsage()
+        _ctd = getattr(usage_obj, "completion_tokens_details", None)
+        _ptd = getattr(usage_obj, "prompt_tokens_details", None)
+        usage = {
+            "cache_read_input_tokens": getattr(_ptd, "cached_tokens", 0) or 0,
+            "cache_creation_input_tokens": getattr(_ptd, "cache_write_tokens", 0) or 0,
+            "reasoning_tokens": getattr(_ctd, "reasoning_tokens", 0) or 0,
+        }
+        assert usage["cache_read_input_tokens"] == 0
+        assert usage["cache_creation_input_tokens"] == 0
+        assert usage["reasoning_tokens"] == 0
+
+    def test_dump_usage_raw(self):
+        """_dump_usage_raw が pydantic model / plain object / None に対して安全に動作すること"""
+        from llm.adapters import _dump_usage_raw
+
+        # pydantic-like model_dump
+        class FakeModel:
+            def model_dump(self):
+                return {"a": 1, "b": 2}
+        result = _dump_usage_raw(FakeModel())
+        assert result == {"a": 1, "b": 2}
+
+        # plain object with vars()
+        class PlainObj:
+            x = 10
+            y = 20
+        result = _dump_usage_raw(PlainObj())
+        assert result is not None  # vars() で取得可能
+
+        # None → 例外を出さず None を返す
+        result = _dump_usage_raw(None)
+        assert result is None
+
+
+class TestLoggerNewFields:
+    """Stage 1: ログエントリに新フィールドが正しく記録されることを検証"""
+
+    def test_logger_entry_has_reasoning_tokens(self):
+        """reasoning_tokens が usage から記録されること"""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            logger = LLMLogger(tmpdir, game_id="test_rt")
+            logger.log_call(
+                player_id="P01", model_id="test", phase="negotiation",
+                round_num=1, turn=1, system_prompt="sys", user_prompt="user",
+                response_text="resp",
+                usage={"input_tokens": 100, "output_tokens": 50, "reasoning_tokens": 200},
+                cost=0.01, elapsed_ms=100,
+            )
+            entry = logger._entries[-1]
+            assert entry["reasoning_tokens"] == 200
+            logger.close()
+
+    def test_logger_entry_has_unit_price_snapshot(self):
+        """単価スナップショット (unit_price_input/output) が記録されること"""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            logger = LLMLogger(tmpdir, game_id="test_up")
+            logger.log_call(
+                player_id="P01", model_id="gemini", phase="commit",
+                round_num=2, turn=None, system_prompt="sys", user_prompt="user",
+                response_text="resp",
+                usage={"input_tokens": 100, "output_tokens": 50},
+                cost=0.05, elapsed_ms=200,
+                unit_price_input=1.50,
+                unit_price_output=9.00,
+            )
+            entry = logger._entries[-1]
+            assert entry["unit_price_input"] == 1.50
+            assert entry["unit_price_output"] == 9.00
+            logger.close()
+
+    def test_logger_entry_has_usage_raw(self):
+        """usage_raw が記録されること（None でも例外を出さないこと）"""
+        import tempfile, json
+        with tempfile.TemporaryDirectory() as tmpdir:
+            logger = LLMLogger(tmpdir, game_id="test_ur")
+            raw = {"prompt_tokens": 100, "completion_tokens": 50,
+                   "completion_tokens_details": {"reasoning_tokens": 30}}
+            logger.log_call(
+                player_id="P01", model_id="test", phase="negotiation",
+                round_num=1, turn=1, system_prompt="sys", user_prompt="user",
+                response_text="resp",
+                usage={"input_tokens": 100, "output_tokens": 50, "usage_raw": raw},
+                cost=0.01, elapsed_ms=100,
+            )
+            entry = logger._entries[-1]
+            assert entry["usage_raw"] == raw
+
+            # usage_raw が無い場合は None
+            logger.log_call(
+                player_id="P01", model_id="test", phase="commit",
+                round_num=1, turn=None, system_prompt="sys", user_prompt="user",
+                response_text="resp",
+                usage={"input_tokens": 100, "output_tokens": 50},
+                cost=0.01, elapsed_ms=100,
+            )
+            entry2 = logger._entries[-1]
+            assert entry2["usage_raw"] is None
+
+            # ファイルにも正しく書かれること（JSON serializable）
+            with open(logger._file_path, "r") as f:
+                lines = f.readlines()
+            assert len(lines) == 2
+            parsed = json.loads(lines[0])
+            assert parsed["usage_raw"]["completion_tokens_details"]["reasoning_tokens"] == 30
+
+            logger.close()

@@ -50,6 +50,8 @@ class LLMLogger:
         error_type: str | None = None,
         emotion: str | None = None,
         finish_reason: str | None = None,
+        unit_price_input: float = 0.0,
+        unit_price_output: float = 0.0,
     ) -> None:
         """
         1回のLLMコールを記録し、即時にファイルへ追記する
@@ -77,6 +79,10 @@ class LLMLogger:
             "emotion": emotion,
             "reasoning": None,  # CoT: _update_last_log_emotion で後付け
             "finish_reason": finish_reason,
+            "reasoning_tokens": usage.get("reasoning_tokens", 0),
+            "usage_raw": usage.get("usage_raw"),  # 生usageダンプ（Gemini等の未知フィールド炙り出し用）
+            "unit_price_input": unit_price_input,   # 単価スナップショット（$/1Mトークン）
+            "unit_price_output": unit_price_output,  # 単価スナップショット（$/1Mトークン）
         }
         self._entries.append(entry)
         self._total_cost += cost

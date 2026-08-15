@@ -17,6 +17,23 @@ from llm.models import ModelInfo
 from llm.constants import API_TIMEOUT_SECONDS, API_MAX_RETRIES
 
 
+def _dump_usage_raw(usage_obj: Any) -> dict[str, Any] | None:
+    """
+    API応答の usage オブジェクトを辞書にダンプする（Gemini等の未知フィールド炙り出し用）。
+
+    pydantic v2 の model_dump() → pydantic v1 の dict() → vars() の順で試行。
+    取得失敗時は None を返す（試合を止めない）。
+    """
+    try:
+        if hasattr(usage_obj, "model_dump"):
+            return usage_obj.model_dump()
+        if hasattr(usage_obj, "dict"):
+            return usage_obj.dict()
+        return {k: v for k, v in vars(usage_obj).items() if not k.startswith("_")}
+    except Exception:
+        return None
+
+
 class AdapterError(Exception):
     """APIアダプタのエラー（キー情報を含まない安全なメッセージのみ）"""
     pass
@@ -129,12 +146,17 @@ class AnthropicAdapter:
                     if hasattr(block, "text"):
                         text = block.text
                         break
+                # thinking_tokens を捕捉（Sonnet 5 等の extended thinking 用）
+                # Anthropic SDK: output_tokens_details.thinking_tokens → 統一キー reasoning_tokens
+                _otd = getattr(response.usage, "output_tokens_details", None)
                 usage = {
                     "input_tokens": response.usage.input_tokens,
                     "output_tokens": response.usage.output_tokens,
                     "cache_creation_input_tokens": getattr(response.usage, "cache_creation_input_tokens", 0) or 0,
                     "cache_read_input_tokens": getattr(response.usage, "cache_read_input_tokens", 0) or 0,
+                    "reasoning_tokens": getattr(_otd, "thinking_tokens", 0) or 0,
                     "finish_reason": getattr(response, "stop_reason", None),
+                    "usage_raw": _dump_usage_raw(response.usage),
                 }
                 return text, usage
 
@@ -225,12 +247,19 @@ class OpenAICompatAdapter:
                     text = extras.get('reasoning_content', '') or ''
                 # finish_reason キャプチャ（length=max_tokens切断の検知用）
                 finish_reason = response.choices[0].finish_reason if response.choices else None
+                # reasoning_tokens / cached_tokens を防御的に取得
+                # OpenAI SDK: completion_tokens_details.reasoning_tokens,
+                #             prompt_tokens_details.cached_tokens / cache_write_tokens
+                _ctd = getattr(response.usage, "completion_tokens_details", None)
+                _ptd = getattr(response.usage, "prompt_tokens_details", None)
                 usage = {
                     "input_tokens": getattr(response.usage, "prompt_tokens", 0) or 0,
                     "output_tokens": getattr(response.usage, "completion_tokens", 0) or 0,
-                    "cache_read_input_tokens": 0,
-                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": getattr(_ptd, "cached_tokens", 0) or 0,
+                    "cache_creation_input_tokens": getattr(_ptd, "cache_write_tokens", 0) or 0,
+                    "reasoning_tokens": getattr(_ctd, "reasoning_tokens", 0) or 0,
                     "finish_reason": finish_reason,
+                    "usage_raw": _dump_usage_raw(response.usage),
                 }
                 return text, usage
 

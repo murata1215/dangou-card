@@ -137,6 +137,8 @@ class LLMAgent(PlayerAgent):
             error=error_msg,
             error_type=error_type,
             finish_reason=finish_reason,
+            unit_price_input=self.model_info.input_price,
+            unit_price_output=self.model_info.output_price,
         )
 
         self.total_calls += 1

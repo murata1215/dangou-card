@@ -1536,3 +1536,13 @@ bash scripts/check_trial.sh  # 進行確認
 > R1の初期状況を分析する。【現状把握】現金500万円、借金500万円、Free Cash 0万円。全員が同じカード構成で、市場は3つ各96万円。P01-P02、P03-P04が既に談合の枠組みを作っている。6人が3市場に分散すれば、各市場2人ずつが標準的な配置…
 
 **リーク検査**: 全プレイヤーの reasoning が他プレイヤーのプロンプトおよびゲームイベントに**一切含まれていないこと**を確認。**PASS**。
+
+### 2026-08-16 07:00 JST — コストログ化 Stage 1: トークン内訳の捕捉 + ログスキーマ拡張
+
+実請求額に近いコストを後から算出できる基盤として、各アダプタが捨てていた reasoning_tokens（thinking）と cached_tokens を防御的に捕捉しログに記録する仕組みを実装。
+
+**目的**: (1) 実請求との乖離の主因であった Gemini/Anthropic の thinking トークンと、OpenAI/DeepSeek の入力キャッシュトークンをログに残す。(2) 生 usage ダンプ（`usage_raw`）を仕込み、次回実試合のログで Gemini が reasoning をどのフィールド名で返すか／`completion_tokens` に含むかを炙り出す。(3) 単価スナップショット（`unit_price_input`/`unit_price_output`）を記録し、事後の単価変更に影響されない再計算を可能にする。
+
+**変更**: `llm/adapters.py`（AnthropicAdapter に `output_tokens_details.thinking_tokens` → 統一キー `reasoning_tokens` で捕捉、OpenAICompatAdapter に `completion_tokens_details.reasoning_tokens` / `prompt_tokens_details.cached_tokens` / `cache_write_tokens` を防御的に取得（ハードコード 0 を廃止）、`_dump_usage_raw()` ヘルパー追加）、`llm/llm_logger.py`（`reasoning_tokens` / `usage_raw` / `unit_price_input` / `unit_price_output` の 4 フィールド追加）、`llm/llm_agent.py`（単価の受け渡し追加）。テスト 8 件追加、全 332 件パス。
+
+**cost_usd の算出式は変更なし**（内訳対応・単価表の拡張は Stage 2 で実施予定）。
