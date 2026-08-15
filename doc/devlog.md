@@ -726,3 +726,653 @@ LLM 短時間試行（trial_C_20260814_210120）のログを精査し、3つの�
 - R5 P01 (deposit=10万, from_solo_market=true): 修正後は**失敗**（全市場 participants=1）
 - R5 P05 (deposit=42万, from_solo_market=true): 修正後は**失敗**（同上）
 - R6 P01 (deposit=22万, from_solo_market=true): 修正後は**失敗**（同上）
+
+---
+
+## 2026-08-14 22:25 JST — LLMプロンプトキャッシュ・コスト構造 調査レポート
+
+**本エントリは調査のみ。コード変更なし。**
+
+### 背景
+
+trial_C_20260814_210120（S2 6人6R）でClaude Haiku 4.5が全体コスト$0.59の約42%（$0.2470）を占めた。
+1コール単価はGPT-4.1-miniの約5倍、Gemini 3.5 Flashの約13倍。
+「Anthropic系だけプロンプトキャッシュが効いていない」という仮説を検証した。
+
+### 調査1: 各vendorアダプタのキャッシュ設定
+
+| アダプタ | キャッシュ設定 | ファイル |
+|---|---|---|
+| AnthropicAdapter | `cache_control: {"type": "ephemeral"}` **実装済み** | `llm/adapters.py` L109-112 |
+| OpenAICompatAdapter | なし（各社の自動キャッシュに依存） | `llm/adapters.py` L200 |
+
+**重要発見:** `cache_control`は実装済みだが、P04（Haiku）の全27コールで `cache_creation_input_tokens=0`, `cache_read_input_tokens=0`。
+初回コール（cache creationが発生すべき）ですら0であり、**APIがキャッシュを作成していない**。
+
+考えられる原因候補:
+1. Anthropic SDK 0.121.0 での cache_control パラメータ取り扱いの変更
+2. API応答の `response.usage` にフィールドが存在せず `getattr()` がデフォルト0を返している
+3. model ID `claude-haiku-4-5-20251001` 固有の挙動
+
+### 調査2: systemプロンプトのトークン数
+
+- 固定部（RULES_SUMMARY + identity）: **約3,689トークン**（初回コールの入力3,889tokからuser_prompt分を差し引いて逆算）
+- Haiku 4.5 のキャッシュ最小長 **2,048トークン** を大幅に超過 → キャッシュ適格
+- 変動部（user_prompt）: 200-800 tok/コール
+- ブレークポイント設計は適切（system部にcache_control、messagesは動的）
+
+### 調査3: トークン内訳のログ記録
+
+`llm/llm_logger.py` で `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`, `cost_usd` 等20フィールドを**JSONL形式で逐次記録済み**。
+
+問題点:
+- `estimate_cost()` (`llm/models.py` L146-148) がキャッシュ割引を考慮していない（全入力にフル単価を適用）
+- `total_cache_creation_tokens` 集計プロパティが未実装（read側のみ実装）
+
+### コスト構造分析
+
+| 座席 | モデル | コール数 | 平均出力tok | コスト |
+|---|---|---|---|---|
+| P01 | GPT-4.1 Mini | 41 | **131** | $0.0739 |
+| P02 | DeepSeek V3 (L) | 41 | 218 | $0.0517 |
+| P03 | Kimi K2.6 | 26 | 371 | $0.1454 |
+| P04 | **Haiku 4.5** | 27 | **821** | **$0.2470** |
+| P05 | DeepSeek V3 | 41 | 225 | $0.0530 |
+| P06 | Gemini 3.5 Flash | 29 | 242 | $0.0203 |
+
+**Haiku高コストの原因:**
+1. **出力トークン過多**: 平均821 tok/call（GPT-miniの6.3倍）。出力だけで$0.1108（全体の45%）
+2. **単価差**: Haiku $1/$5 vs GPT-mini $0.40/$1.60
+3. **キャッシュ未発動**: 効けば入力コスト約35%削減可能（$0.1361→$0.0507）
+
+### 次のアクション候補（未実施）
+
+1. キャッシュ未発動の根本原因調査（SDK 0.121.0でのAPI 1コール検証）
+2. `estimate_cost()` のキャッシュ対応価格反映
+3. 出力トークン数の抑制策検討（max_tokens調整 or プロンプトで簡潔な応答を指示）
+
+---
+
+## 2026-08-14 22:38 JST — viewer プレイヤーカードUIレイアウト変更
+
+配信時の視認性向上のため、プレイヤーカードUIを改修した。ゲームロジックへの変更なし。
+
+### 変更内容
+
+1. **キャラ画像拡大**: 56px → 88px角（`border-radius: 10px`）、感情差分が判別可能に
+2. **純資産メイン + 内訳サブの2段表示**:
+   - 上段: `純資産 = 現金 - 借入額`（19px, font-weight 500, ゴールド）
+   - 下段: `現金 X ／ 借入 Y`（11px、借入の数値のみ danger色で強調）
+   - 借入0の場合は内訳行を非表示（純資産=現金なので冗長を避ける）
+3. **APIコスト($)をメタ情報帯へ移動**: stats-row の左にR/JSON/DM/BC/ERR、右端に$（`justify-content: space-between`）
+4. **CSS変数 `--text-danger` 追加**: ダーク `#ef5350` / ライト `#c62828`
+
+### 変更理由
+
+- S2の強制返済（kパラメータ）があるため、借入額が見えないとプレイヤーの返済圧が伝わらない
+- 感情画像が小さすぎて実況で感情に言及しても視聴者が確認できなかった
+- APIコスト($)とゲーム内通貨(¥)が視線上で混在し、視聴者が混乱していた
+
+### 変更ファイル
+
+- `viewer/log_parser.py`: SNAPSHOTから `free_cash` も取得し `debt = cash - free_cash` を計算。`LOAN_CHOSEN` イベントから `initial_loan` も取得
+- `viewer/static/style.css`: CSS変数追加、パネルレイアウト変更（画像88px, 純資産/内訳2段, stats-row space-between）
+- `viewer/static/index.html`: パネルHTML構造変更、`computeStateSig` に `debt` 追加
+
+---
+
+## 2026-08-14 22:55 JST — Anthropic系出力トークン過多の原因分析
+
+**本エントリは調査のみ。コード変更なし。**
+
+### 背景
+
+前回調査でClaude Haikuの平均出力トークンが821/call（GPT-4.1-miniの6.3倍）と判明。
+出力コストだけで$0.1108（Haiku総額の45%）。Sonnet($15/MTok output)起用時のコスト爆発を防ぐため根本原因を特定した。
+
+### 根本原因: JSON前後の非JSONテキスト（全出力の57%）
+
+| 項目 | Haiku (P04) | GPT-4.1-mini (P01) |
+|---|---|---|
+| 全レスポンス文字数 | 30,821 | 10,486 |
+| JSON部分 | 13,196 (43%) | 10,486 (**100%**) |
+| **非JSONテキスト** | **17,625 (57%)** | **0 (0%)** |
+| 推定非JSONトークン | **~8,600** | **0** |
+
+- 27/27コールでマークダウンのコードフェンス（\`\`\`json）を付与
+- 21/27コールでJSON前に500〜2000文字の**戦略分析テキスト**を出力
+- JSON内部のフィールド差は1.2〜2.0倍で主因ではない
+- extended thinkingは無効。**通常テキスト出力として課金される「声に出す思考」**
+
+### 具体例（R1 negotiation 同一局面）
+
+Haiku（946 tok）: JSON前に「私の状況を整理します：**現在の状態分析:**...」と500文字の分析を出力し、その後に\`\`\`json\`\`\`でJSON。GPT-mini（91 tok）: JSONのみ。
+
+### プロンプト側の要因
+
+`prompt_builder.py` L99「出力は必ず以下の形式:」は「JSONのみ出力せよ」とは書いておらず、「JSONも説明も」と解釈されている。文字数・トークン数の上限指示は一切なし。
+
+### Sonnet波及の推定（未対策時）
+
+| 項目 | Haiku実測 | Sonnet推定 |
+|---|---|---|
+| 出力トークン | 22,169 | ~22,000 |
+| 出力コスト | $0.1108 | **$0.3300** |
+| 1プレイヤー合計 | $0.2470 | **$0.6022** |
+| 8人戦 | — | **~$4.82/game** |
+
+### 改善案候補（優先度順、未実施）
+
+1. **system promptに「JSONのみ出力。説明文・コードフェンス不要」を明記**（推定60-70%削減）→ `prompt_builder.py` L98-101
+2. **Anthropic系の max_tokens を 1000-1500 に制限**（推定30-40%削減）→ `models.py`
+3. **フェイズごとに max_tokens を変える**（negotiation=800等）→ `llm_agent.py`
+4. **Anthropic API の stop_sequences で \`\`\` を指定**（推定5-10%削減）→ `adapters.py`
+
+---
+
+## 2026-08-15 00:00 JST — 出力トークン削減の検証（結果: 対策無効・revert済み）
+
+**本エントリは調査・検証の記録。プロンプト変更は効果なしのため revert 済み。**
+
+### 実施内容
+
+`llm/prompt_builder.py` L98-101 の出力指示を「JSONオブジェクトのみを返す。前置き・後置きの説明文やコードフェンスは不要」に変更し、固定入力3局面 x 10回 x before/after x 2モデル（claude-haiku-4-5 / gpt-4.1-mini）= 120コールで効果を検証。実コスト **$0.7130**。検証スクリプトは `scripts/bench_output_tokens.py`、レポートは `.devrelay-output/bench_report.md`。
+
+### 結果: 効果なし（むしろ悪化）
+
+| 入力 | before | after | 変化 |
+|---|---|---|---|
+| early_negotiation | 774 | 819 | -5.8% |
+| complex_negotiation | 718 | 775 | -7.9% |
+| mid_commit | 967 | 1031 | -6.6% |
+
+- コードフェンス率は after でも **10/10**。明示的に禁止しても一切従わなかった
+- 非JSON文字数もほぼ不変（661→688 / 527→605 / 815→891）
+- 事前推定「60-70%削減」は完全に外れ
+- gpt-4.1-mini は +-7%以内でサンプリング揺らぎの範囲。共通プロンプト変更による悪影響はなし
+
+### 原因の推定
+
+修正後プロンプトは「コードフェンス不要」と書いた直後にフェンスなしのJSON例示を置いていた。それでもHaikuは10/10でフェンスを付与しており、「JSON出力＝コードブロック」という結びつきが強固である可能性が高い。**プロンプトの書き方では制御できない**と判断。
+
+### 有効そうな次の手（未実施）
+
+1. **Assistant prefill**: assistantターン冒頭を `{` で埋める。前置きもフェンスも物理的に書けなくなる（最有力）
+2. **stop_sequences**: prefillと併用し、閉じ括弧以降の出力を停止
+3. max_tokens制限は最終手段（JSON生成途中で切れると有効率が落ちるリスク）
+
+### JSON有効率低下は計測バグだった
+
+検証レポートで complex_negotiation の Haiku JSON有効率が 6-7/10 と出たが、**これはモデルの問題ではなくベンチスクリプトの欠陥**。
+
+- `scripts/bench_output_tokens.py` の `extract_json_content()` は本番パーサを使わず独自実装。`find("{")` 〜 `rfind("}")` の1回勝負で、失敗したら即 None を返す
+- 本番の `llm/response_parser.py` は4段階フォールバックを持つ（L46 正規表現でフェンス内抽出 / L68 最後の閉じ括弧まで試行 / L76 全体試行 / L91 括弧の対応を数えながら走査）
+- Haikuは散文中に `{` を含むことがあり、ベンチはそこで破綻するが本番パーサは L91 の走査で救える
+- 本番試合の Haiku JSON有効率 27/27 = 100% と整合する
+
+### 教訓（インフラバグ3例目）
+
+S1 `contract_id` 表示バグ、S2 カードトレードのパーサ欠落に続き、**インフラの不備がモデル側の問題に見える**事例。今回の原因は「検証スクリプトが本番と別実装だったこと」。
+→ **今後の検証スクリプトは `llm/response_parser.py` の `parse_response()` を必ず import して使うこと。**
+
+### 対応
+
+- `llm/prompt_builder.py` の変更は **revert 済み**（効果がないため）
+- `scripts/bench_output_tokens.py` は枠組みとして残置。ただしJSON判定が誤るため、再利用時は `parse_response()` に差し替えること
+
+---
+
+## 2026-08-15 01:30 JST — プレイヤーカードの借入額表示修正（近似計算→正しいデータ源）
+
+### 問題
+
+先行タスクで追加した借入額表示が `debt = cash - free_cash` という近似計算を使用していた。`free_cash = max(0, cash - debt_balance)` のため、`debt_balance > cash` のとき `free_cash = 0` となり `debt = cash`（実際の `debt_balance` より過小評価）になる問題があった。
+
+同一ログ内のINTERESTイベントに正確な `old_debt`（= SNAPSHOT時点の借金残高）が記録されており、近似を使う必要はなかった。
+
+### 修正内容
+
+`viewer/log_parser.py` の `get_game_state()` と `get_round_states()` の両方で:
+
+1. **SNAPSHOT**: `cash` と `cash - free_cash` を取得（`free_cash > 0` のとき正確）
+2. **INTEREST イベント**: `old_debt`（= SNAPSHOT時点の正確な借金残高）で上書き
+   - `free_cash = 0` のケースを正しく補正する
+   - INTEREST は SNAPSHOT の直後に発生するため、`old_debt` がSNAPSHOT時点のdebtに一致する
+
+MANDATORY_REPAY の `new_debt`/`new_cash` は**使用しない**（Finance後の値であり、ラウンド状況パネルのSNAPSHOTベース表示と時点がずれるため）。
+
+### 検証結果（trial_C_20260814_210120 / game01 R6）
+
+| プレイヤー | 現金 | 借金 | 純資産 | 期待値一致 |
+|---|---|---|---|---|
+| P01 GPT-4.1 Mini | 2,834,088 | 215,457 | 2,618,631 | OK |
+| P02 DeepSeek V3 (L) | 2,562,039 | 897,737 | 1,664,302 | OK |
+| P05 DeepSeek V3 | 4,044,080 | 1,795,473 | 2,248,607 | OK |
+
+全6プレイヤーの内訳行が表示され、ラウンド状況パネルと値が一致。`free_cash=0` のケース（R2 P02/P03, R3 P03/P05 等）もINTERESTの`old_debt`で正しく補正された。
+
+### 変更ファイル
+
+- `viewer/log_parser.py`: `get_game_state()` と `get_round_states()` の debt 算出をINTEREST.old_debtベースに変更
+- `tests/test_viewer.py`: `debt == cash - free_cash` を前提としたアサーションを更新
+---
+
+## 2026-08-15 04:42 JST — RULES_SUMMARY に最終市場ルール（R12基本賞金N倍）を追記
+
+### 背景
+
+エンジン側では `engine/config.py` の `final_market_multiplier=3`（S2設定）が `engine/market.py` の `generate_markets()` で正しくR12賞金に乗算されていたが、LLMエージェントへのシステムプロンプト（`llm/prompt_builder.py` の `RULES_SUMMARY`）に最終市場ルールの記載が漏れていた。Season 2 追加ルールセクションには4項目（市場高騰・強制最低返済・カードトレード・倍掛け）が記載されていたが、5番目の最終市場ルールが脱落していた。
+
+エージェントはR12のMarket Openで初めて高い賞金額を目にするのみで、R10等の時点で「R12は3倍だから温存しよう」という戦略立案が不可能だった。
+
+### 修正内容
+
+- `llm/prompt_builder.py` の `RULES_SUMMARY` に `{final_market_rule}` プレースホルダを追加
+- `build_system_prompt()` で `config.final_market_multiplier > 1` のときのみ最終市場ルールの文言を組み立て、プレースホルダに差し込む
+- `final_market_multiplier <= 1`（S1/デフォルト）のときは空文字を差し込み、行自体を出力しない
+
+### 倍率の扱い: 条件付き表示（パラメータ化 + 非表示分岐）
+
+他4項目（市場高騰=2倍, 倍掛け=2倍 等）は固定挙動のため無条件表示で問題ないが、最終市場の `multiplier=1` は「1倍＝変化なし」で無意味。この非対称は意味的に正当と判断し、最終市場のみ条件付き表示とした。ラウンド番号も `config.num_rounds` で動的埋め込み。
+
+### テスト
+
+- `test_rules_summary_contains_final_market_s2`: S2設定で「最終市場」「3倍」が含まれること
+- `test_rules_summary_no_final_market_s1`: S1設定で「最終市場」が含まれないこと
+- 全283件パス
+
+### 変更ファイル
+
+- `llm/prompt_builder.py`: RULES_SUMMARY にプレースホルダ追加 + build_system_prompt に条件付き組立ロジック追加
+- `tests/test_llm.py`: 最終市場ルールの表示/非表示テスト2件追加
+
+---
+
+## 2026-08-15 07:54 JST — S2フルトライアル（9人全LLM・12R・seed=501）
+
+### 設定
+
+- ロスター: Gemini 3.5 Flash(M3)×3 + GPT-4.1 Mini(L2)×3 + DeepSeek V3(M6)×3 = 9人全員LLM
+- ルールセット: S2 (baseline_v1_s2, num_players=9)
+- 12ラウンド / seed=501 / 1試合
+- 実行時間: 2478秒（41分）
+- APIコスト: $0.6097
+
+### 座席配置（seed=501シャッフル後）
+
+| PID | モデル |
+|---|---|
+| P01 | Gemini 3.5 Flash |
+| P02 | DeepSeek V3 |
+| P03 | GPT-4.1 Mini |
+| P04 | DeepSeek V3 |
+| P05 | Gemini 3.5 Flash |
+| P06 | DeepSeek V3 |
+| P07 | Gemini 3.5 Flash |
+| P08 | GPT-4.1 Mini |
+| P09 | GPT-4.1 Mini |
+
+### 結果: 全員脱落（生還者0人、R7でゲーム終了）
+
+| ラウンド | 脱落者 | 脱落原因 |
+|---|---|---|
+| R3 | P02(DeepSeek), P04(DeepSeek), P09(GPT-4.1 Mini) | 契約違反(type_b_card) |
+| R5 | P01(Gemini), P03(GPT-4.1 Mini), P07(Gemini), P08(GPT-4.1 Mini) | 契約違反(type_b_card) |
+| R6 | P05(Gemini), P06(DeepSeek) | 契約違反(type_b_card) |
+
+R7のMarket Open前に全員脱落 → ゲーム終了。R12には到達せず。
+
+### 契約: propose=26件 / sign=9件（署名率35%）
+
+- R3: P09がP02・P04と3者契約(C_16cbd48c)を提案→両者署名→成立。だがR3のCommitで型Bカード指定(ONE_PAIR)に違反しP02・P09脱落。P04は合法Commit=0件でAUTO_COMMIT_FAILURE→脱落。
+- R5: P01⇔P03が4契約、P07⇔P08が2契約、P05⇔P06が0契約（提案7回だが署名なし）を締結。**同一ペア間で複数の矛盾するtype_b_card義務が同一ラウンドに重複**し、どのカードを出しても契約違反→全員脱落。
+- R6: P05⇔P06がようやく契約締結(C_c8c69c10)→即座にtype_b_card違反で両者脱落。
+
+### 脱落の根本原因: 矛盾する複数契約の同時締結
+
+エージェントが同一ペア間で何度も契約を提案・署名し、**同一ラウンドに「ONE_PAIRを使え」「HIGH_CARDを使え」「FLUSHを使え」といった矛盾するtype_b_card義務が共存**した。1つのカードしか出せないため合法Commitが0件になり全員脱落。
+
+これはルールエンジンの問題ではなく**エージェントの戦略的誤り**（複数契約の矛盾リスクを理解していない）。
+
+### 観測指標
+
+| 指標 | 結果 |
+|---|---|
+| 契約署名率 | 35% (9/26) — contract_id修正により署名は発生 |
+| 最終市場3倍の言及 | **0件** — 全9エージェントのstrategyメモにR12/3倍/最終市場の言及なし |
+| カードトレード | 0件 |
+| 倍掛け | DOUBLE=9回, 成功=1, 失敗=8（高リスク選好） |
+| 強制返済脱落 | 0件（全て契約違反で脱落） |
+| 非戦略的脱落 | なし（JSON率97%、AUTO COMMIT 0、APIエラー0） |
+| R12到達 | 未到達（全員R6以前に脱落） |
+
+### contract_id修正の実効性
+
+**部分的に有効**: 署名率35%は0%ではないため、受信者がcontract_idを見て署名できていることは確認された。ただしエージェントが矛盾する複数契約を締結する問題が深刻で、契約機能の実用性を阻害している。
+
+### 最終市場3倍（RULES_SUMMARY追記）の実効性
+
+**観測不能**: R12に到達しなかったため、3倍ルールを見据えた温存行動を観測できなかった。全エージェントのstrategyメモにR12/3倍の言及は0件。ルール自体はプロンプトに含まれている（S2設定で確認済み）が、早期脱落によりR12への戦略立案に至らなかった。
+
+### ログ出力先
+
+- イベントログ: `logs/llm/trial_C_20260815_070115/game01_events.jsonl`
+- 座席マップ: `logs/llm/trial_C_20260815_070115/game01_seat_map.json`
+- LLMコールログ: `logs/llm/trial_C_20260815_070115/llm_logs/`
+- レポート: `logs/llm/trial_C_20260815_070115/trial_C_report.md`
+
+---
+
+## 2026-08-15 08:14 JST — 契約義務の可視化（毎プロンプト注入）
+
+### 背景
+
+9人S2トライアル（seed=501）で全9体がR3〜R6に contract_violation で脱落しR7早期終了。原因は経済暗殺（戦略的敗北）ではなく、エージェントが自分の署名済み義務を管理できず、同一ラウンドに矛盾するカード義務（type_b_card）を複数署名して自爆したこと。§7.3が債務で「破産を計算ミスでなく戦略判断にする」ために数字を渡しているのと同じ思想を、契約側にも適用する。
+
+### 修正内容
+
+#### 1. `engine/game.py` — `_build_visible_state()` に `my_obligations` キー追加
+
+ACTIVE（署名済み）契約の未履行・未来ラウンド義務で、自分がobligorのもの。過去ラウンド・履行済み・失効済み・提案中は除外。engine判定ロジック（settlement/autocommit/contracts）には一切影響しない — プロンプトへの情報提示用データのみ。
+
+#### 2. `llm/prompt_builder.py` — `_render_obligations_block()` ヘルパー追加 + 全3エージェント向けプロンプトビルダーに注入
+
+注入先の全エージェント向けプロンプトビルダー列挙と注入状況:
+
+| # | 関数名 | 義務注入 | 理由 |
+|---|---|---|---|
+| 1 | `build_system_prompt` | 不要 | ルール説明のみ、毎回同一 |
+| 2 | `build_loan_prompt` | 不要 | 契約が存在しない |
+| 3 | `build_negotiation_prompt` | **注入済み** | 署名前に義務を確認 |
+| 4 | `build_commit_prompt` | **注入済み** | 最重要（違反確定） |
+| 5 | `build_double_up_prompt` | **注入済み** | type_a支払い判断に有用 |
+
+financeフェーズのプロンプトビルダーは存在しない（finance処理は自動実行、エージェント意思決定不要。repay は negotiation 内アクション）。
+
+#### 3. 描画仕様
+
+- ラウンドでグルーピング、現ラウンドを「⬅ 今ラウンド」で強調
+- 各義務に contract_id / 義務種別 / 詳細 / 相手方を表示
+- **コンフリクト警告を採用**: 同一ラウンドに type_b_card 義務が2件以上 → 「⚠ カード使用義務がN件（1ラウンドに出せるのは1枚 → 必ず違反で脱落）」。情報提示のみ・署名拒否はしない。`_render_obligations_block` 関数内の `if card_obs_count >= 2` ブロックで実装、後で外せる構造。
+- 義務ゼロ → 空リスト返却（トークン節約）
+
+### テスト
+
+7件追加（negotiation/commit/double_up 各ビルダーでの表示確認、空表示、コンフリクト警告、非警告、ラウンドグルーピング）。全290件パス。
+
+### 変更ファイル
+
+- `engine/game.py`: `_build_visible_state()` に `my_obligations` データ追加
+- `llm/prompt_builder.py`: `_render_obligations_block()` ヘルパー追加 + 3ビルダーから呼び出し
+- `tests/test_llm.py`: 契約義務可視化テスト7件追加
+
+---
+
+## 2026-08-15 08:30 JST — type_b_card 判定バグ修正（キー不一致 `card` vs `card_rank`）
+
+### バグ内容
+
+RULES_SUMMARY に type_b_card の details 例がなく、LLMエージェントが `details: {"card": "ONE_PAIR"}` とキー `"card"` で送信していた。一方、判定ロジック `audit_type_b()` (engine/contracts.py) は `ob.details.get("card_rank")` を参照するため、キー不一致で常に `None` が返り、`commit.card.rank.name != None` → 常に `True` → **type_b_card義務を持つと必ず違反判定→脱落**していた。
+
+前回9人S2トライアル（seed=501）でR3〜R6に全9体が contract_violation で脱落した主因。P02はONE_PAIRを正しく出したにもかかわらず違反判定された。
+
+### 修正内容
+
+#### 1. 入口正規化（`engine/contracts.py` `create_contract()`）
+
+type_b_card義務の details で `"card"` → `"card_rank"` / `"rank"` → `"card_rank"` にキー名を正規化。4消費者すべてが `card_rank` を参照するため、入口1箇所の正規化で全て解決:
+- `audit_type_b()` — engine/contracts.py
+- `_satisfies_all_obligations()` — engine/autocommit.py
+- pending契約表示 — llm/prompt_builder.py
+- 義務可視化ブロック — llm/prompt_builder.py `_render_obligations_block()`
+
+#### 2. バリデーション（案A: 不正義務を弾く）
+
+正規化しても `card_rank` が取得できない、または `CardRank` enum に存在しないrank名の場合、`ValueError` で契約提案を弾く。呼び出し元のP2防御層でキャッチされアクション不成立として記録され、ゲームは続行。silent脱落トラップを防ぐ。
+
+#### 3. プロンプト例追加
+
+RULES_SUMMARY の `contract_propose` 例に type_b_card の義務例を追加: `{"card_rank": "FLUSH"}`。正準キー名をLLMに明示。
+
+#### 4. 義務可視化ブロック + pending契約表示のフォールバック
+
+`_render_obligations_block()` とpending契約表示の details 描画で `"card"` キーへのフォールバックを追加（古いログデータとの互換）。
+
+### engine判定ロジアは不変
+
+`audit_type_b()` / `_satisfies_all_obligations()` / settlement / autocommit の比較ロジック自体は変更していない。正規化はデータの入口（契約作成時）のみ。
+
+### テスト
+
+7件追加（正規化3件: card/rank/後方互換、回帰テスト2件: 正しいカード→違反なし/別カード→違反、バリデーション2件: 無効rank/キーなし）。全297件パス。
+
+### 変更ファイル
+
+- `engine/contracts.py`: `create_contract()` に type_b_card details の正規化 + バリデーション追加、CardRank import追加
+- `llm/prompt_builder.py`: RULES_SUMMARY に type_b_card の details 例追加、義務可視化ブロック + pending契約表示に `"card"` キーフォールバック追加
+- `tests/test_llm.py`: type_b_card 正規化・回帰・バリデーションテスト7件追加
+
+---
+
+## 2026-08-15 08:49 JST — EventLogger を逐次追記+flush 方式に変更
+
+### 原因
+
+Webビューワーの「ラウンド状況」パネルで、進行中ゲームの過去ラウンド（例: R3進行中にR2選択）で市場の賞金・資産ランキング・提出カード・手札・公正証書が表示されなかった。原因は `EventLogger` がイベントをメモリ上にのみ保持し、`save_jsonl()` がゲーム完了後に1度だけ呼ばれてディスク書き出しする設計のため、進行中は `events.jsonl` がディスク上に存在しなかった。
+
+### 方針A（逐次追記+flush）を採用
+
+`LLMLogger`（`llm/llm_logger.py`）と同パターンで、`EventLogger` に `output_path` パラメータを追加。指定時は `log()` 呼び出しごとに1行ずつ append + flush する。未指定時は従来通りメモリ保持のみ。
+
+### 変更内容
+
+#### 1. `engine/events.py` EventLogger
+
+- コンストラクタに `output_path: str | Path | None = None` を追加
+- `log()`: ファイルハンドルが開いていれば即時追記+flush（エラー時はゲーム続行）
+- `save_jsonl()`: 逐次書き込み済みで同じパスなら flush のみ（二重書き込み回避）、別パスなら従来通り全書き出し
+- `close()`: ファイルハンドルを閉じるメソッド追加
+
+#### 2. `scripts/llm_trial.py`
+
+Phase A/B の `run_trial_game()` と Phase C の `run_trial_game_c()` の2箇所で、EventLogger 生成時に `output_path` を渡すよう変更。既存の `save_jsonl()` 呼び出しはそのまま残す（同一パスなので flush のみ）。
+
+### シミュレーション経路への影響なし確認
+
+以下のスクリプトは全て `EventLogger()` をパスなしで生成しており、逐次書き込みは有効化されない。余分なファイルI/Oは発生しない:
+- `scripts/simulate.py`, `scripts/simulate_s2_comparison.py`, `scripts/simulate_surge_change.py`, `scripts/simulate_mandatory_repay.py`, `scripts/compare_schedules.py`, `scripts/mirror_match.py`, `scripts/dry_run.py`
+
+テスト（`tests/conftest.py`, `tests/test_mandatory_repay.py`）も同様にパスなし — 影響なし。
+
+### テスト
+
+4件追加（逐次書き込み即時確認、パスなし後方互換、二重書き込み回避、別パスへの全書き出し）。全301件パス。
+
+### 変更ファイル
+
+- `engine/events.py`: EventLogger に output_path パラメータ・逐次追記・close() 追加
+- `scripts/llm_trial.py`: Phase A/B + Phase C の EventLogger 生成を逐次追記モードに変更（2箇所）
+- `tests/test_llm.py`: EventLogger 逐次書き込みテスト4件追加
+
+---
+
+## 2026-08-15 09:20 JST — ビューワー pidLabel を player_id 併記に変更
+
+### 背景
+
+ビューワーの公正証書パネル・メッセージパネル等でプレイヤーをモデル名のみ（例: `Gemini 3.5 Flash`）で表示していたため、同一モデルが3体ずついるロスターで人間がどの個体か判別できなかった。内部データは player_id（P01〜P09）で正しく管理されており（確認済み）、表示のみの問題。
+
+### 修正内容
+
+`viewer/static/index.html` の `pidLabel()` 関数（L608）を1行変更:
+
+```javascript
+// Before:
+return mm.name || pid;
+// After:
+return mm.name ? `${pid}（${mm.name}）` : pid;
+```
+
+これにより `pidLabel()` を使用する全9箇所（公正証書パネル3箇所 + メッセージパネル2箇所 + ラウンド状況パネル4箇所）が `P01（Gemini 3.5 Flash）` 形式で表示される。seat_map が無い場合は player_id のみを返す（フォールバック維持）。
+
+プレイヤーカード（L308-333）は `pidLabel()` を使っていないため影響なし（モデル名と player_id を別行で独自描画）。フッタメッセージ（L338-345）は `m.sender`（player_id）を直接表示しており判別可能なため据え置き。
+
+### エンジン・契約データは不変
+
+表示のみの修正。Contract / Obligation の parties / obligor / counterparty / signed_by は全て player_id で管理されており、変更なし。
+
+### テスト
+
+フロント変更のため Python テストに直接影響なし。全301件パス。
+
+### 変更ファイル
+
+- `viewer/static/index.html`: `pidLabel()` の return 文を1行変更
+
+---
+
+## 2026-08-15 11:39 JST — S2フルトライアル再実行（全修正投入後・seed=501）
+
+### 設定
+
+- 9人全員LLM: Gemini 3.5 Flash(M3)×3 + GPT-4.1 Mini(L2)×3 + DeepSeek V3(M6)×3
+- S2 / 12ラウンド / seed=501（前回 trial_C_20260815_070115 と同一seed）
+- 全修正投入後: contract_id表示 + 最終市場3倍周知 + 義務可視化 + type_b_cardバグ修正
+- ログ: `logs/llm/trial_C_20260815_093117/`
+
+### 前回比較サマリ
+
+| 指標 | 前回（バグあり） | 今回（修正後） |
+|---|---|---|
+| 到達ラウンド | R7（全滅で早期終了） | **R12（完走）** |
+| 生還者 | 0人 | **4人** |
+| 脱落原因 | 全員 type_b_card 違反（バグ由来） | 破産2,型A不履行1,条件未達1,**type_b違反0** |
+| 契約提案/署名 | 26/9 (35%) | 11/10 **(91%)** |
+| 総コール数 | 459 | **1,010** |
+| APIコスト | $0.61 | **$1.30** |
+| 実行時間 | 41分 | **124分** |
+| JSON有効率 | 97% | **99%** |
+
+### 結果詳細
+
+#### 生還者（4人）
+1. P05（Gemini 3.5 Flash）: ¥4,962,588 — **優勝**
+2. P01（Gemini 3.5 Flash）: ¥3,969,426
+3. P07（Gemini 3.5 Flash）: ¥3,493,716
+4. P02（DeepSeek V3）: ¥2,448,775
+
+#### 脱落者（5人）
+- R6 P03（GPT-4.1 Mini）: **破産**（Entry Fee支払不能）
+- R6 P08（GPT-4.1 Mini）: **破産**（Entry Fee支払不能）
+- R7 P06（DeepSeek V3）: **型A金銭契約不履行**（Free Cash不足でAtomic執行失敗）— 正当な脱落
+- R12 P04（DeepSeek V3）: **条件未達**（Cash=¥1,181,580 < ¥2,000,000）
+- R12 P09（GPT-4.1 Mini）: **contract_violation**（R12の型A/B義務。詳細未調査だが type_b_card バグではない）
+
+#### type_b_card 違反: **0件**（前回14件→0件）
+TYPE_B_VIOLATION イベントが1件も発生しなかった。type_b_card キー正規化バグ修正が完全に効いている。
+
+#### 契約: 11提案 / 10署名 = **91%**（前回35%）
+署名率が劇的に改善。contract_id表示修正と義務可視化の効果。
+
+#### カードトレード: 1提案 / 1受諾
+
+#### 倍掛け: 19回選択、成功4回、失敗15回
+積極的に使用されている。成功率は低い（21%）が、ギャンブル的な使い方。
+
+#### 最終市場(R12): **3倍賞金が適用**
+- M01: P07が空き巣で¥1,540,000獲得
+- M02: P05がROYAL_FLUSHで¥3,480,000獲得（3人参加・市場高騰で2倍）
+- M03: P01が空き巣で¥1,540,000獲得
+- R12の思考に「ROYAL_FLUSH」「棲み分け」「最強カード」への言及が多数。3倍賞金の周知が効いている。
+
+#### 非戦略的脱落: **0件**
+無効JSON・APIエラー・タイムアウト由来の脱落なし。AUTO COMMITも0件。
+
+### 変更ファイル
+
+なし（実行のみ）
+
+---
+
+## 2026-08-15 15:12 JST — S2フルトライアル seed=502（再現性検証 1/3）
+
+### 設定
+
+- 9人全員LLM: Gemini 3.5 Flash(M3)×3 + GPT-4.1 Mini(L2)×3 + DeepSeek V3(M6)×3
+- S2 / 12ラウンド / seed=502 / 1試合
+- 全修正投入後（contract_id表示・最終市場3倍周知・義務可視化・type_b_card正規化・EventLogger逐次書き込み・pidLabel併記）
+- 出力: logs/llm/trial_C_20260815_132716/
+
+### 結果
+
+- **到達ラウンド: R12（完走）** → 2試合連続R12完走
+- **実行時間: 5640秒（約94分）** / コスト: $1.25 / 1008コール / JSON率98%
+
+#### 最終結果
+
+| 座席 | モデル | 借入額 | 最終Cash | 結果 |
+|---|---|---|---|---|
+| P05 | Gemini 3.5 Flash | 200万 | 5,711,148円 | **生還・1位** |
+| P06 | DeepSeek V3 | 1000万 | 4,649,302円 | **生還・2位** |
+| P04 | DeepSeek V3 | 700万 | 4,218,511円 | **生還・3位** |
+| P02 | Gemini 3.5 Flash | 120万 | 0円 | 脱落R12 contract_violation |
+| P07 | Gemini 3.5 Flash | 300万 | 0円 | 脱落R12 contract_violation |
+| P01 | GPT-4.1 Mini | 120万 | 0円 | 脱落R7 contract_violation |
+| P09 | DeepSeek V3 | 1000万 | 0円 | 脱落R12 condition_not_met |
+| P03 | GPT-4.1 Mini | 120万 | 0円 | 脱落R6 bankruptcy |
+| P08 | GPT-4.1 Mini | 120万 | 0円 | 脱落R6 bankruptcy |
+
+生還者3人。1位Gemini、2-3位DeepSeek。GPT-4.1 Miniは全滅（2体R6破産、1体R7契約違反）。
+
+#### 契約
+
+- propose: 11 / sign: 9 / 署名率: 82%（seed=501は11/9=82%と同水準）
+- 契約内容は全て type_b_no_market + type_a_payment の組み合わせ。type_b_card / type_b_market の使用はなし。
+
+#### カードトレード / 倍掛け
+
+- カードトレード: 1件成立（R5 P07→P02: ONE_PAIR⇄TWO_PAIR）
+- 倍掛け: 17選択（成功10 / 没収7）。P06が特に積極的（4回選択3成功）で2位に貢献。
+
+#### 脱落原因内訳
+
+- bankruptcy: 2（P03, P08 — R6）
+- contract_violation: 3（P01 R7, P02 R12, P07 R12）
+- condition_not_met: 1（P09 R12）
+
+#### 最終市場(R12) — 3倍ルールの認知
+
+R12の基本賞金は1,440,000×3=4,320,000。P05(Gemini)のR12 strategy に「STRAIGHT_FLUSHを使用すれば確実に勝利」「最終資産を最大化」等の記述あり。P02(Gemini)は「M02の予定参加者であるP04とP06は手札がHIGH_CARDのみで確定しており、私のTWO_PAIRであれば確実に勝利」と裏切りを計画。3倍ルール自体への直接言及は見られないが、高額賞金を意識した戦略的行動は確認できた。
+
+### バグチェック
+
+#### ⚠ P02/P07のR12 AUTO_COMMIT_FAILURE（要調査）
+
+P02（残り手札: TWO_PAIR_1）とP07（残り手札: HIGH_CARD_2）がR12でAUTO_COMMIT_FAILUREにより contract_violation で脱落。しかし:
+- R12にACTIVEなtype_b義務は存在しない（全義務はR11以前）
+- 手札は各1枚残っているはず（12枚デッキ - 11枚R1-R11使用 = 1枚）
+- しかし `cards_destroyed: 0` は脱落時に手札が0枚だったことを示唆
+
+→ compute_legal_commits() が空を返す原因不明。手札の追跡に問題がある可能性（カードトレード後の hand 更新バグ?）。**別タスクで詳細調査が必要。**
+
+#### その他
+
+- TYPE_B_VIOLATION: 0件（type_b_card キーバグ再発なし ✅）
+- APIエラー / タイムアウト: 0件 ✅
+- ACTION_ERROR: 0件 ✅
+- AUTO_COMMIT: 1件（P01 R7 — 不正コミット→自動代行、正常フォールバック）
+- 契約バリデーション拒否: 0件 ✅
+
+### seed=501との比較（2試合）
+
+| 項目 | seed=501 | seed=502 |
+|---|---|---|
+| 到達ラウンド | R12 | R12 |
+| 生還者 | 4人 | 3人 |
+| 1位モデル | Gemini | Gemini |
+| GPT-4.1 Mini | 全滅 | 全滅 |
+| DeepSeek V3 | 1体生還 | 2体生還 |
+| 契約署名率 | 82% | 82% |
+| コスト | $1.30 | $1.25 |
+
+Gemini 1位は安定。GPT-4.1 Mini全滅も安定（低借入+破産パターン）。DeepSeek V3は高借入で生還する傾向。n=2では断定困難だが、序列は一貫している。

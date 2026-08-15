@@ -234,7 +234,7 @@ function computeStateSig(state) {
     const s = p.strategy_summary || {};
     parts.push(p.player_id, p.status, p.model_name || p.model_id,
       s.target_market, s.current_goal, s.card_plan,
-      p.emotion, p.cash, p.last_message, p.latest_round,
+      p.emotion, p.cash, p.debt, p.last_message, p.latest_round,
       p.stats.valid_json, p.stats.calls, p.stats.dm_count, p.stats.broadcast_count,
       p.stats.errors, p.stats.cost, isThinking);
   });
@@ -293,9 +293,16 @@ function renderState(state) {
     const vendor = guessVendor(p.model_name || p.model_id || '');
     const emotionHtml = emotionDisplay(p.emotion || '平静', vendor);
 
-    // モデル名・所持金・最終発言
+    // モデル名・純資産・内訳・最終発言
     const mm = splitModelName(p.model_name || p.model_id || '');
-    const cashStr = (p.cash != null) ? '¥' + p.cash.toLocaleString() : '—';
+    const debt = (p.debt != null) ? p.debt : 0;
+    const netAsset = (p.cash != null) ? p.cash - debt : null;
+    const netAssetStr = (netAsset != null) ? '¥' + netAsset.toLocaleString() : '—';
+    // 内訳: 借入>0のときのみ表示（借入0は純資産=現金なので冗長）
+    let financeDetail = '';
+    if (p.cash != null && debt > 0) {
+      financeDetail = `現金 ${p.cash.toLocaleString()} ／ 借入 <span class="debt-val">${debt.toLocaleString()}</span>`;
+    }
     const lastMsg = p.last_message ? escapeHtml(p.last_message) : '—';
 
     panel.innerHTML = `
@@ -308,17 +315,20 @@ function renderState(state) {
             <span class="seat">${escapeHtml(mm.seat)}</span>
             <span class="badge ${badgeClass}">${badgeText}</span>
           </div>
-          <div class="cash-large">${cashStr}</div>
+          <div class="net-asset">${netAssetStr}</div>
+          ${financeDetail ? `<div class="finance-detail">${financeDetail}</div>` : ''}
         </div>
       </div>
       <div class="strategy">${strategyText || '—'}</div>
       <div class="last-utterance" title="最終発言">💬 ${lastMsg}</div>
       <div class="stats-row">
-        <span>R${p.latest_round}</span>
-        <span>JSON:${p.stats.valid_json}/${p.stats.calls}</span>
-        <span>DM:${p.stats.dm_count} BC:${p.stats.broadcast_count}</span>
-        <span>ERR:${p.stats.errors}</span>
-        <span>$${p.stats.cost.toFixed(4)}</span>
+        <span class="stats-left">
+          <span>R${p.latest_round}</span>
+          <span>JSON:${p.stats.valid_json}/${p.stats.calls}</span>
+          <span>DM:${p.stats.dm_count} BC:${p.stats.broadcast_count}</span>
+          <span>ERR:${p.stats.errors}</span>
+        </span>
+        <span class="stats-cost">$${p.stats.cost.toFixed(4)}</span>
       </div>
     `;
     panel.addEventListener('click', () => openTimeline(p.player_id, p.model_name));
@@ -595,7 +605,7 @@ function pidLabel(pid) {
   const label = (situationData && situationData.seat_map) ? situationData.seat_map[pid] : null;
   if (!label) return pid;
   const mm = splitModelName(label);
-  return mm.name || pid;
+  return mm.name ? `${pid}（${mm.name}）` : pid;
 }
 function yen(v) { return (v != null) ? '¥' + Number(v).toLocaleString() : '—'; }
 

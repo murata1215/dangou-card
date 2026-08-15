@@ -473,6 +473,341 @@ class TestStep31Fixes:
         # R12 Financeの説明が含まれること
         assert "返済可能額" in prompt or "全額充当" in prompt
 
+    def test_rules_summary_contains_final_market_s2(self):
+        """S2設定でRULES_SUMMARYに最終市場ルールが含まれること"""
+        from llm.prompt_builder import build_system_prompt
+        config = GameConfig.baseline_v1_s2()
+        prompt = build_system_prompt("P01", config)
+        assert "最終市場" in prompt
+        assert "3倍" in prompt
+
+    def test_rules_summary_no_final_market_s1(self):
+        """S1設定（multiplier=1）ではRULES_SUMMARYに最終市場が含まれないこと"""
+        from llm.prompt_builder import build_system_prompt
+        config = GameConfig.baseline_v1()
+        prompt = build_system_prompt("P01", config)
+        assert "最終市場" not in prompt
+
+    def test_obligations_block_in_negotiation_prompt(self):
+        """署名済み義務がnegotiationプロンプトに含まれること"""
+        from llm.prompt_builder import build_negotiation_prompt
+        from engine.models import PlayerState, Card, CardRank
+        config = GameConfig.baseline_v1()
+        player = PlayerState(
+            player_id="P01", cash=3_000_000, debt_balance=1_200_000,
+            initial_loan=1_200_000,
+            hand=[Card(card_id="c1", rank=CardRank.HIGH_CARD)],
+        )
+        state = {
+            "markets": [{"market_id": "M01", "prize_pool": 500_000}],
+            "alive_players": ["P01", "P02"],
+            "messages": [],
+            "contracts_pending": [],
+            "trades_pending": [],
+            "my_obligations": [
+                {"contract_id": "C_abc", "obligor": "P01", "counterparty": "P02",
+                 "ob_type": "type_b_market", "round_num": 5,
+                 "details": {"market_id": "M02"}},
+            ],
+        }
+        prompt = build_negotiation_prompt(player, 5, 1, state, config)
+        assert "契約義務" in prompt
+        assert "C_abc" in prompt
+        assert "型B市場指定" in prompt
+        assert "M02" in prompt
+        assert "⬅ 今ラウンド" in prompt
+
+    def test_obligations_block_in_commit_prompt(self):
+        """署名済み義務がcommitプロンプトに含まれること"""
+        from llm.prompt_builder import build_commit_prompt
+        from engine.models import PlayerState, Card, CardRank, Market
+        config = GameConfig.baseline_v1()
+        player = PlayerState(
+            player_id="P01", cash=3_000_000, debt_balance=1_200_000,
+            initial_loan=1_200_000,
+            hand=[Card(card_id="c1", rank=CardRank.HIGH_CARD)],
+        )
+        markets = [Market(market_id="M01", base_prize=500_000, carryover=0)]
+        state = {
+            "used_cards": {},
+            "my_obligations": [
+                {"contract_id": "C_xyz", "obligor": "P01", "counterparty": "P03",
+                 "ob_type": "type_b_card", "round_num": 3,
+                 "details": {"card_rank": "FLUSH"}},
+            ],
+        }
+        prompt = build_commit_prompt(player, markets, 3, state, config)
+        assert "契約義務" in prompt
+        assert "C_xyz" in prompt
+        assert "型Bカード指定" in prompt
+        assert "FLUSH" in prompt
+
+    def test_obligations_block_in_double_up_prompt(self):
+        """署名済み義務がdouble_upプロンプトに含まれること"""
+        from llm.prompt_builder import build_double_up_prompt
+        from engine.models import PlayerState, Card, CardRank
+        config = GameConfig.baseline_v1_s2()
+        player = PlayerState(
+            player_id="P01", cash=3_000_000, debt_balance=1_200_000,
+            initial_loan=1_200_000,
+            hand=[Card(card_id="c1", rank=CardRank.HIGH_CARD)],
+        )
+        state = {
+            "alive_players": ["P01", "P02"],
+            "double_ups": [],
+            "my_obligations": [
+                {"contract_id": "C_du", "obligor": "P01", "counterparty": "P02",
+                 "ob_type": "type_a_payment", "round_num": 7,
+                 "details": {"amount": 500_000}},
+            ],
+        }
+        prompt = build_double_up_prompt(player, 300_000, 5, state, config)
+        assert "契約義務" in prompt
+        assert "型A金銭支払い" in prompt
+        assert "50万円" in prompt
+
+    def test_obligations_block_empty_when_none(self):
+        """義務ゼロのときは契約義務セクションが出ないこと"""
+        from llm.prompt_builder import build_negotiation_prompt
+        from engine.models import PlayerState, Card, CardRank
+        config = GameConfig.baseline_v1()
+        player = PlayerState(
+            player_id="P01", cash=3_000_000, debt_balance=1_200_000,
+            initial_loan=1_200_000,
+            hand=[Card(card_id="c1", rank=CardRank.HIGH_CARD)],
+        )
+        state = {
+            "markets": [{"market_id": "M01", "prize_pool": 500_000}],
+            "alive_players": ["P01"],
+            "messages": [],
+            "contracts_pending": [],
+            "trades_pending": [],
+            "my_obligations": [],
+        }
+        prompt = build_negotiation_prompt(player, 1, 1, state, config)
+        assert "契約義務" not in prompt
+
+    def test_obligations_conflict_warning(self):
+        """同一ラウンドにtype_b_card義務2件でコンフリクト警告が出ること"""
+        from llm.prompt_builder import _render_obligations_block
+        visible = {"my_obligations": [
+            {"contract_id": "C_a", "obligor": "P01", "counterparty": "P02",
+             "ob_type": "type_b_card", "round_num": 5,
+             "details": {"card_rank": "ONE_PAIR"}},
+            {"contract_id": "C_b", "obligor": "P01", "counterparty": "P03",
+             "ob_type": "type_b_card", "round_num": 5,
+             "details": {"card_rank": "FLUSH"}},
+        ]}
+        lines = _render_obligations_block("P01", visible, 5)
+        text = "\n".join(lines)
+        assert "⚠" in text
+        assert "2件" in text
+        assert "1枚" in text
+
+    def test_obligations_no_conflict_for_single_card(self):
+        """同一ラウンドにtype_b_card義務1件ならコンフリクト警告が出ないこと"""
+        from llm.prompt_builder import _render_obligations_block
+        visible = {"my_obligations": [
+            {"contract_id": "C_a", "obligor": "P01", "counterparty": "P02",
+             "ob_type": "type_b_card", "round_num": 5,
+             "details": {"card_rank": "ONE_PAIR"}},
+        ]}
+        lines = _render_obligations_block("P01", visible, 5)
+        text = "\n".join(lines)
+        assert "⚠" not in text
+
+    def test_obligations_round_grouping(self):
+        """義務がラウンドでグルーピングされること"""
+        from llm.prompt_builder import _render_obligations_block
+        visible = {"my_obligations": [
+            {"contract_id": "C_a", "obligor": "P01", "counterparty": "P02",
+             "ob_type": "type_b_market", "round_num": 5,
+             "details": {"market_id": "M01"}},
+            {"contract_id": "C_b", "obligor": "P01", "counterparty": "P03",
+             "ob_type": "type_a_payment", "round_num": 8,
+             "details": {"amount": 300_000}},
+        ]}
+        lines = _render_obligations_block("P01", visible, 5)
+        text = "\n".join(lines)
+        # R5が先、R8が後に出ること
+        r5_pos = text.index("R5")
+        r8_pos = text.index("R8")
+        assert r5_pos < r8_pos
+        # R5は「今ラウンド」強調、R8はなし
+        assert "R5** ⬅ 今ラウンド" in text
+        assert "R8**:" in text
+        assert "R8** ⬅" not in text
+
+    def test_type_b_card_key_normalization_card(self):
+        """type_b_card義務のdetailsキー 'card' が 'card_rank' に正規化されること"""
+        from engine.contracts import create_contract
+        terms = [
+            {"obligor": "P01", "counterparty": "P02", "ob_type": "type_b_card",
+             "round_num": 5, "details": {"card": "ONE_PAIR"}},
+        ]
+        contract = create_contract("P01", ["P01", "P02"], terms, 5)
+        ob = contract.obligations[0]
+        # 正規化後: "card_rank" キーに統一
+        assert ob.details.get("card_rank") == "ONE_PAIR"
+        # 元の "card" キーは除去
+        assert "card" not in ob.details
+
+    def test_type_b_card_key_normalization_rank(self):
+        """type_b_card義務のdetailsキー 'rank' が 'card_rank' に正規化されること"""
+        from engine.contracts import create_contract
+        terms = [
+            {"obligor": "P01", "counterparty": "P02", "ob_type": "type_b_card",
+             "round_num": 5, "details": {"rank": "FLUSH"}},
+        ]
+        contract = create_contract("P01", ["P01", "P02"], terms, 5)
+        ob = contract.obligations[0]
+        assert ob.details.get("card_rank") == "FLUSH"
+        assert "rank" not in ob.details
+
+    def test_type_b_card_key_backward_compat(self):
+        """type_b_card義務のdetailsキーが既に 'card_rank' なら変更なし"""
+        from engine.contracts import create_contract
+        terms = [
+            {"obligor": "P01", "counterparty": "P02", "ob_type": "type_b_card",
+             "round_num": 5, "details": {"card_rank": "ONE_PAIR"}},
+        ]
+        contract = create_contract("P01", ["P01", "P02"], terms, 5)
+        ob = contract.obligations[0]
+        assert ob.details.get("card_rank") == "ONE_PAIR"
+
+    def test_type_b_card_regression_audit_no_violation(self):
+        """回帰テスト: 'card'キーで作ったtype_b_card義務 → 正しいカードを出せば違反にならない"""
+        from engine.contracts import create_contract, audit_type_b, get_active_type_b_obligations
+        from engine.models import MarketCommit, Card, CardRank, ContractStatus
+        # "card" キーで契約作成（LLMが送信する形式）
+        terms = [
+            {"obligor": "P02", "counterparty": "P09", "ob_type": "type_b_card",
+             "round_num": 3, "details": {"card": "ONE_PAIR"}},
+        ]
+        contract = create_contract("P09", ["P09", "P02"], terms, 3)
+        # 契約を ACTIVE にする
+        contract = contract.model_copy(update={"status": ContractStatus.ACTIVE,
+                                                "signed_by": ["P09", "P02"]})
+        # P02が ONE_PAIR をコミット
+        commit = MarketCommit(
+            player_id="P02", market_id="M03",
+            card=Card(card_id="ONE_PAIR_1", rank=CardRank.ONE_PAIR),
+        )
+        # 監査: 違反なし
+        type_b_obs = get_active_type_b_obligations([contract], 3)
+        violations = audit_type_b(type_b_obs, [commit])
+        assert len(violations) == 0, f"Expected no violations, got {violations}"
+
+    def test_type_b_card_regression_audit_violation(self):
+        """回帰テスト: 'card'キーで作ったtype_b_card義務 → 別カードを出せば違反になる"""
+        from engine.contracts import create_contract, audit_type_b, get_active_type_b_obligations
+        from engine.models import MarketCommit, Card, CardRank, ContractStatus
+        terms = [
+            {"obligor": "P02", "counterparty": "P09", "ob_type": "type_b_card",
+             "round_num": 3, "details": {"card": "ONE_PAIR"}},
+        ]
+        contract = create_contract("P09", ["P09", "P02"], terms, 3)
+        contract = contract.model_copy(update={"status": ContractStatus.ACTIVE,
+                                                "signed_by": ["P09", "P02"]})
+        # P02が FLUSH をコミット（義務違反）
+        commit = MarketCommit(
+            player_id="P02", market_id="M03",
+            card=Card(card_id="FLUSH_1", rank=CardRank.FLUSH),
+        )
+        type_b_obs = get_active_type_b_obligations([contract], 3)
+        violations = audit_type_b(type_b_obs, [commit])
+        assert len(violations) == 1
+
+    def test_type_b_card_invalid_rank_rejected(self):
+        """無効なrank名のtype_b_card義務を含む契約提案がValueErrorで弾かれること"""
+        from engine.contracts import create_contract
+        terms = [
+            {"obligor": "P01", "counterparty": "P02", "ob_type": "type_b_card",
+             "round_num": 5, "details": {"card_rank": "INVALID_RANK"}},
+        ]
+        import pytest
+        with pytest.raises(ValueError, match="Invalid type_b_card"):
+            create_contract("P01", ["P01", "P02"], terms, 5)
+
+    def test_type_b_card_no_key_rejected(self):
+        """card_rankキーが全くないtype_b_card義務がValueErrorで弾かれること"""
+        from engine.contracts import create_contract
+        terms = [
+            {"obligor": "P01", "counterparty": "P02", "ob_type": "type_b_card",
+             "round_num": 5, "details": {}},
+        ]
+        import pytest
+        with pytest.raises(ValueError, match="Invalid type_b_card"):
+            create_contract("P01", ["P01", "P02"], terms, 5)
+
+    def test_event_logger_streaming_writes_immediately(self, tmp_path):
+        """逐次追記モード: log()呼び出し後にファイルにイベントが即時書き込まれること"""
+        from engine.events import EventLogger
+        out = tmp_path / "events.jsonl"
+        logger = EventLogger(output_path=out)
+        logger.log("TEST_EVENT", 1, "test", data={"key": "value"})
+        # ファイルが即時に存在し、1行書き込まれている
+        assert out.exists()
+        lines = out.read_text().strip().split("\n")
+        assert len(lines) == 1
+        import json
+        event = json.loads(lines[0])
+        assert event["event_type"] == "TEST_EVENT"
+        assert event["data"]["key"] == "value"
+        # 2つ目のイベント
+        logger.log("TEST_EVENT_2", 2, "test")
+        lines = out.read_text().strip().split("\n")
+        assert len(lines) == 2
+        logger.close()
+
+    def test_event_logger_no_file_without_path(self, tmp_path):
+        """後方互換: output_pathなしではファイルが生成されないこと"""
+        from engine.events import EventLogger
+        import os
+        before = set(os.listdir(tmp_path))
+        logger = EventLogger()
+        logger.log("TEST", 1, "test")
+        after = set(os.listdir(tmp_path))
+        # tmp_path に新規ファイルが生成されていない
+        assert before == after
+        # メモリには保持
+        assert len(logger.events) == 1
+        # save_jsonl で従来通り一括書き出しできる
+        out = tmp_path / "manual.jsonl"
+        logger.save_jsonl(out)
+        assert out.exists()
+        lines = out.read_text().strip().split("\n")
+        assert len(lines) == 1
+
+    def test_event_logger_no_duplicate_on_save(self, tmp_path):
+        """二重書き込み回避: 逐次書き込み済みパスにsave_jsonl()しても重複しないこと"""
+        from engine.events import EventLogger
+        out = tmp_path / "events.jsonl"
+        logger = EventLogger(output_path=out)
+        logger.log("E1", 1, "test")
+        logger.log("E2", 2, "test")
+        # 逐次書き込みで2行
+        assert len(out.read_text().strip().split("\n")) == 2
+        # save_jsonl を同一パスで呼んでも増えない
+        logger.save_jsonl(out)
+        assert len(out.read_text().strip().split("\n")) == 2
+        logger.close()
+
+    def test_event_logger_save_to_different_path(self, tmp_path):
+        """逐次書き込み中でも別パスへのsave_jsonlは従来通り全書き出しすること"""
+        from engine.events import EventLogger
+        out1 = tmp_path / "streaming.jsonl"
+        out2 = tmp_path / "manual.jsonl"
+        logger = EventLogger(output_path=out1)
+        logger.log("E1", 1, "test")
+        logger.log("E2", 2, "test")
+        # 別パスに全書き出し
+        logger.save_jsonl(out2)
+        assert out2.exists()
+        lines = out2.read_text().strip().split("\n")
+        assert len(lines) == 2
+        logger.close()
+
     def test_highlight_detection_h9(self):
         """修正6: H9同ランク山分けが検出されること"""
         from scripts.highlights import detect_highlights

@@ -1,5 +1,23 @@
 # Changelog
 
+## 2026-08-15: type_b_cardキー不一致バグ修正・契約義務可視化・最終市場周知・EventLogger逐次追記化・pidLabel併記・ビューアdebt表示修正
+
+### 概要
+S2フルトライアル（9人全員LLM、seed=501）でR7に全員がcontract_violationで脱落する事象が発生。原因調査の結果、型B契約（type_b_card）のdetailsキー不一致という重大バグを特定・修正。あわせて再発防止と情報周知の3施策（契約義務可視化・最終市場3倍ルール周知・ビューア係員判別）を実施し、同一seedで再実行してR12完走・生還者4人まで改善したことを確認。
+
+### 変更
+- **type_b_cardキー不一致バグ修正（最重要）**: LLMが契約提案で `details: {"card": "ONE_PAIR"}` と送信していたが、判定ロジック `audit_type_b()` は `details.get("card_rank")` を参照するため常に `None` が返り、type_b_card義務を持つプレイヤーは正しくカードを提出しても必ず契約違反判定される致命的バグだった（R7全滅の主因）。`engine/contracts.py` の `create_contract()` で入口正規化（`"card"`/`"rank"` → `"card_rank"`）+ 無効なrank名は `ValueError` で契約提案自体を拒否するよう修正。判定ロジック・自動代行Commit・ビューワー表示・契約義務可視化ブロックの4消費者全てが `card_rank` を参照するため入口1箇所の正規化で全解決。`llm/prompt_builder.py` のRULES_SUMMARYにtype_b_card契約提案の正しいJSON例（`{"card_rank": "FLUSH"}`）を追加（テスト: `tests/test_llm.py` 7件追加）
+- **契約義務の可視化（毎プロンプト注入）**: 署名済み・未履行の契約義務一覧を `engine/game.py` の `_build_visible_state()` に `my_obligations` として追加し、`llm/prompt_builder.py` の `_render_obligations_block()` ヘルパーで negotiation/commit/double_up の3プロンプト全てに注入。ラウンドでグルーピングし現ラウンドを強調（⬅ 今ラウンド）、同一ラウンドにtype_b_card義務が2件以上ある場合はコンフリクト警告を表示（テスト7件追加）
+- **最終市場3倍ルールの周知漏れ修正**: RULES_SUMMARYに最終ラウンド市場3倍ルールの記載が漏れており、エージェントが事前に知れない状態だった。`{final_market_rule}` プレースホルダを追加し `final_market_multiplier > 1` のときのみ条件付き表示するよう修正（テスト2件追加）
+- **EventLoggerの逐次追記化**: `engine/events.py` に `output_path` パラメータを追加し、`LLMLogger` と同パターンで `log()` 呼び出しごとに即時追記+flushするよう変更。従来はゲーム終了時の一括書き出しのみで、進行中ゲームをビューワーで観戦できない問題があった。`scripts/llm_trial.py` の `run_trial_game()`/`run_trial_game_c()` で `EventLogger(output_path=event_path)` を指定するよう変更（テスト4件追加）
+- **ビューワーの公正証書当事者player_id併記**: 同一モデルを複数体投入した場合にモデル名だけでは個体判別できない問題を調査（エンジン内部はplayer_idで正しく管理されておりバグなし）。`viewer/static/index.html` の `pidLabel()` 関数を1行修正し、`P01（Gemini 3.5 Flash）` のようにplayer_id併記表示に変更
+- **ビューワーの借入額・純資産(debt)表示修正**: `viewer/log_parser.py` の `get_game_state()`/`get_round_states()` に `debt`/`initial_loan` フィールドを追加。SNAPSHOTイベントの `cash - free_cash` 近似値を、INTERESTイベントの `old_debt`（SNAPSHOT時点の正確な借金残高）で補正する2段階ロジックを実装（`tests/test_viewer.py` のアサーションを近似式ベースから型・非負検証に更新）
+
+### 検証
+- S2フルトライアル（9人全員LLM、seed=501、全修正投入後）: R7全滅 → **R12完走・生還者4人**（Gemini 3.5 Flash上位独占、コスト$1.30、1010コール、JSON率99%）
+- 再現性検証（seed=502、1本目）: **R12完走・生還者3人**（1位Gemini 3.5 Flash、コスト$1.25、1008コール、JSON率98%）。TYPE_B_VIOLATION 0件・APIエラー0件・契約バリデーション拒否0件を確認し、type_b_cardバグの再発なしを確認
+- 全テストパス（既存 + 今回追加分約20件）
+
 ## 2026-08-14: 高騰境界値変更・S2設定統一・LLM対応拡充（カードトレード/倍掛け）・ソロ市場除外バグ修正
 
 ### 概要

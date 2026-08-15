@@ -10,6 +10,7 @@
   --text-strong: #e6e6f5;   --text-soft: #b0b0d0;    --sub: #8888aa;
   --cash: #ffd479;          --pid-alt: #ff6b6b;      --action-type: #4fc3f7;
   --phase-text: #d0d0f0;    --overlay: rgba(0,0,0,0.7);
+  --text-danger: #ef5350;
 }
 
 /* ライトテーマ上書き（html付きで詳細度を上げ、後方の :root 再定義に勝たせる） */
@@ -21,6 +22,7 @@ html[data-theme="light"] {
   --text-strong: #1c1e28;  --text-soft: #4a4d5e;     --sub: #6b6f82;
   --cash: #a9791f;         --pid-alt: #d5285f;       --action-type: #0277bd;
   --phase-text: #ffffff;   --overlay: rgba(0,0,0,0.45);
+  --text-danger: #c62828;
   /* 実況席もライト化 */
   --commentary-bg: #e7eaf2;             --commentary-border: #c8cde0;
   --commentary-bubble-zundamon: #d9f2d9; --commentary-bubble-metan: #f0ddf5;
@@ -105,10 +107,12 @@ body {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .panel .stats-row {
-  font-size: 11px; color: var(--text-muted); margin-top: 6px;
-  display: flex; gap: 10px; flex-wrap: wrap;
+  font-size: 10px; color: var(--text-muted); margin-top: 6px;
+  display: flex; justify-content: space-between; align-items: center;
 }
-.panel .stats-row span { white-space: nowrap; }
+.panel .stats-row .stats-left { display: flex; gap: 8px; flex-wrap: wrap; }
+.panel .stats-row .stats-left span { white-space: nowrap; }
+.panel .stats-row .stats-cost { white-space: nowrap; }
 
 /* フッタ（最新メッセージ） */
 .footer {
@@ -301,16 +305,18 @@ body {
 .emotion-badge { font-size: 1.1em; margin-right: 2px; }
 .emotion-badge .emotion-img { width: 20px; height: 20px; vertical-align: middle; }
 
-/* パネル改善: 大きい感情画像・モデル名・所持金・最終発言 */
-.panel-top { display: flex; gap: 10px; align-items: center; margin-bottom: 6px; }
-.emotion-big { flex: 0 0 auto; font-size: 3em; line-height: 1; }
-.emotion-big .emotion-img { width: 56px; height: 56px; vertical-align: middle; }
-.panel-id { min-width: 0; }
-.model-large { font-size: 1.25em; font-weight: bold; color: var(--text-strong); line-height: 1.2; }
+/* パネル改善: 大きい感情画像・モデル名・純資産・内訳・最終発言 */
+.panel-top { display: flex; gap: 10px; align-items: flex-start; margin-bottom: 6px; }
+.emotion-big { flex: 0 0 88px; line-height: 1; }
+.emotion-big .emotion-img { width: 88px; height: 88px; border-radius: 10px; vertical-align: middle; }
+.panel-id { min-width: 0; flex: 1; }
+.model-large { font-size: 1.1em; font-weight: bold; color: var(--text-strong); line-height: 1.2; }
 .panel-sub { font-size: 0.78em; color: var(--sub); margin: 1px 0; }
 .panel-sub .pid { color: var(--pid-alt); font-weight: bold; margin-right: 4px; }
 .panel-sub .seat { margin-right: 6px; }
-.cash-large { font-size: 1.3em; font-weight: bold; color: var(--cash); margin-top: 2px; }
+.net-asset { font-size: 19px; font-weight: 500; color: var(--cash); margin-top: 4px; letter-spacing: -0.02em; }
+.finance-detail { font-size: 11px; color: var(--text-secondary); margin-top: 1px; }
+.finance-detail .debt-val { color: var(--text-danger); }
 .last-utterance {
   font-size: 0.85em; color: var(--text-soft); margin: 4px 0; font-style: italic;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;

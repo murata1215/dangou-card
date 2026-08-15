@@ -75,7 +75,9 @@ def run_trial_game(
         pid = f"P{i + 1:02d}"
         agents[pid] = RandomBot(seed=game_seed * 100 + i)
 
-    event_logger = EventLogger()
+    # 逐次追記モード: 進行中でもビューワーがラウンド状況を表示できるようにする
+    event_path = output_dir / f"game{game_index + 1:02d}_events.jsonl"
+    event_logger = EventLogger(output_path=event_path)
     game = Game(config=config, agents=agents, seed=game_seed, logger=event_logger)
     result = game.run()
 
@@ -83,8 +85,8 @@ def run_trial_game(
     for agent in llm_agents:
         agent.llm_logger.save()
 
-    # イベントログ保存
-    event_logger.save_jsonl(output_dir / f"game{game_index + 1:02d}_events.jsonl")
+    # イベントログ保存（逐次書き込み済みなので flush のみ）
+    event_logger.save_jsonl(event_path)
 
     return result, llm_agents, event_logger
 
@@ -279,7 +281,9 @@ def run_trial_game_c(
         llm_agents.append(agent)
         seat_map[pid] = f"{model_key}:{model_info.name}"
 
-    event_logger = EventLogger()
+    # 逐次追記モード: 進行中でもビューワーがラウンド状況を表示できるようにする
+    event_path = output_dir / f"game{game_index + 1:02d}_events.jsonl"
+    event_logger = EventLogger(output_path=event_path)
     game = Game(config=config, agents=agents, seed=game_seed, logger=event_logger)
 
     # コスト上限付き実行: ラウンドごとにチェック
@@ -292,8 +296,8 @@ def run_trial_game_c(
     if total_cost > COST_LIMIT_TOTAL:
         print(f"  ⚠ 全体コスト上限${COST_LIMIT_TOTAL}超過: ${total_cost:.4f}")
 
-    # イベントログ保存
-    event_logger.save_jsonl(output_dir / f"game{game_index + 1:02d}_events.jsonl")
+    # イベントログ保存（逐次書き込み済みなので flush のみ）
+    event_logger.save_jsonl(event_path)
 
     # 座席⇔モデル対応表をファイルに保存
     seat_map_path = output_dir / f"game{game_index + 1:02d}_seat_map.json"

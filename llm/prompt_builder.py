@@ -10,6 +10,93 @@ from typing import Any
 from engine.models import PlayerState, Market, CardRank
 from engine.config import GameConfig
 
+# --- 契約義務の可視化ヘルパー ---
+# §7.3の「破産を計算ミスでなく戦略判断にする」思想を契約側にも適用。
+# 署名済み未履行義務を毎プロンプトで提示し、帳簿ミス起因の自爆を防ぐ。
+# engine判定ロジック（settlement/autocommit/contracts）には一切影響しない。
+
+
+def _render_obligations_block(
+    player_id: str,
+    visible_state: dict[str, Any],
+    round_num: int,
+) -> list[str]:
+    """
+    署名済み未履行の契約義務一覧を描画する（毎プロンプト注入）
+
+    全エージェント向けプロンプトビルダー（negotiation / commit / double_up）
+    から呼ばれ、帳簿ミス起因の契約違反脱落を防止する情報を提示する。
+
+    - ラウンドでグルーピング、現ラウンドを「⬅ 今ラウンド」で強調
+    - 同一ラウンドに type_b_card 義務が2件以上あればコンフリクト警告
+      （1ラウンド1枚制約との矛盾を計算済みで通知）
+    - 義務ゼロなら空リスト（トークン節約）
+
+    Args:
+        player_id: 対象プレイヤーID（ログ用、現時点では未使用）
+        visible_state: _build_visible_state() の出力（my_obligations キーを参照）
+        round_num: 現在のラウンド番号
+
+    Returns:
+        プロンプトに追加する行のリスト（義務ゼロなら空リスト）
+    """
+    obligations = visible_state.get("my_obligations", [])
+    if not obligations:
+        return []
+
+    lines: list[str] = ["\n## あなたの契約義務（署名済み・未履行）"]
+
+    # ラウンドでグルーピング
+    by_round: dict[int, list[dict]] = {}
+    for ob in obligations:
+        by_round.setdefault(ob["round_num"], []).append(ob)
+
+    for rn in sorted(by_round.keys()):
+        obs = by_round[rn]
+        # 現ラウンドを強調表示（自爆は現ラウンドの多重義務で起きるため）
+        marker = " ⬅ 今ラウンド" if rn == round_num else ""
+        lines.append(f"  **R{rn}**{marker}:")
+
+        # 各義務の描画
+        card_obs_count = 0
+        for ob in obs:
+            # 義務種別のラベル変換
+            ob_type_label = {
+                "type_a_payment": "型A金銭支払い",
+                "type_b_market": "型B市場指定",
+                "type_b_card": "型Bカード指定",
+                "type_b_no_market": "型B不参加指定",
+            }.get(ob["ob_type"], ob["ob_type"])
+            # 詳細情報の描画（金額 / 市場ID / カードrank）
+            details_str = ""
+            if "amount" in ob["details"]:
+                details_str = f'{ob["details"]["amount"] // 10_000}万円'
+            elif "market_id" in ob["details"]:
+                details_str = ob["details"]["market_id"]
+            elif "card_rank" in ob["details"]:
+                details_str = ob["details"]["card_rank"]
+            elif "card" in ob["details"]:
+                # フォールバック: 正規化前の古いデータとの互換
+                details_str = ob["details"]["card"]
+            lines.append(
+                f'    - [{ob["contract_id"]}] {ob_type_label} {details_str}'
+                f' （相手: {ob["counterparty"]}）'
+            )
+            if ob["ob_type"] == "type_b_card":
+                card_obs_count += 1
+
+        # コンフリクト警告: 同一ラウンドにカード使用義務が2件以上
+        # → 1ラウンドに出せるのは1枚なので必ず違反で脱落する
+        # この警告は情報提示のみ（署名拒否・自動修正はしない）
+        if card_obs_count >= 2:
+            lines.append(
+                f"    ⚠ R{rn}: カード使用義務が{card_obs_count}件"
+                f"（1ラウンドに出せるのは1枚 → 必ず違反で脱落）"
+            )
+
+    return lines
+
+
 # --- システムプロンプト（ルール詳細） ---
 # Step 3.3: キャッシュ閾値(2048トークン)超えのため仕様書v0.5準拠で詳細化
 # ルールの内容は変えず、仕様書に存在する事実を忠実に記載
@@ -112,7 +199,8 @@ strategyに必ず"emotion"を含めてください。現在のあなたの感情
 - {{"type": "pass"}}
 - {{"type": "contract_propose", "with": ["P07"], "terms": [
     {{"obligor": "自分のID", "counterparty": "P07", "ob_type": "type_a_payment", "round_num": 5, "details": {{"amount": 500000}}}},
-    {{"obligor": "P07", "counterparty": "自分のID", "ob_type": "type_b_market", "round_num": 5, "details": {{"market_id": "M02"}}}}
+    {{"obligor": "P07", "counterparty": "自分のID", "ob_type": "type_b_market", "round_num": 5, "details": {{"market_id": "M02"}}}},
+    {{"obligor": "P07", "counterparty": "自分のID", "ob_type": "type_b_card", "round_num": 5, "details": {{"card_rank": "FLUSH"}}}}
   ]}}
   ※ob_type: type_a_payment(金銭支払) / type_b_market(市場指定) / type_b_card(カード指定) / type_b_no_market(不参加指定)
 - {{"type": "contract_sign", "contract_id": "..."}}
@@ -129,7 +217,7 @@ strategyに必ず"emotion"を含めてください。現在のあなたの感情
 - **強制最低返済**: 毎ラウンドのFinanceで「借金残高 ÷ 残りラウンド数」が自動返済される。返済を先送りできないため、計画的な資金管理が必要
 - **カードトレード**: Negotiation中に他プレイヤーとカード交換を提案できる（1ラウンド1回まで、R12は不可）。複数宛先へのブロードキャスト提案が可能で、最初に受諾した相手と即時交換される
 - **倍掛け**: 市場賞金を獲得した直後にTAKE（即時受領）かDOUBLE（預託）を選択。DOUBLEを選ぶと賞金を預託し、次ラウンドで市場賞金を獲得すれば預託額の2倍を受領。獲得できなければ全額没収。参加者が自分1人だけの市場（空き巣）での賞金は成功判定に含めない。R11が最後の選択機会（R12は自動TAKE）。選択と預託額は全員に公開される
-"""
+{final_market_rule}"""
 
 
 def build_system_prompt(player_id: str, config: GameConfig) -> str:
@@ -138,6 +226,19 @@ def build_system_prompt(player_id: str, config: GameConfig) -> str:
 
     匿名化: モデル名は一切含めない。プレイヤーIDと目的のみ。
     """
+    # 最終市場ルール: multiplier > 1 のときのみ表示（S1/デフォルトでは非表示）
+    # multiplier=1 は「1倍＝変化なし」で無意味なため、行自体を出力しない
+    if config.final_market_multiplier > 1:
+        final_market_rule = (
+            f"- **最終市場**: R{config.num_rounds}（最終ラウンド）は"
+            f"全市場のシステム基本賞金が{config.final_market_multiplier}倍になる。"
+            f"Entry Feeは通常どおりプールに加算。"
+            f"市場高騰と併用時は{config.final_market_multiplier}倍後の"
+            f"プール全体がさらに2倍"
+        )
+    else:
+        final_market_rule = ""
+
     rules = RULES_SUMMARY.format(
         num_players=config.num_players,
         survival_cash_man=config.survival_cash // 10_000,
@@ -146,6 +247,7 @@ def build_system_prompt(player_id: str, config: GameConfig) -> str:
         interest_pct=config.interest_rate * 100,
         entry_fee_man=config.entry_fee // 10_000,
         contract_fee_man=config.contract_fee // 10_000,
+        final_market_rule=final_market_rule,
     )
 
     identity = (
@@ -191,6 +293,10 @@ def build_negotiation_prompt(
     lines.append(f"  Free Cash: {player_state.free_cash // 10_000}万円")
     hand_names = [c.rank.name for c in sorted(player_state.hand, key=lambda c: c.rank.value)]
     lines.append(f"  手札: {', '.join(hand_names)}")
+
+    # 署名済み未履行の契約義務一覧（帳簿ミス起因の自爆防止）
+    ob_lines = _render_obligations_block(player_state.player_id, visible_state, round_num)
+    lines.extend(ob_lines)
 
     # 生存者
     alive = visible_state.get("alive_players", [])
@@ -240,6 +346,9 @@ def build_negotiation_prompt(
                     details_str = ob["details"]["market_id"]
                 elif "card_rank" in ob["details"]:
                     details_str = ob["details"]["card_rank"]
+                elif "card" in ob["details"]:
+                    # フォールバック: 正規化前の古いデータとの互換
+                    details_str = ob["details"]["card"]
                 lines.append(
                     f'    - {ob["obligor"]} → {ob["counterparty"]}: '
                     f'{ob_type_label} R{ob["round_num"]} {details_str}'
@@ -320,6 +429,11 @@ def build_commit_prompt(
     lines.append(f"  手札: {', '.join(hand_names)}")
     lines.append(f"  残りラウンド: {config.num_rounds - round_num}")
 
+    # 署名済み未履行の契約義務一覧（帳簿ミス起因の自爆防止）
+    # コミットフェイズは最重要: ここで市場・カード選択が確定し違反が決まる
+    ob_lines = _render_obligations_block(player_state.player_id, visible_state, round_num)
+    lines.extend(ob_lines)
+
     # 使用済みカード情報
     used = visible_state.get("used_cards", {})
     if used:
@@ -391,6 +505,10 @@ def build_double_up_prompt(
     hand_names = [c.rank.name for c in sorted(player_state.hand, key=lambda c: c.rank.value)]
     lines.append(f"  残りカード: {', '.join(hand_names)}（{len(hand_names)}枚）")
     lines.append(f"  残りラウンド: {remaining}")
+
+    # 署名済み未履行の契約義務一覧（帳簿ミス起因の自爆防止）
+    ob_lines = _render_obligations_block(player_state.player_id, visible_state, round_num)
+    lines.extend(ob_lines)
 
     # 他プレイヤーの倍掛け状況
     double_ups = visible_state.get("double_ups", [])

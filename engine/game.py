@@ -958,6 +958,27 @@ class Game:
                 and for_player_id in c.parties
             ]
 
+            # 当事者向け: 署名済み契約の未履行義務一覧（自分が obligor のもの）
+            # 帳簿ミス起因の契約違反脱落を防ぐための情報提示（§7.3の思想を契約に適用）
+            # engine判定ロジックには影響しない — プロンプトへの情報提示のみ
+            state["my_obligations"] = [
+                {
+                    "contract_id": c.contract_id,
+                    "obligor": ob.obligor,
+                    "counterparty": ob.counterparty,
+                    "ob_type": ob.ob_type.value,
+                    "round_num": ob.round_num,
+                    "details": dict(ob.details),
+                }
+                for c in self.contracts
+                if c.status == ContractStatus.ACTIVE
+                for ob in c.obligations
+                if ob.obligor == for_player_id
+                and not ob.is_fulfilled
+                and not ob.is_expired
+                and ob.round_num >= round_num  # 過去ラウンドの義務は除外
+            ]
+
             # カードトレード提案（当事者のみ可視, v0.7.1: 受信者に他宛先非公開）
             pending_trades = []
             for tp in self.trade_proposals:

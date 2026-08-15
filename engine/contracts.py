@@ -13,7 +13,7 @@ import uuid
 
 from engine.models import (
     Contract, ContractStatus, Obligation, ObligationType,
-    MarketCommit, PlayerState,
+    MarketCommit, PlayerState, CardRank,
 )
 
 
@@ -39,6 +39,30 @@ def create_contract(
 
     obligations: list[Obligation] = []
     for i, term in enumerate(terms):
+        details = dict(term.get("details", {}))
+
+        # type_b_card 義務の details キー正規化:
+        # LLMが "card" や "rank" キーで送信する場合があるため "card_rank" に統一。
+        # 判定ロジック(audit_type_b)・autocommit・プロンプト表示が全て
+        # "card_rank" を参照するため、入口1箇所で正規化して全消費者を修正。
+        if term.get("ob_type") == "type_b_card" and "card_rank" not in details:
+            if "card" in details:
+                details["card_rank"] = details.pop("card")
+            elif "rank" in details:
+                details["card_rank"] = details.pop("rank")
+
+        # type_b_card 義務のバリデーション:
+        # 正規化しても card_rank が取得できない、または CardRank enum に
+        # 存在しないrank名の場合、silent脱落トラップを防ぐため契約提案を弾く。
+        # 呼び出し元のP2防御層(game.py)でキャッチされアクション不成立になる。
+        if term.get("ob_type") == "type_b_card":
+            rank_name = details.get("card_rank")
+            if rank_name is None or rank_name not in CardRank.__members__:
+                raise ValueError(
+                    f"Invalid type_b_card obligation: card_rank={rank_name!r} "
+                    f"(valid: {', '.join(CardRank.__members__)})"
+                )
+
         ob = Obligation(
             obligation_id=f"{contract_id}_OB{i + 1:02d}",
             contract_id=contract_id,
@@ -46,7 +70,7 @@ def create_contract(
             counterparty=term["counterparty"],
             ob_type=ObligationType(term["ob_type"]),
             round_num=term["round_num"],
-            details=term.get("details", {}),
+            details=details,
         )
         obligations.append(ob)
 

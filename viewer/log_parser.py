@@ -290,6 +290,8 @@ def get_game_state(logs_dir: Path, trial_dir_name: str, game_id: str) -> dict[st
             "emotion": latest_emotion,
             "emotion_history": emotion_history,
             "cash": None,  # 後段のeventsループでSNAPSHOTから埋める
+            "debt": None,  # 後段のeventsループでSNAPSHOTから埋める
+            "initial_loan": None,  # LOAN_CHOSENイベントから取得
             "last_message": (last_message[:120] if last_message else None),
             "stats": {
                 "calls": calls,
@@ -306,34 +308,60 @@ def get_game_state(logs_dir: Path, trial_dir_name: str, game_id: str) -> dict[st
     events_file = trial_dir / f"{game_id}_events.jsonl"
     eliminated: list[str] = []
     cash_by_pid: dict[str, int] = {}
+    debt_by_pid: dict[str, int] = {}
+    loan_by_pid: dict[str, int] = {}
     game_config: dict[str, Any] = {}
     if events_file.exists():
         events = _cache.get_entries(events_file)
         for e in events:
-            if e.get("event_type") == "GAME_START":
+            et = e.get("event_type")
+            if et == "GAME_START":
                 game_config = e.get("data", {}).get("config", {})
-            if e.get("event_type") in ("ELIMINATION", "BANKRUPTCY", "FORCED_LIQUIDATION"):
+            elif et == "LOAN_CHOSEN":
+                data = e.get("data", {})
+                pid = data.get("player_id", "")
+                if pid:
+                    loan_by_pid[pid] = data.get("loan_amount", 0)
+            elif et in ("ELIMINATION", "BANKRUPTCY", "FORCED_LIQUIDATION"):
                 pid = e.get("data", {}).get("player_id", "")
                 if pid and pid not in eliminated:
                     eliminated.append(pid)
-            if e.get("event_type") == "SURVIVAL_CHECK":
+            elif et == "SURVIVAL_CHECK":
                 data = e.get("data", {})
                 if data.get("result") == "eliminated":
                     pid = data.get("player_id", "")
                     if pid and pid not in eliminated:
                         eliminated.append(pid)
-            if e.get("event_type") == "SNAPSHOT":
-                # SNAPSHOTから各プレイヤーの最新所持金を取得
+            elif et == "SNAPSHOT":
+                # SNAPSHOTから各プレイヤーの所持金・借金を取得
+                # debt = cash - free_cash（free_cash > 0 のとき正確）
                 for pid, sd in e.get("data", {}).get("snapshots", {}).items():
-                    if sd.get("cash") is not None:
-                        cash_by_pid[pid] = sd["cash"]
+                    cash = sd.get("cash")
+                    free_cash = sd.get("free_cash")
+                    if cash is not None:
+                        cash_by_pid[pid] = cash
+                        if free_cash is not None:
+                            debt_by_pid[pid] = cash - free_cash
+            elif et == "INTEREST":
+                # old_debt = SNAPSHOT時点の正確な借金残高
+                # free_cash=0 の場合 cash-free_cash は過小評価するため、
+                # INTEREST.old_debt で補正する
+                data = e.get("data", {})
+                pid = data.get("player_id", "")
+                if pid and data.get("old_debt") is not None:
+                    debt_by_pid[pid] = data["old_debt"]
 
         # プレイヤーの状態を更新
         for p in players:
-            if p["player_id"] in eliminated:
+            pid = p["player_id"]
+            if pid in eliminated:
                 p["status"] = "eliminated"
-            if p["player_id"] in cash_by_pid:
-                p["cash"] = cash_by_pid[p["player_id"]]
+            if pid in cash_by_pid:
+                p["cash"] = cash_by_pid[pid]
+            if pid in debt_by_pid:
+                p["debt"] = debt_by_pid[pid]
+            if pid in loan_by_pid:
+                p["initial_loan"] = loan_by_pid[pid]
 
     return {
         "current_round": max_round,
@@ -672,8 +700,18 @@ def get_round_states(
             for pid, sd in data.get("snapshots", {}).items():
                 cash = sd.get("cash")
                 free = sd.get("free_cash")
+                # debt = cash - free_cash（free_cash > 0 のとき正確）
                 debt = (cash - free) if (cash is not None and free is not None) else None
                 rd["cash"][pid] = {"cash": cash, "free_cash": free, "debt": debt}
+
+        elif et == "INTEREST":
+            # old_debt = SNAPSHOT時点の正確な借金残高
+            # free_cash=0 の場合 cash-free_cash は過小評価するため補正
+            rd = rnd(r)
+            pid = data.get("player_id", "")
+            if pid and data.get("old_debt") is not None:
+                entry = rd["cash"].setdefault(pid, {"cash": None, "free_cash": None, "debt": None})
+                entry["debt"] = data["old_debt"]
 
         elif et == "NEGOTIATION_ACTION":
             act = data.get("action")
