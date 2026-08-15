@@ -296,6 +296,10 @@ def run_trial_game_c(
     if total_cost > COST_LIMIT_TOTAL:
         print(f"  ⚠ 全体コスト上限${COST_LIMIT_TOTAL}超過: ${total_cost:.4f}")
 
+    # LLMログ保存（emotion/reasoning等の後付けフィールドをファイルに反映）
+    for agent in llm_agents:
+        agent.llm_logger.save()
+
     # イベントログ保存（逐次書き込み済みなので flush のみ）
     event_logger.save_jsonl(event_path)
 
@@ -958,6 +962,8 @@ def main() -> None:
                         help="ルールセット: S1(Season 1, 既定) / S2(Season 2)")
     parser.add_argument("--roster", type=str, default=None,
                         help='Phase C ロスター（カンマ区切り、例: "M6,L6,M5,L2,L1,M3"）')
+    parser.add_argument("--cot", action="store_true", default=False,
+                        help="CoT (Chain-of-Thought) を有効化: LLMにreasoningフィールドを要求")
     args = parser.parse_args()
 
     # 修正8: レポート再生成モード
@@ -1006,6 +1012,11 @@ def main() -> None:
             })
         if args.max_turns:
             config = config.model_copy(update={"negotiation_max_turns": args.max_turns})
+
+    # CoT (Chain-of-Thought) 有効化
+    if args.cot:
+        config = config.model_copy(update={"enable_cot": True})
+        print("[CoT] reasoning フィールドを要求します")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = Path(f"logs/llm/trial_{args.phase}_{timestamp}")

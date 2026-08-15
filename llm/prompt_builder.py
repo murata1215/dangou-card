@@ -257,16 +257,31 @@ def build_system_prompt(player_id: str, config: GameConfig) -> str:
         f"嘘をついてもよい。交渉・談合・裏切りは自由。ただし正式契約の違反は即脱落。"
     )
 
-    return rules + identity
+    cot_block = ""
+    if config.enable_cot:
+        cot_block = (
+            "\n\n**重要: reasoning（推論）**\n"
+            "JSONの先頭に \"reasoning\" フィールドを必ず含めてください。"
+            "行動を決める前に、現在の状況・他プレイヤーの意図・リスク・最善手を"
+            "日本語で論理的に考えてください。\n"
+            '出力形式: {"reasoning": "（ここに推論を書く）", '
+            '"strategy": {...}, "action": {...}}'
+        )
+
+    return rules + identity + cot_block
 
 
 def build_loan_prompt(config: GameConfig) -> str:
     """借入額選択用のユーザープロンプト"""
+    if config.enable_cot:
+        json_example = '{"reasoning": "...", "strategy": {"reason": "..."}, "action": {"type": "choose_loan", "amount": 金額}}'
+    else:
+        json_example = '{"strategy": {"reason": "..."}, "action": {"type": "choose_loan", "amount": 金額}}'
     return (
         f"ゲーム開始前です。{config.loan_min // 10_000}万〜{config.loan_max // 10_000}万円の範囲で借入額を選んでください。\n"
         f"借入額がそのまま初期資金になります。利息は毎ラウンド{config.interest_rate * 100}%の複利です。\n"
         f"生還条件: 借金0 + 現金{config.survival_cash // 10_000}万円以上\n\n"
-        f'JSON形式で回答: {{"strategy": {{"reason": "..."}}, "action": {{"type": "choose_loan", "amount": 金額}}}}'
+        f"JSON形式で回答: {json_example}"
     )
 
 
@@ -390,10 +405,14 @@ def build_negotiation_prompt(
                 lines.append(f"  宛先: {', '.join(parts)}")
 
     # 修正2: 交渉フェイズではmarket_commitは使えないことを明記
+    if config.enable_cot:
+        json_example = '{"reasoning": "...", "strategy": {...}, "action": {"type": "pass"}}'
+    else:
+        json_example = '{"strategy": {...}, "action": {"type": "pass"}}'
     lines.append(
         f"\n交渉フェイズのアクションをJSON形式で1つ選んでください。"
         f"（market_commitはコミットフェイズで行います。ここではdm/broadcast/transfer/repay/pass等を選択）\n"
-        f'例: {{"strategy": {{...}}, "action": {{"type": "pass"}}}}'
+        f"例: {json_example}"
     )
 
     return "\n".join(lines)
@@ -461,9 +480,13 @@ def build_commit_prompt(
         for k, v in last_strategy.items():
             lines.append(f"  {k}: {v}")
 
+    if config.enable_cot:
+        json_example = '{"reasoning": "...", "strategy": {...}, "action": {"type": "market_commit", "market_id": "M01", "card": "ONE_PAIR"}}'
+    else:
+        json_example = '{"strategy": {...}, "action": {"type": "market_commit", "market_id": "M01", "card": "ONE_PAIR"}}'
     lines.append(
         f"\n交渉で合意・宣言した内容と整合するコミットを検討してください。"
-        f'\nJSON形式で回答: {{"strategy": {{...}}, "action": {{"type": "market_commit", "market_id": "M01", "card": "ONE_PAIR"}}}}'
+        f"\nJSON形式で回答: {json_example}"
     )
 
     return "\n".join(lines)
@@ -524,10 +547,16 @@ def build_double_up_prompt(
     alive = visible_state.get("alive_players", [])
     lines.append(f"\n生存者: {len(alive)}人（{', '.join(sorted(alive))}）")
 
-    lines.append(
-        f'\n以下のJSON形式で回答してください:\n'
-        f'{{"strategy": {{"reason": "判断理由", "emotion": "楽"}}, '
-        f'"choice": "DOUBLE" または "TAKE"}}'
-    )
+    if config.enable_cot:
+        json_example = (
+            '{"reasoning": "...", "strategy": {"reason": "判断理由", "emotion": "楽"}, '
+            '"choice": "DOUBLE" または "TAKE"}'
+        )
+    else:
+        json_example = (
+            '{"strategy": {"reason": "判断理由", "emotion": "楽"}, '
+            '"choice": "DOUBLE" または "TAKE"}'
+        )
+    lines.append(f"\n以下のJSON形式で回答してください:\n{json_example}")
 
     return "\n".join(lines)

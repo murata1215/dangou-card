@@ -75,6 +75,7 @@ class LLMLogger:
             "error": error,
             "error_type": error_type,
             "emotion": emotion,
+            "reasoning": None,  # CoT: _update_last_log_emotion で後付け
             "finish_reason": finish_reason,
         }
         self._entries.append(entry)
@@ -112,9 +113,19 @@ class LLMLogger:
         return list(self._entries)
 
     def save(self) -> Path:
-        """後方互換のため残す（逐次書き込みで既に保存済み）"""
+        """
+        in-memoryエントリでファイルを全書き直しする。
+
+        逐次書き込み中は emotion/reasoning が後付け更新されるため、
+        試合完了後にこのメソッドを呼ぶことでファイルに最終値が反映される。
+        """
         try:
-            self._file.flush()
+            self._file.close()
+            with open(self._file_path, "w", encoding="utf-8") as f:
+                for entry in self._entries:
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            # 再オープン（以降の追記に備える）
+            self._file = open(self._file_path, "a", encoding="utf-8")
         except Exception:
             pass
         return self._file_path

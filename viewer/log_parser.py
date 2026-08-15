@@ -665,6 +665,7 @@ def get_round_states(
             target["winners"] = data.get("winners", [])
             target["prize_per_winner"] = data.get("prize_per_winner")
             target["total_pool"] = data.get("total_pool")
+            target["surged"] = data.get("surged", False)
 
         elif et == "REVEAL":
             rd = rnd(r)

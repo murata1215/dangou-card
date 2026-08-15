@@ -1,5 +1,35 @@
 # Changelog
 
+## 2026-08-16: card_idトレード重複バグ修正・Gemini単価是正・トライアルのデタッチ起動化・CoT(A)実装
+
+### 概要
+seed=502のR12 `AUTO_COMMIT_FAILURE`（P02/P07）の根本原因調査から着手し、カードトレード時のcard_id重複による手札ドレインバグを特定・修正。続けてコスト表示の単価検証でGemini 3.5系が旧世代(2.5)単価のまま10〜15倍過小だった問題を発見・是正し、Claudeセッションのタイムアウトで長時間トライアルが巻き込まれてkillされる問題をデタッチ起動ラッパーで解消。最後にCoT (Chain-of-Thought) の`reasoning`フィールドを`enable_cot`フラグで追加実装し、6ベンダー混合スモークテストで情報リーク0件・全ベンダーでの正常出力を確認した。
+
+### 変更
+- **card_idトレード重複バグ修正（最重要）**: 全プレイヤーが同一card_id体系のデッキを持つ設計上、カードトレードで相手のカードを受け取ると手札内に同一card_idが2枚生じ、`engine/player.py` の `use_card()` がcard_id一致の**全カードを除去**するロジックのため1枚使用で2枚消滅していた（`compute_legal_commits()`が空集合になりAUTO_COMMIT_FAILUREを誘発する真因）。`use_card()`を1枚のみ除去するよう修正し、`swap_card()`は受け取るカードのcard_idが手札と衝突する場合に`_t`/`_t2`...サフィックスでリネームするよう修正（rank不変）。回帰テスト3件追加（`tests/test_card_trade.py`: `test_swap_duplicate_card_id_renamed`/`test_use_card_removes_only_one`/`test_trade_then_use_no_drain`）
+- **コスト算出単価の是正（Gemini）**: `llm/models.py` のGemini 3.5 Flash (M3)・Flash-Lite (L3) の単価がGemini 2.5世代のまま放置され、Google公式単価（2026-08時点 ai.google.dev/gemini-api/docs/pricing）に対し10〜15倍過小だった。M3: input $0.15→**$1.50**/output $0.60→**$9.00**、L3: input $0.075→**$0.30**/output $0.30→**$2.50**に修正。DeepSeek V3 (M6) は2026-08-17改定予定のためTODOコメントのみ追加、GPT-4.1 Miniは変更なし。過去のクリーントライアル(seed=501/502/503)のコスト表示は過小だった（seed=503のP02(Gemini)実測: 表示$0.1055→正しくは$1.16）。`tests/test_llm.py`のGemini単価テストを更新
+- **トライアル試合のデタッチ起動化**: seed=504（trial_C_20260815_221824）のR10全体停止を調査した結果、LLM側エラーは0件で、Claude/DevRelayセッションのSIGALRMタイムアウトにより子プロセスの`llm_trial.py`ごとkillされたのが原因と断定（P03/P09のR3脱落は正当な矛盾契約によるAUTO_COMMIT_FAILUREで別原因）。`scripts/run_trial.sh`（新規）を`setsid nohup`で親プロセスから完全に切り離して起動するラッパーとして追加。stdout/stderrは`logs/llm/run_YYYYMMDD_HHMMSS.log`に、PIDは`.pid`に記録。`scripts/check_trial.sh`（新規）で最新trialのラウンド・完了状態・PID生存・座席マップ・ログ末尾を確認可能に
+- **CoT(A)実装: reasoningフィールド追加**: 各LLMエージェントの応答JSONに`reasoning`フィールドを追加し、行動決定前の状況分析・他者意図推察・最善手の論理的推論を出力させる仕組みを実装。`engine/config.py`に`enable_cot: bool = False`フラグ（デフォルト無効・既存挙動完全維持）。`llm/prompt_builder.py`の`build_system_prompt()`/`build_loan_prompt()`/`build_negotiation_prompt()`/`build_commit_prompt()`/`build_double_up_prompt()`が`enable_cot=True`時にreasoning指示・JSON例を追加。`llm/response_parser.py`の`parse_response()`がトップレベルの`reasoning`を抽出し`strategy["_reasoning"]`に格納（欠落しても脱落しない任意フィールド、戻り値の型は不変で既存呼び出しを壊さない設計）。`llm/llm_agent.py`の`_update_last_log_emotion()`でreasoningもロガーに後付け記録。`scripts/llm_trial.py`に`--cot`フラグ追加（`config.enable_cot=True`を設定）。**情報リーク防止（最重要制約）**: reasoningは神視点のみに記録し、`_build_visible_state()`・`NEGOTIATION_ACTION`イベント・他プレイヤー向けプロンプトには一切含まれない設計（既存の可視化ロジックがそもそもstrategy/reasoningを含まない設計だったためコード変更不要、テスト`tests/test_cot.py`の`TestCoTNoLeak`3件で担保）。テスト20件新規追加（`tests/test_cot.py`）
+- **LLMLoggerの逐次書き込み×post-hoc更新のタイミングズレ修正**: CoTスモークテスト実施中に発見。`llm/llm_logger.py`の`log_call()`は即時ファイル追記するが、emotion/reasoningは`_update_last_log_emotion()`でメモリ上のエントリのみ後付け更新されるため、ファイルには反映されないタイミングズレがあった。`save()`メソッドをin-memory entriesでファイル全書き直しする方式に変更。あわせて`scripts/llm_trial.py`の`run_trial_game_c()`（Phase C）に`agent.llm_logger.save()`呼び出しを追加（Phase A/Bは既存実装で呼ばれていたが、Phase Cのみ欠落していた）
+
+### 検証
+- 全テスト324件パス
+- seed=502クリーン再走・seed=503実行: AUTO_COMMIT_FAILURE 0件、card_idドレインなし（トレード成立分がリネーム済みcard_idで正常に使用できることを確認）
+- CoTスモークテスト（seed=601, trial_C_20260816_051835, 6社混合・S2・R1打ち切り、コスト$0.36）: 全6ベンダー（DeepSeek V3/Grok 4.3/Kimi K2.6/Gemini 3.5 Flash-Lite/Claude Haiku 4.5/GPT-4.1 Mini）がJSON率85〜92%を維持しつつreasoningを正常出力（negotiation/commitフェイズで11/12前後）。他プレイヤー向けプロンプト・イベントログへのreasoningリーク**0件**を確認
+
+## 2026-08-15: ビューワー市場高騰バッジ追加
+
+### 概要
+市場高騰（サージ）が発動してプールが2倍になった市場が、ビューワーのラウンド状況パネルで判別できず賞金額の不整合に見える問題を修正。`MARKET_RESULT`イベントの`surged`フラグ（engineが既に出力済み）を利用し、高騰市場に「高騰×2」バッジを表示するのみの表示側修正（engine・ゲームロジックは不変）。
+
+### 変更
+- `viewer/log_parser.py`: `get_round_states()`のMARKET_RESULTパース時に`target["surged"] = data.get("surged", False)`を追加
+- `viewer/static/index.html`: 市場行に`m.surged`ベースの条件付き「高騰×2」バッジを描画
+- `viewer/static/style.css`: `.sit-surge`スタイル追加（オレンジ太字）
+
+### 検証
+- テスト24件パス
+
 ## 2026-08-15: type_b_cardキー不一致バグ修正・契約義務可視化・最終市場周知・EventLogger逐次追記化・pidLabel併記・ビューアdebt表示修正
 
 ### 概要

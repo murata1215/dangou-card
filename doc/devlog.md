@@ -1376,3 +1376,163 @@ P02（残り手札: TWO_PAIR_1）とP07（残り手札: HIGH_CARD_2）がR12でA
 | コスト | $1.30 | $1.25 |
 
 Gemini 1位は安定。GPT-4.1 Mini全滅も安定（低借入+破産パターン）。DeepSeek V3は高借入で生還する傾向。n=2では断定困難だが、序列は一貫している。
+
+### 2026-08-15 16:39 JST — カードトレード card_id 重複バグ修正
+
+seed=502（trial_C_20260815_132716）で P02・P07（Gemini）が R12 で AUTO_COMMIT_FAILURE により脱落。調査の結果、R5 のカードトレードが原因と判明。
+
+**バグ**: 全プレイヤーが同一 card_id 体系のデッキを持つ（例: 全員が "TWO_PAIR_1"）。カードトレードで相手のカードを受け取ると、同じ card_id のカードが手札内に 2 枚存在。`use_card()` が `card_id != target` でフィルタし全一致カードを除去するため、1 枚コミットで 2 枚消滅。実データ: P02 は R6→R7 で手札 7→5 枚（期待 6 枚）、R12 で 0 枚に。P07 も同様。
+
+**修正**: (1) `swap_card()`: 受け取りカードの card_id が手札内で重複する場合サフィックス `_t` でリネーム（rank は不変）。(2) `use_card()`: 1 枚だけ除去するよう変更。両方適用で根治。テスト 3 件追加、全 304 件パス。
+
+seed=501 はトレード 0 件で影響なし。seed=502 は本バグで汚染されていた。
+
+### 2026-08-15 18:25 JST — ビューワー市場高騰バッジ追加
+
+市場高騰（サージ）が発動してプールが2倍になった市場が、ビューワーのラウンド状況パネルで判別できず賞金額の不整合に見える問題を修正。MARKET_RESULT イベントの `surged` フラグ（boolean、engine が既に出力済み）を利用し、高騰市場に「高騰×2」バッジを表示。
+
+**修正**: (1) `viewer/log_parser.py`: MARKET_RESULT パース時に `target["surged"]` をAPIレスポンスに通す（1行追加）。(2) `viewer/static/index.html`: 市場行に `m.surged` ベースの条件付きバッジを描画。(3) `viewer/static/style.css`: `.sit-surge` スタイル追加（オレンジ太字）。engine・ゲームロジックは不変。表示のみの追加。テスト 24 件パス。
+
+### 2026-08-15 18:59 JST — seed=502 クリーン再走（card_id重複バグ修正後）
+
+card_id重複バグ修正後に seed=502 を再走。前回の汚染版（trial_C_20260815_132716）では P02・P07（Gemini）が R5 のカードトレードによる手札ドレインで R12 AUTO_COMMIT_FAILURE（cards_destroyed=0）で脱落していた。
+
+**設定**: S2ルール / 9人（Gemini 3.5 Flash×3, GPT-4.1 Mini×3, DeepSeek V3×3）/ seed=502 / 12R
+**出力**: `logs/llm/trial_C_20260815_171602/`
+**コスト**: $1.42 / 所要: 5,969秒（約100分）
+
+**結果**:
+- 生還 4人: P02(Gemini, ¥3,674,145), P05(Gemini, ¥3,353,174), P07(Gemini, ¥2,895,648), P09(DeepSeek, ¥2,736,615)
+- 脱落 5人: P03(GPT-4.1 Mini, contract_violation R6), P08(GPT-4.1 Mini, contract_violation R7), P04(DeepSeek, contract_violation R10), P01(GPT-4.1 Mini, condition_not_met R12), P06(DeepSeek, condition_not_met R12)
+- 契約: propose 11件, sign 9件, 署名率 82%
+- 倍掛け: 16件選択, 成功6/失敗10
+- カードトレード: **0件**（今回はトレード自体が発生せず）
+
+**バグチェック**:
+- AUTO_COMMIT_FAILURE: 1件（P03 R6, cards_destroyed=7）— 矛盾契約による正当な脱落。前回の不正脱落パターン（cards_destroyed=0）は**消滅** ✅
+- card_idドレイン: カードトレード0件のため直接検証できず。ただし全生存者がR12まで手札1枚を正常に保持 ✅
+- APIエラー/タイムアウト: 0件 ✅ / ACTION_ERROR: 0件 ✅ / TYPE_B_VIOLATION: 0件 ✅
+
+**前回汚染版との比較**:
+
+| 項目 | 汚染版 | クリーン版 |
+|---|---|---|
+| 生還者 | 3人 | **4人** |
+| Gemini生還 | 1/3 (P05のみ) | **3/3 (全生還)** |
+| GPT-4.1 Mini | 0/3 全滅 | 0/3 全滅 |
+| DeepSeek V3 | 2/3 生還 | 1/3 生還 |
+| AUTO_COMMIT_FAILURE(バグ) | **2件** (P02,P07 cards=0) | **0件** |
+| カードトレード | 1件 (ドレイン発生) | 0件 |
+
+汚染版で不正脱落した P02・P07（ともにGemini）は、クリーン版では**ともに生還**。座席割り当てが同一（P02=Gemini, P07=Gemini）のまま結果が逆転した。Gemini の真の実力は全生還レベルであり、汚染版の「Gemini 1位だが2体脱落」はバグによる過小評価だった。GPT-4.1 Mini全滅は安定して再現。
+
+### 2026-08-15 22:06 JST — seed=503 再現性検証3試合目 + クリーン3試合集計
+
+**設定**: S2ルール / 9人（Gemini 3.5 Flash×3, GPT-4.1 Mini×3, DeepSeek V3×3）/ seed=503 / 12R
+**出力**: `logs/llm/trial_C_20260815_202246/`
+**コスト**: $1.53 / 所要: 6,041秒（約101分）
+
+**結果**:
+- 生還 3人: P02(Gemini, ¥6,557,036), P05(Gemini, ¥3,138,647), P09(Gemini, ¥2,057,719)
+- 脱落 6人: P04(GPT-4.1 Mini, bankruptcy R6), P03(GPT-4.1 Mini, bankruptcy R11), P01(DeepSeek, bankruptcy R12), P07(DeepSeek, bankruptcy R12), P08(DeepSeek, bankruptcy R12), P06(GPT-4.1 Mini, condition_not_met R12)
+- 契約: propose 8件, sign 8件, 署名率 **100%**
+- 倍掛け: 20件選択, 成功4/失敗16（forfeit多発）
+- カードトレード: propose 7件(成功5/失敗2), **accept 1件**（P01→P03: R3で成立）
+
+**バグチェック**:
+- AUTO_COMMIT_FAILURE: **0件** ✅
+- card_idドレイン: R3で P01→P03 のカードトレードが成立。P03がR6で `TWO_PAIR_1_t`（リネーム済みcard_id）を正常使用、P01がR7で `FULL_HOUSE_1_t` を正常使用。**ドレインなし、バグ修正の動作確認完了** ✅
+- APIエラー: 0件 ✅ / ACTION_ERROR: 0件 ✅ / TYPE_B_VIOLATION: 0件 ✅
+- AUTO_COMMIT(正常フォールバック): 3件（P03 R3/R11, P06 R7）
+- Gemini 3体が**1位/2位/3位を独占**（全生還）。P02は¥6,557,036で3試合最高資産
+
+**R12詳細**: 基本賞金144万×3倍=432万。P09がM01でSF勝利(¥174万), P02がM02でRF勝利(¥164万), P05がM03でSF勝利(¥164万)。高騰なし。Gemini 3体がR12で強カード（RF/SF/SF）を温存し全市場制圧。
+
+**クリーン3試合集計（seed=501/502/503）**:
+
+| モデル | 参加数 | 生還 | 生還率 | 優勝 | 最高資産 |
+|---|---|---|---|---|---|
+| **Gemini 3.5 Flash** | 9 | **9** | **100%** | **3** | ¥6,557,036 |
+| DeepSeek V3 | 9 | 2 | 22% | 0 | ¥2,736,615 |
+| GPT-4.1 Mini | 9 | 0 | **0%** | 0 | — |
+
+**序列傾向（n=3、断定は避け傾向として）**:
+- Gemini 3.5 Flash: 3試合9体**全員生還・全優勝**。最低資産でも¥2,057,719（生還ライン¥200万をぎりぎり超え）。R12で強カード温存→全市場制圧が3試合共通。圧倒的な安定感。
+- DeepSeek V3: 2/9生還。生還時は4位。脱落理由はbankruptcy(4), contract_violation(2), condition_not_met(1)と多様。
+- GPT-4.1 Mini: 0/9生還。全滅パターンが3試合で完全再現。脱落理由はbankruptcy(4), contract_violation(3), condition_not_met(2)。序盤bankruptcy(R6)が目立つ。
+
+### 2026-08-16 00:38 JST — Gemini 単価修正（10〜15倍過小だった）
+
+`llm/models.py` の Gemini 3.5 Flash (M3) / Flash-Lite (L3) の単価が旧世代 Gemini 2.5 の値のままで、Google 公式単価（2026-08時点）に対し 10〜15倍過小だった問題を修正。
+
+**修正内容**:
+- M3 (gemini-3.5-flash): input $0.15→**$1.50**、output $0.60→**$9.00**（Google公式 ai.google.dev/gemini-api/docs/pricing）
+- L3 (gemini-3.5-flash-lite): input $0.075→**$0.30**、output $0.30→**$2.50**（同上）
+- GPT-4.1 Mini ($0.40/$1.60)、DeepSeek V3 ($0.27/$1.10) は正確なため変更なし
+
+**影響**: 過去のクリーントライアル (seed=501/502/503) のコスト表示が過小。例: seed=503 P02(Gemini) のコード報告コスト $0.1055 は、正しい単価では **$1.16**（11倍）。試合全体では ~$1.5 → 実勢 ~$5-6/試合。
+
+**残課題**:
+- (a) Gemini 3.5 Flash の output 単価 $9.00 は thinking トークン込みだが、`adapters.py` が `completion_tokens` のみ計上し、thinking トークンを別途キャプチャしていない疑い → 別途調査
+- (b) Claude Sonnet 5 (M1) も $2.00/$10.00 で実勢 $3.00/$15.00 より過小 → 今回ロスター外のため未修正
+- (c) DeepSeek V3 は 2026-08-17 に peak/off-peak 価格改定予定 → コメントで TODO 記録済み
+
+テスト 304 件パス。
+
+### 2026-08-16 01:38 JST — トライアル試合のデタッチ起動ラッパー追加
+
+seed=504（trial_C_20260815_221824）が R10 で停止した原因を調査。LLM ログにエラー 0 件（全 vendor 正常）、Gemini 費用上限ヒットの形跡なし。**Claude セッションのバックグラウンドタスクの SIGALRM タイムアウトにより、子プロセスとして起動された `llm_trial.py` ごと kill されたのが原因**と断定。P03/P09 の R3 脱落は正当な矛盾契約（AUTO_COMMIT_FAILURE, cards_destroyed=10）で、停止とは別原因。
+
+**対策**: `scripts/run_trial.sh` を新設。`setsid nohup` で親プロセスから完全に切り離して起動する。stdout/stderr は `logs/llm/run_YYYYMMDD_HHMMSS.log` にリダイレクト（traceback が必ず残る）、PID は `.pid` に記録。
+
+**確認ヘルパー**: `scripts/check_trial.sh` を新設。最新 trial の進行状況（ラウンド/完了/生還者）を表示。
+
+**今後の運用**: 試合は以下のコマンドで起動する。
+```
+bash scripts/run_trial.sh --phase C --ruleset S2 --roster "M3,M3,M3,L2,L2,L2,M6,M6,M6" --games 1 --seed 504
+bash scripts/check_trial.sh  # 進行確認
+```
+
+### 2026-08-16 02:07 JST — CoT(A) 実装: reasoning フィールド追加
+
+各LLMエージェントの応答JSONに `reasoning`（推論）フィールドを追加。行動を決める前に状況分析・他者の意図推察・最善手の論理的推論を出力させる仕組み。`enable_cot: bool` フラグで全モデル一律にON/OFF切替可能（デフォルト False、既存挙動完全維持）。
+
+**目的**: 「熟慮するモデルが勝つか」を検証する実験基盤。同一モデルの CoT ON/OFF で因果効果を分離し、可視化する。vendor 固有の native thinking（Gemini等）とは独立した、全モデル共通の「思考軸」。
+
+**実装**:
+- `engine/config.py`: `enable_cot: bool = False` フラグ追加
+- `llm/prompt_builder.py`: `enable_cot=True` 時、システムプロンプトに reasoning 指示を追加。各フェイズ（loan/negotiation/commit/double_up）のJSON例に `"reasoning": "..."` を条件付き追加
+- `llm/response_parser.py`: トップレベルの `reasoning` フィールドを抽出し `strategy["_reasoning"]` に埋め込み。任意フィールド（欠落しても脱落しない）
+- `llm/llm_agent.py`: `_update_last_log_emotion()` で reasoning もロガーに後付け記録
+- `llm/llm_logger.py`: entry に `reasoning` フィールド追加（デフォルト None）
+
+**情報リーク防止（最重要）**: reasoning は**神視点のみ**に記録。`_build_visible_state()` / NEGOTIATION_ACTION イベント / 他プレイヤー向けプロンプトには**一切含まれない**。テスト 3 件で担保。
+
+**コスト面**: reasoning は可視出力トークン（completion_tokens）として課金される。CoT ON で出力トークンが増加するため、試合あたりコストが上昇する。
+
+テスト 20 件追加（config 3 + prompt 7 + parse 5 + leak 3 + log 2）、全 324 件パス。
+
+### 2026-08-16 05:33 JST — CoT スモークテスト（6ベンダー混合・R1）+ --cot フラグ追加 + ログ書き込み修正
+
+**追加実装**:
+- `scripts/llm_trial.py`: `--cot` フラグ追加（`config.enable_cot=True` を設定）
+- `llm/llm_logger.py`: `save()` メソッドを in-memory entries でファイル全書き直しに変更。逐次書き込み中は emotion/reasoning が後付け更新されるため、試合完了後の `save()` で最終値がファイルに反映されるようになった
+- `scripts/llm_trial.py`: Phase C の `run_trial_game_c()` 完了時に全エージェントの `llm_logger.save()` を呼ぶよう追加（Phase A/B は既に呼んでいた）
+
+**6ベンダー混合R1スモークテスト**（seed=601, trial_C_20260816_051835）:
+
+| 座席 | モデル | JSON率 | reasoning有無 | コスト |
+|---|---|---|---|---|
+| P01 | DeepSeek V3 | 13/13 | 11/13 ✅ | $0.005 |
+| P02 | Grok 4.3 | 12/12 | 11/12 ✅ | $0.011 |
+| P03 | Kimi K2.6 | 11/11 | 10/11 ✅ | $0.025 |
+| P04 | Gemini Flash-Lite | 12/12 | 11/12 ✅ | $0.007 |
+| P05 | Claude Haiku 4.5 | 12/12 | 11/12 ✅ | $0.040 |
+| P06 | GPT-4.1 Mini | 13/13 | 11/13 ✅ | $0.008 |
+
+**全6ベンダーが reasoning を正常に出力。** loan_choice（R0）ではパーサーの都合で記録されない（2/6体分）が、negotiation/commit では全員記録。総コスト $0.36。
+
+**reasoning 実出力サンプル（Haiku 4.5・R1 negotiation）**:
+> R1の初期状況を分析する。【現状把握】現金500万円、借金500万円、Free Cash 0万円。全員が同じカード構成で、市場は3つ各96万円。P01-P02、P03-P04が既に談合の枠組みを作っている。6人が3市場に分散すれば、各市場2人ずつが標準的な配置…
+
+**リーク検査**: 全プレイヤーの reasoning が他プレイヤーのプロンプトおよびゲームイベントに**一切含まれていないこと**を確認。**PASS**。

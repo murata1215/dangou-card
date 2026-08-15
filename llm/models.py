@@ -7,7 +7,7 @@
 Step 3C-prep2: モデルIDを各社APIで確認した実在IDに確定。
 - OpenAI: gpt-4.1 / gpt-4.1-mini（最新世代）
 - xAI: grok-4.5 / grok-4.3（実在確認）
-- Gemini: gemini-2.5-flash / gemini-2.5-flash-lite（OpenAI互換エンドポイント）
+- Gemini: gemini-3.5-flash / gemini-3.5-flash-lite（OpenAI互換エンドポイント）
 - Moonshot: kimi-k2.6（api.moonshot.aiが正しいエンドポイント）
 - DeepSeek: deepseek-chat（402入金待ち）
 - Anthropic: claude-sonnet-5 / claude-haiku-4-5（確認済み）
@@ -59,7 +59,7 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         model_id="gemini-3.5-flash",
         provider="Google", name="Gemini 3.5 Flash",
         adapter_type="gemini",
-        input_price=0.15, output_price=0.60,
+        input_price=1.50, output_price=9.00,  # Google公式 2026-08 ai.google.dev/gemini-api/docs/pricing
         env_key="GEMINI_API_KEY", base_url=GEMINI_OPENAI_BASE_URL,
     ),
     "M4": ModelInfo(
@@ -82,7 +82,7 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         model_id="deepseek-chat",
         provider="DeepSeek", name="DeepSeek V3",
         adapter_type="openai_compat",
-        input_price=0.27, output_price=1.10,
+        input_price=0.27, output_price=1.10,  # TODO: 2026-08-17 peak/off-peak改定予定・要確認
         env_key="DEEPSEEK_API_KEY", base_url="https://api.deepseek.com",
     ),
     # Tier L（軽量級）
@@ -104,7 +104,7 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         model_id="gemini-3.5-flash-lite",
         provider="Google", name="Gemini 3.5 Flash-Lite",
         adapter_type="gemini",
-        input_price=0.075, output_price=0.30,
+        input_price=0.30, output_price=2.50,  # Google公式 2026-08 ai.google.dev/gemini-api/docs/pricing
         env_key="GEMINI_API_KEY", base_url=GEMINI_OPENAI_BASE_URL,
     ),
     "L4": ModelInfo(

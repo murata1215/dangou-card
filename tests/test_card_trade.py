@@ -45,6 +45,59 @@ class TestSwapCard:
         assert not any(c.card_id == give.card_id for c in p2.hand)
         assert any(c.card_id == "FLUSH_99" for c in p2.hand)
 
+    def test_swap_duplicate_card_id_renamed(self):
+        """同一card_idのカードを受け取るとcard_idがリネームされる"""
+        p = make_player("P01", cash=3_000_000, debt=2_000_000)
+        # P01 は HIGH_CARD_1 を持っている。同じ card_id のカードを受け取る
+        give = next(c for c in p.hand if c.rank == CardRank.FLUSH)
+        receive = Card(card_id="HIGH_CARD_1", rank=CardRank.HIGH_CARD)  # 重複 card_id
+
+        p2 = player_ops.swap_card(p, give, receive)
+
+        assert len(p2.hand) == len(p.hand)  # 枚数不変
+        # HIGH_CARD が 3 枚（元の _1, _2 + リネームされた受け取り分）
+        hc_cards = [c for c in p2.hand if c.rank == CardRank.HIGH_CARD]
+        assert len(hc_cards) == 3
+        # card_id はすべてユニーク
+        card_ids = [c.card_id for c in p2.hand]
+        assert len(card_ids) == len(set(card_ids))
+
+    def test_use_card_removes_only_one(self):
+        """同一card_idが2枚ある場合、use_cardは1枚だけ除去する"""
+        p = make_player("P01", cash=3_000_000, debt=2_000_000)
+        # 手動で重複カードを追加（バグ再現用）
+        dup_card = Card(card_id="HIGH_CARD_1", rank=CardRank.HIGH_CARD)
+        hand_with_dup = list(p.hand) + [dup_card]
+        p = p.model_copy(update={"hand": hand_with_dup})
+        original_count = len(p.hand)  # 13枚
+
+        target = next(c for c in p.hand if c.card_id == "HIGH_CARD_1")
+        p2 = player_ops.use_card(p, target)
+
+        assert len(p2.hand) == original_count - 1  # 1枚だけ減少（2枚ではない）
+        # まだ HIGH_CARD_1 が1枚残っている
+        assert any(c.card_id == "HIGH_CARD_1" for c in p2.hand)
+
+    def test_trade_then_use_no_drain(self):
+        """トレードで同rank受取→使用しても手札が1枚だけ減る（ドレインしない）"""
+        p1 = make_player("P01", cash=3_000_000, debt=2_000_000)
+        p2_state = make_player("P02", cash=3_000_000, debt=2_000_000)
+
+        # P01 が FLUSH_1 を渡し、P02 の HIGH_CARD_1 を受け取る（P01は既にHIGH_CARD_1を所持）
+        give1 = next(c for c in p1.hand if c.card_id == "FLUSH_1")
+        recv1 = next(c for c in p2_state.hand if c.card_id == "HIGH_CARD_1")
+
+        p1_after = player_ops.swap_card(p1, give1, recv1)
+        assert len(p1_after.hand) == 12  # 枚数不変
+
+        # HIGH_CARD が3枚（元の _1, _2 + リネームされた受け取り分）
+        hc_cards = [c for c in p1_after.hand if c.rank == CardRank.HIGH_CARD]
+        assert len(hc_cards) == 3
+
+        # 1枚使用して11枚になる（2枚消えない）
+        p1_used = player_ops.use_card(p1_after, hc_cards[0])
+        assert len(p1_used.hand) == 11  # 1枚だけ減少
+
     def test_swap_card_not_in_hand_raises(self):
         """手札にないカードを差し出そうとするとエラー"""
         p = make_player("P01", cash=3_000_000, debt=2_000_000)

@@ -103,6 +103,10 @@ class GameConfig(BaseModel):
     card_trade_broadcast_max: int = 5
     """ブロードキャスト提案の宛先数上限（v0.7.1）"""
 
+    # --- CoT (Chain-of-Thought) ---
+    enable_cot: bool = False
+    """True: LLMにreasoningフィールド（推論）を要求する。神視点のみ記録、他プレイヤーにはリークしない"""
+
     # --- 交渉 ---
     negotiation_max_actions: int = 10
     """Negotiationの1プレイヤーあたり最大アクション数（§5.1: 10回、passは非カウント）"""

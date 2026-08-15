@@ -203,7 +203,7 @@ class TestStep3CPrep:
         model = ModelInfo(
             model_id="gemini-2.5-flash", provider="Google", name="Test",
             adapter_type="gemini",
-            input_price=0.15, output_price=0.60,
+            input_price=1.50, output_price=9.00,
             env_key="GEMINI_API_KEY",
             base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
         )

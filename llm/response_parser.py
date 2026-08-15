@@ -121,6 +121,7 @@ def parse_response(
         )
 
     strategy = data.get("strategy")
+    reasoning = data.get("reasoning")  # CoT: トップレベルの推論フィールド
     action_data = data.get("action")
 
     if action_data is None:
@@ -137,6 +138,14 @@ def parse_response(
     # emotionのバリデーション+正規化（リトライ対象にしない）
     if isinstance(strategy, dict):
         strategy = normalize_emotion(strategy)
+
+    # CoT: reasoning を strategy に埋め込む（戻り値型を維持するため）
+    if reasoning and isinstance(reasoning, str):
+        if isinstance(strategy, dict):
+            strategy = dict(strategy)
+            strategy["_reasoning"] = reasoning
+        else:
+            strategy = {"_reasoning": reasoning}
 
     action = _convert_action(action_data, player_id, phase)
     return strategy, action

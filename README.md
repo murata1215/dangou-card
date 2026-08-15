@@ -40,6 +40,26 @@ config = GameConfig.default_12()  # 12人版（テスト大会用）
 config = GameConfig(survival_cash=2_000_000)  # カスタム
 ```
 
+## LLMトライアル実行（本番API）
+
+`scripts/llm_trial.py` を直接フォアグラウンド実行すると、Claude/DevRelayセッションのタイムアウトで長時間試合が巻き込まれてkillされることがある。12ラウンドフル試合など時間のかかるトライアルは、必ずデタッチ起動ラッパーを使うこと。
+
+```bash
+# デタッチ起動（setsid nohup で親プロセスから完全に切り離す）
+bash scripts/run_trial.sh --phase C --ruleset S2 --roster "M3,M3,M3,L2,L2,L2,M6,M6,M6" --games 1 --seed 504
+
+# 進行確認（最新トライアルのラウンド・完了状態・PID生存・座席マップ・ログ末尾を表示）
+bash scripts/check_trial.sh
+```
+
+CoT (Chain-of-Thought) を有効化する場合は `--cot` フラグを追加する（LLM応答JSONに `reasoning` フィールドを要求。デフォルト無効）。
+
+```bash
+bash scripts/run_trial.sh --phase C --ruleset S2 --roster "..." --cot --rounds 1 --games 1 --seed 600
+```
+
+`--rounds N` でラウンド数を打ち切ることができ、スモークテスト等の低コスト確認に使う。
+
 ## JSONLイベント仕様
 
 `logs/` にJSONL形式で全イベントを出力。各行は1イベント:

@@ -686,7 +686,8 @@ function renderSituation() {
     const winners = (m.winners || []).map(w => `<span class="card-chip">${pidLabel(w)}</span>`).join('');
     const pay = (m.prize_per_winner != null) ? `<span class="sit-win">各 +${yen(m.prize_per_winner)}</span>` : '';
     const part = (m.participants != null) ? ` / 参加${m.participants}` : '';
-    mHtml += `<div class="sit-row"><b>${m.market_id}</b> 賞金 ${yen(m.prize_pool)}${part}`
+    const surge = m.surged ? ' <span class="sit-surge">高騰×2</span>' : '';
+    mHtml += `<div class="sit-row"><b>${m.market_id}</b> 賞金 ${yen(m.prize_pool)}${surge}${part}`
       + (winners ? `<br>勝者 ${winners} ${pay}` : ' <span class="sit-muted">（結果待ち）</span>') + '</div>';
   });
   mHtml += '</div>';

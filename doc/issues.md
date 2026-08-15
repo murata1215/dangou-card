@@ -40,4 +40,14 @@
 - [x] R7全滅バグ: type_b_card義務のdetailsキー不一致（"card" vs "card_rank"）で正しくカードを出しても契約違反判定される致命バグを特定・修正（2026-08-15）
 - [x] 契約義務の可視化: 署名済み未履行義務を毎プロンプトに注入し帳簿ミス由来の脱落を防止（2026-08-15）
 - [x] 最終市場3倍ルールの周知漏れ: RULES_SUMMARYに条件付き表示で追記（2026-08-15）
-- [ ] R12 AUTO_COMMIT_FAILURE調査: seed=502試行でP02/P07がR12で `cards_destroyed: 0` のままAUTO_COMMIT_FAILUREし脱落。手札1枚残っているはずが `compute_legal_commits()` が空を返す原因不明（カードトレード後のhand更新バグの可能性）。別タスクで詳細調査が必要
+- [x] R12 AUTO_COMMIT_FAILURE調査: 原因はカードトレード後のcard_id重複（全プレイヤーが同一card_id体系のデッキを持つため、トレードで受け取ったカードのcard_idが既存手札と衝突し、`use_card()`の全除去ロジックで1枚使用時に2枚消滅していた）。`engine/player.py`の`use_card()`/`swap_card()`を修正し、seed=502クリーン再走で再発なしを確認（2026-08-16）
+- [x] コスト表示単価の過小（Gemini）: Gemini 3.5 Flash/Flash-Liteの単価が旧世代(2.5)のまま10〜15倍過小だった問題を発見・是正（2026-08-16、`doc/changelog.md`参照）
+- [ ] Gemini thinkingトークンの計上漏れ疑い: Gemini 3.5 Flashの出力単価はthinkingトークン込みだが、`llm/adapters.py`は`completion_tokens`のみをキャプチャしており、実際のGoogle請求と乖離している可能性がある。別タスクで実請求と突き合わせて要検証
+- [ ] Claude Sonnet 5 (M1) の単価も要確認: $2.00/$10.00で登録されているが実勢は$3.00/$15.00の可能性（今回のロスター外のため未修正、Sonnet 5投入時に要再確認）
+- [x] セッションタイムアウトによる長時間試合の停止: Claude/DevRelayセッションのSIGALRMタイムアウトで子プロセスの`llm_trial.py`ごとkillされていた（seed=504のR10停止）。`scripts/run_trial.sh`のデタッチ起動ラッパーで解消（2026-08-16）
+
+## CoT (Chain-of-Thought) メモ
+
+- [x] CoT(A)実装: `enable_cot`フラグでLLM応答JSONに`reasoning`フィールドを追加。情報リーク防止（他プレイヤー・イベントログへの非公開）をテスト3件で担保（2026-08-16）
+- [x] CoTスモークテスト: 6ベンダー混合・S2・R1打ち切り（seed=601, コスト$0.36）で全6ベンダーがreasoningを正常出力、リーク0件を確認（2026-08-16）
+- [ ] CoT ON/OFF比較実験: 同一モデルでのCoT有無による生還率・意思決定品質の因果効果を測定するフル試合実験が未実施。次タスク候補

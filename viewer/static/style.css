@@ -386,6 +386,7 @@ body {
   background: var(--input-bg); color: var(--text); font-family: monospace; font-size: 11px;
 }
 .sit-win { color: var(--cash); font-weight: bold; }
+.sit-surge { color: #ff6b35; font-weight: bold; font-size: 0.85em; }
 .sit-ok { color: #5cc98a; font-weight: bold; }
 .sit-debt { color: var(--pid-alt); }
 .sit-elim { color: var(--text-muted); }

@@ -110,8 +110,14 @@ def use_card(player: PlayerState, card: Card) -> PlayerState:
     Raises:
         ValueError: 指定カードが手札にない場合
     """
-    new_hand = [c for c in player.hand if c.card_id != card.card_id]
-    if len(new_hand) == len(player.hand):
+    found = False
+    new_hand = []
+    for c in player.hand:
+        if c.card_id == card.card_id and not found:
+            found = True
+            continue
+        new_hand.append(c)
+    if not found:
         raise ValueError(f"{player.player_id} does not have card {card.card_id}")
     new_used = list(player.used_cards) + [card]
     return player.model_copy(update={"hand": new_hand, "used_cards": new_used})
@@ -210,7 +216,16 @@ def swap_card(player: PlayerState, give_card: Card, receive_card: Card) -> Playe
     new_hand = [c for c in player.hand if c.card_id != give_card.card_id]
     if len(new_hand) == len(player.hand):
         raise ValueError(f"{player.player_id} does not have card {give_card.card_id}")
-    new_hand.append(receive_card)
+    # card_id 衝突回避: 受け取りカードの ID が手札内で重複する場合はサフィックスで一意化
+    actual_card = receive_card
+    if any(c.card_id == receive_card.card_id for c in new_hand):
+        new_id = f"{receive_card.card_id}_t"
+        counter = 2
+        while any(c.card_id == new_id for c in new_hand):
+            new_id = f"{receive_card.card_id}_t{counter}"
+            counter += 1
+        actual_card = Card(rank=receive_card.rank, card_id=new_id)
+    new_hand.append(actual_card)
     return player.model_copy(update={"hand": new_hand})
 
 

@@ -68,10 +68,13 @@ class LLMAgent(PlayerAgent):
         self._current_round: int = 0
 
     def _update_last_log_emotion(self, strategy: dict[str, Any]) -> None:
-        """strategyからemotionを抽出し、llm_loggerの最新エントリに後付けする"""
+        """strategyからemotion・reasoningを抽出し、llm_loggerの最新エントリに後付けする"""
         emotion = strategy.get("emotion", "平静") if isinstance(strategy, dict) else "平静"
+        reasoning = strategy.get("_reasoning") if isinstance(strategy, dict) else None
         if self.llm_logger._entries:
             self.llm_logger._entries[-1]["emotion"] = emotion
+            if reasoning is not None:
+                self.llm_logger._entries[-1]["reasoning"] = reasoning
 
     def _call_llm(
         self,
