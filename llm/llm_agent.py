@@ -119,6 +119,8 @@ class LLMAgent(PlayerAgent):
             self.model_info,
             usage.get("input_tokens", 0),
             usage.get("output_tokens", 0),
+            cache_read_input_tokens=usage.get("cache_read_input_tokens", 0),
+            total_tokens=usage.get("total_tokens", 0),
         )
 
         finish_reason = usage.get("finish_reason")

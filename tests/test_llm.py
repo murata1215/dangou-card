@@ -1138,3 +1138,125 @@ class TestLoggerNewFields:
             assert parsed["usage_raw"]["completion_tokens_details"]["reasoning_tokens"] == 30
 
             logger.close()
+
+
+class TestEstimateCostV2:
+    """Stage 2: estimate_cost のキャッシュ割引・thinking内訳対応のテスト"""
+
+    def test_cache_discount_deepseek(self):
+        """キャッシュヒットでinputコストが割引されること（DeepSeek V4 Flash）"""
+        from llm.models import MODEL_REGISTRY, estimate_cost
+        model = MODEL_REGISTRY["M6"]  # DeepSeek V4 Flash
+        # input=1000, うち cached=800 → uncached=200
+        cost_with_cache = estimate_cost(model, input_tokens=1000, output_tokens=100,
+                                        cache_read_input_tokens=800)
+        # uncached: 200 * 0.14 + cached: 800 * 0.0028 + output: 100 * 0.28 = 28 + 2.24 + 28 = 58.24
+        expected = (200 * 0.14 + 800 * 0.0028 + 100 * 0.28) / 1_000_000
+        assert abs(cost_with_cache - expected) < 1e-12
+
+        # キャッシュなしの場合
+        cost_no_cache = estimate_cost(model, input_tokens=1000, output_tokens=100)
+        expected_no_cache = (1000 * 0.14 + 100 * 0.28) / 1_000_000
+        assert abs(cost_no_cache - expected_no_cache) < 1e-12
+
+        # キャッシュありの方が安いこと
+        assert cost_with_cache < cost_no_cache
+
+    def test_cache_discount_gpt41_mini(self):
+        """GPT-4.1 Mini のキャッシュ割引"""
+        from llm.models import MODEL_REGISTRY, estimate_cost
+        model = MODEL_REGISTRY["L2"]  # GPT-4.1 Mini: input=0.40, cached=0.10
+        cost = estimate_cost(model, input_tokens=3000, output_tokens=400,
+                             cache_read_input_tokens=1000)
+        # uncached: 2000*0.40 + cached: 1000*0.10 + output: 400*1.60
+        expected = (2000 * 0.40 + 1000 * 0.10 + 400 * 1.60) / 1_000_000
+        assert abs(cost - expected) < 1e-12
+
+    def test_gemini_thinking_adds_cost(self):
+        """Gemini: total > input+output のとき separate_thinking が加算されること"""
+        from llm.models import MODEL_REGISTRY, estimate_cost
+        model = MODEL_REGISTRY["M3"]  # Gemini 3.5 Flash: output_price=9.00
+        # input=2000, output=500, total=2800 → thinking=300
+        cost_with_thinking = estimate_cost(model, input_tokens=2000, output_tokens=500,
+                                           total_tokens=2800)
+        cost_no_thinking = estimate_cost(model, input_tokens=2000, output_tokens=500,
+                                         total_tokens=2500)  # total = input+output
+        # 差分 = 300 * 9.00 / 1e6 = 0.0027
+        thinking_diff = cost_with_thinking - cost_no_thinking
+        expected_diff = 300 * 9.00 / 1_000_000
+        assert abs(thinking_diff - expected_diff) < 1e-12
+        assert cost_with_thinking > cost_no_thinking
+
+    def test_no_double_counting_openai(self):
+        """OpenAI系: total = input+output のとき thinking=0 で従来と同額"""
+        from llm.models import MODEL_REGISTRY, estimate_cost
+        model = MODEL_REGISTRY["M2"]  # GPT-4.1
+        input_t, output_t = 2000, 600
+        # total = input + output → separate_thinking = 0
+        cost_new = estimate_cost(model, input_tokens=input_t, output_tokens=output_t,
+                                 total_tokens=input_t + output_t)
+        # 旧計算（total_tokens=0 → input+output で代用）
+        cost_old = estimate_cost(model, input_tokens=input_t, output_tokens=output_t)
+        assert abs(cost_new - cost_old) < 1e-12
+        # 手計算と一致
+        expected = (2000 * 2.0 + 600 * 8.0) / 1_000_000
+        assert abs(cost_new - expected) < 1e-12
+
+    def test_grok43_confirmed_price(self):
+        """Grok 4.3 の単価が確定値であること"""
+        from llm.models import MODEL_REGISTRY
+        model = MODEL_REGISTRY["L4"]
+        assert model.input_price == 1.25
+        assert model.output_price == 2.50
+        assert model.cached_input_price == 0.20
+
+    def test_deepseek_v4_flash_model_id(self):
+        """DeepSeek M6/L6 の model_id が deepseek-v4-flash であること"""
+        from llm.models import MODEL_REGISTRY
+        assert MODEL_REGISTRY["M6"].model_id == "deepseek-v4-flash"
+        assert MODEL_REGISTRY["L6"].model_id == "deepseek-v4-flash"
+        assert MODEL_REGISTRY["M6"].input_price == 0.14
+        assert MODEL_REGISTRY["M6"].output_price == 0.28
+        assert MODEL_REGISTRY["M6"].cached_input_price == 0.0028
+
+    def test_backward_compat_no_extra_args(self):
+        """新引数なしの呼び出しが従来と同じ結果を返すこと"""
+        from llm.models import ModelInfo, estimate_cost
+        model = ModelInfo(
+            model_id="test", provider="Test", name="Test",
+            adapter_type="openai_compat", input_price=1.0, output_price=5.0,
+            env_key="TEST_KEY", base_url=None,
+        )
+        cost = estimate_cost(model, 1000, 200)
+        expected = (1000 * 1.0 + 200 * 5.0) / 1_000_000
+        assert abs(cost - expected) < 1e-12
+
+    def test_cached_input_price_none_defaults_to_input(self):
+        """cached_input_price=None のとき input_price と同値で計算されること"""
+        from llm.models import ModelInfo, estimate_cost
+        model = ModelInfo(
+            model_id="test", provider="Test", name="Test",
+            adapter_type="openai_compat", input_price=2.0, output_price=5.0,
+            env_key="TEST_KEY", base_url=None,
+            # cached_input_price=None (default)
+        )
+        # cache_read があっても input_price で計算される（割引なし=安全側）
+        cost = estimate_cost(model, 1000, 200, cache_read_input_tokens=500)
+        expected = (1000 * 2.0 + 200 * 5.0) / 1_000_000  # 500*2.0 + 500*2.0 = 1000*2.0
+        assert abs(cost - expected) < 1e-12
+
+    def test_logger_total_tokens_field(self):
+        """ログエントリに total_tokens が記録されること"""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            logger = LLMLogger(tmpdir, game_id="test_tt")
+            logger.log_call(
+                player_id="P01", model_id="test", phase="negotiation",
+                round_num=1, turn=1, system_prompt="sys", user_prompt="user",
+                response_text="resp",
+                usage={"input_tokens": 100, "output_tokens": 50, "total_tokens": 180},
+                cost=0.01, elapsed_ms=100,
+            )
+            entry = logger._entries[-1]
+            assert entry["total_tokens"] == 180
+            logger.close()

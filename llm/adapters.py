@@ -149,9 +149,12 @@ class AnthropicAdapter:
                 # thinking_tokens を捕捉（Sonnet 5 等の extended thinking 用）
                 # Anthropic SDK: output_tokens_details.thinking_tokens → 統一キー reasoning_tokens
                 _otd = getattr(response.usage, "output_tokens_details", None)
+                _input_t = response.usage.input_tokens
+                _output_t = response.usage.output_tokens
                 usage = {
-                    "input_tokens": response.usage.input_tokens,
-                    "output_tokens": response.usage.output_tokens,
+                    "input_tokens": _input_t,
+                    "output_tokens": _output_t,
+                    "total_tokens": _input_t + _output_t,  # Anthropic: thinking は output_tokens に含まれる
                     "cache_creation_input_tokens": getattr(response.usage, "cache_creation_input_tokens", 0) or 0,
                     "cache_read_input_tokens": getattr(response.usage, "cache_read_input_tokens", 0) or 0,
                     "reasoning_tokens": getattr(_otd, "thinking_tokens", 0) or 0,
@@ -255,6 +258,7 @@ class OpenAICompatAdapter:
                 usage = {
                     "input_tokens": getattr(response.usage, "prompt_tokens", 0) or 0,
                     "output_tokens": getattr(response.usage, "completion_tokens", 0) or 0,
+                    "total_tokens": getattr(response.usage, "total_tokens", 0) or 0,  # Gemini: thinking が completion に含まれない場合 total > input+output
                     "cache_read_input_tokens": getattr(_ptd, "cached_tokens", 0) or 0,
                     "cache_creation_input_tokens": getattr(_ptd, "cache_write_tokens", 0) or 0,
                     "reasoning_tokens": getattr(_ctd, "reasoning_tokens", 0) or 0,

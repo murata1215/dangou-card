@@ -69,3 +69,30 @@
 
 ## 新規エントリ
 
+- 2026-08-16 10:03 JST | コストログ化 Stage 2: 単価表拡張・estimate_cost内訳対応・確定単価反映
+
+### 2026-08-16 10:03 JST | コストログ化 Stage 2: 単価表拡張・estimate_cost内訳対応・確定単価反映
+
+Stage 1 で捕捉したトークン内訳（cached/reasoning/total）を活用し、コスト計算を正確化した。
+
+**確定した単価ズレと是正:**
+- Grok 4.3（L4）: input 0.60→1.25、output 3.00→2.50（xAI料金表 2026-08-16準拠）
+- DeepSeek（M6, L6）: 実測で `deepseek-chat` が `deepseek-v4-flash` にリダイレクトされていたため、model_id を変更。単価も V3→V4 Flash（input 0.27→0.14、output 1.10→0.28）に是正
+- 各社 cached_input_price を設定（DeepSeek 0.0028、Haiku 0.10、GPT-4.1 Mini 0.10、GPT-4.1 0.50、Grok 4.5 0.30、Grok 4.3 0.20）
+
+**ModelInfo 拡張:**
+- `cached_input_price`（キャッシュヒット入力単価、None→input同値=割引なし）
+- `reasoning_price`（thinkingトークン単価、None→output同値）
+
+**estimate_cost 内訳対応:**
+- キャッシュ割引: uncached_input × input_price + cached × cached_input_price
+- thinking 二重計上防止: `separate_thinking = max(0, total_tokens - input - output)` 方式
+  - OpenAI系: reasoning は completion_tokens に含まれる → separate_thinking=0（自動的に二重計上なし）
+  - Gemini系: completion に thinking が含まれない → 差分が thinking として加算される
+  - Anthropic: thinking は output_tokens に含まれる → total=input+output → separate_thinking=0
+- 後方互換: 新引数はすべてデフォルト値付き。外部スクリプトは変更不要
+
+**テスト:** 9件追加（TestEstimateCostV2）、全341テスト PASSED
+
+**次段:** Stage 3（試合サマリー・ビューワー内訳パネル）
+
