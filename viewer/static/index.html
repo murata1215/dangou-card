@@ -126,6 +126,14 @@
   </div>
 </div>
 
+<div class="modal-overlay" id="cost-modal-overlay">
+  <div class="modal cost-modal">
+    <span class="close" id="cost-modal-close">&times;</span>
+    <h2>Cost Breakdown</h2>
+    <div id="cost-modal-body"></div>
+  </div>
+</div>
+
 <script>
 // === 談合カード 観戦ビューア JS ===
 let currentGame = null; // {trial_dir, game_id}
@@ -269,7 +277,11 @@ function renderState(state) {
   // ヘッダ
   document.getElementById('round-info').textContent = `R${state.current_round}/${state.total_rounds}`;
   document.getElementById('survivor-info').textContent = `生存 ${state.survivors}/${state.players.length}`;
-  document.getElementById('cost-info').textContent = `$${state.total_cost.toFixed(4)}`;
+  const costEl = document.getElementById('cost-info');
+  costEl.textContent = `$${state.total_cost.toFixed(4)}`;
+  costEl.style.cursor = 'pointer';
+  costEl.title = 'Click for cost breakdown';
+  costEl.onclick = () => openCostModal();
 
   // グリッド
   const grid = document.getElementById('player-grid');
@@ -328,7 +340,7 @@ function renderState(state) {
           <span>DM:${p.stats.dm_count} BC:${p.stats.broadcast_count}</span>
           <span>ERR:${p.stats.errors}</span>
         </span>
-        <span class="stats-cost">$${p.stats.cost.toFixed(4)}</span>
+        <span class="stats-cost">$${p.stats.cost.toFixed(4)}${p.stats.thinking_tokens > 0 ? ` <span class="thinking-badge" title="Thinking tokens">\u{1F9E0}${Math.round(p.stats.thinking_tokens/1000)}k</span>` : ''}</span>
       </div>
     `;
     panel.addEventListener('click', () => openTimeline(p.player_id, p.model_name));
@@ -401,6 +413,81 @@ document.getElementById('modal-close').addEventListener('click', () => {
 document.getElementById('modal-overlay').addEventListener('click', (e) => {
   if (e.target === e.currentTarget) {
     document.getElementById('modal-overlay').classList.remove('active');
+  }
+});
+
+// --- コスト内訳モーダル ---
+async function openCostModal() {
+  if (!currentGame) return;
+  const url = `api/games/${currentGame.trial_dir}/${currentGame.game_id}/cost`;
+  try {
+    const res = await fetch(url);
+    const data = await res.json();
+    const body = document.getElementById('cost-modal-body');
+
+    let html = '<h3>Model Breakdown</h3>';
+    html += '<table class="cost-table"><thead><tr><th>Model</th><th>Calls</th><th>Input</th><th>Cached</th><th>Output</th><th class="thinking-col">Thinking</th><th>Cost</th></tr></thead><tbody>';
+    const models = Object.values(data.by_model).sort((a,b) => b.cost_total - a.cost_total);
+    let totalCalls=0, totalIn=0, totalCached=0, totalOut=0, totalThink=0;
+    for (const m of models) {
+      totalCalls += m.calls; totalIn += m.input_tokens; totalCached += m.cache_read_tokens;
+      totalOut += m.output_tokens; totalThink += m.thinking_tokens;
+      html += `<tr>
+        <td>${escapeHtml(m.name)}</td>
+        <td class="num">${m.calls}</td>
+        <td class="num">${fmtK(m.input_tokens)}</td>
+        <td class="num">${m.cache_read_tokens ? fmtK(m.cache_read_tokens) : '-'}</td>
+        <td class="num">${fmtK(m.output_tokens)}</td>
+        <td class="num thinking-col">${m.thinking_tokens ? fmtK(m.thinking_tokens) : '-'}</td>
+        <td class="num">$${m.cost_total.toFixed(4)}</td>
+      </tr>`;
+    }
+    html += `<tr class="total-row">
+      <td><b>Total</b></td>
+      <td class="num"><b>${totalCalls}</b></td>
+      <td class="num"><b>${fmtK(totalIn)}</b></td>
+      <td class="num"><b>${totalCached ? fmtK(totalCached) : '-'}</b></td>
+      <td class="num"><b>${fmtK(totalOut)}</b></td>
+      <td class="num thinking-col"><b>${totalThink ? fmtK(totalThink) : '-'}</b></td>
+      <td class="num"><b>$${data.total_cost.toFixed(4)}</b></td>
+    </tr>`;
+    html += '</tbody></table>';
+
+    html += '<h3>Player Breakdown</h3>';
+    html += '<table class="cost-table"><thead><tr><th>Player</th><th>Model</th><th>Calls</th><th>In/Out/Think</th><th>Cost</th></tr></thead><tbody>';
+    const players = Object.entries(data.by_player).sort((a,b) => b[1].cost_total - a[1].cost_total);
+    for (const [pid, p] of players) {
+      const tokStr = `${fmtK(p.input_tokens)}/${fmtK(p.output_tokens)}${p.thinking_tokens ? '/'+fmtK(p.thinking_tokens) : ''}`;
+      html += `<tr>
+        <td>${pid}</td>
+        <td>${escapeHtml(p.model_name)}</td>
+        <td class="num">${p.calls}</td>
+        <td class="num">${tokStr}</td>
+        <td class="num">$${p.cost_total.toFixed(4)}</td>
+      </tr>`;
+    }
+    html += '</tbody></table>';
+    html += `<div class="cost-total">Total: <b>$${data.total_cost.toFixed(4)}</b> (approx. &yen;${Math.round(data.total_cost_jpy).toLocaleString()})</div>`;
+
+    body.innerHTML = html;
+    document.getElementById('cost-modal-overlay').classList.add('active');
+  } catch (e) {
+    console.error('openCostModal error:', e);
+  }
+}
+
+function fmtK(n) {
+  if (n >= 1_000_000) return (n/1_000_000).toFixed(1) + 'M';
+  if (n >= 1_000) return (n/1_000).toFixed(1) + 'k';
+  return String(n);
+}
+
+document.getElementById('cost-modal-close').addEventListener('click', () => {
+  document.getElementById('cost-modal-overlay').classList.remove('active');
+});
+document.getElementById('cost-modal-overlay').addEventListener('click', (e) => {
+  if (e.target === e.currentTarget) {
+    document.getElementById('cost-modal-overlay').classList.remove('active');
   }
 });
 

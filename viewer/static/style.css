@@ -405,3 +405,25 @@ body {
 .ob-b { color: var(--action-type); border-color: var(--action-type); } /* 型B=行動 */
 .ob-round { color: var(--text-muted); font-size: 11px; margin-left: 4px; }
 .ob-none { font-size: 12px; padding: 2px 0; }
+
+/* コスト内訳モーダル */
+.cost-modal { max-width: 850px; }
+.cost-modal h3 { font-size: 14px; color: var(--accent); margin: 14px 0 6px; }
+.cost-table {
+  width: 100%; border-collapse: collapse; font-size: 12px; margin-bottom: 8px;
+}
+.cost-table th {
+  text-align: left; padding: 4px 8px; border-bottom: 2px solid var(--border);
+  color: var(--text-secondary); font-weight: 600; font-size: 11px;
+}
+.cost-table td { padding: 3px 8px; border-bottom: 1px solid var(--border); }
+.cost-table .num { text-align: right; font-family: monospace; }
+.cost-table .total-row td { border-top: 2px solid var(--border-accent); }
+.cost-table .thinking-col { color: #ff9800; }
+.cost-total {
+  text-align: right; font-size: 14px; margin-top: 10px; color: var(--cash);
+}
+.thinking-badge {
+  font-size: 10px; color: #ff9800; margin-left: 2px; white-space: nowrap;
+}
+#cost-info:hover { text-decoration: underline; color: var(--cash); }

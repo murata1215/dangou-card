@@ -213,6 +213,10 @@ def get_game_state(logs_dir: Path, trial_dir_name: str, game_id: str) -> dict[st
         cost = 0.0
         dm_count = 0
         bc_count = 0
+        input_tokens_total = 0
+        output_tokens_total = 0
+        cache_read_total = 0
+        total_tokens_total = 0
         latest_round = 0
         latest_phase = ""
         latest_ts = ""
@@ -221,6 +225,11 @@ def get_game_state(logs_dir: Path, trial_dir_name: str, game_id: str) -> dict[st
 
         for e in entries:
             cost += e.get("cost_usd", 0)
+            input_tokens_total += e.get("input_tokens", 0) or 0
+            output_tokens_total += e.get("output_tokens", 0) or 0
+            cache_read_total += e.get("cache_read_input_tokens", 0) or 0
+            _tt = e.get("total_tokens", 0) or 0
+            total_tokens_total += _tt if _tt > 0 else ((e.get("input_tokens", 0) or 0) + (e.get("output_tokens", 0) or 0))
             rnd = e.get("round_num", 0)
             if rnd > latest_round:
                 latest_round = rnd
@@ -301,6 +310,10 @@ def get_game_state(logs_dir: Path, trial_dir_name: str, game_id: str) -> dict[st
                 "dm_count": dm_count,
                 "broadcast_count": bc_count,
                 "last_active_sec_ago": last_active_sec,
+                "input_tokens": input_tokens_total,
+                "output_tokens": output_tokens_total,
+                "cache_read_tokens": cache_read_total,
+                "thinking_tokens": max(0, total_tokens_total - input_tokens_total - output_tokens_total),
             },
         })
 
@@ -806,3 +819,120 @@ def get_round_states(
             }
 
     return result
+
+
+def get_cost_breakdown(
+    logs_dir: Path, trial_dir_name: str, game_id: str,
+) -> dict[str, Any]:
+    """
+    モデル別・プレイヤー別のコスト内訳を返す。
+
+    Stage 2 の estimate_cost() を使い、キャッシュ割引・thinking内訳を正確に反映。
+    reasoning テキストは一切含めない（秘匿維持）。
+    """
+    from llm.models import ModelInfo, estimate_cost, MODEL_REGISTRY
+
+    # model_id → ModelInfo のルックアップ（レジストリから）
+    _model_by_id: dict[str, ModelInfo] = {}
+    for mi in MODEL_REGISTRY.values():
+        _model_by_id[mi.model_id] = mi
+
+    trial_dir = logs_dir / trial_dir_name
+    llm_logs_dir = trial_dir / "llm_logs"
+    seat_map = _load_seat_map(trial_dir, game_id)
+
+    by_model: dict[str, dict[str, Any]] = {}
+    by_player: dict[str, dict[str, Any]] = {}
+    total_cost = 0.0
+
+    if not llm_logs_dir.exists():
+        return {"by_model": {}, "by_player": {}, "total_cost": 0.0, "total_cost_jpy": 0}
+
+    for lf in sorted(llm_logs_dir.glob(f"{game_id}_*_llm_calls.jsonl")):
+        pid = lf.stem.split("_")[1] if "_" in lf.stem else "?"
+        entries = _cache.get_entries(lf)
+        if not entries:
+            continue
+
+        model_id = entries[0].get("model_id", "unknown")
+        model_name = seat_map.get(pid, model_id)
+
+        # プレイヤー集計の初期化
+        p_data = by_player.setdefault(pid, {
+            "model_id": model_id,
+            "model_name": model_name,
+            "calls": 0,
+            "cost_total": 0.0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "thinking_tokens": 0,
+        })
+
+        for e in entries:
+            inp = e.get("input_tokens", 0) or 0
+            out = e.get("output_tokens", 0) or 0
+            cached = e.get("cache_read_input_tokens", 0) or 0
+            tt = e.get("total_tokens", 0) or 0
+            thinking = max(0, (tt if tt > 0 else (inp + out)) - inp - out)
+
+            # コスト再計算: ModelInfo があれば estimate_cost、なければログの cost_usd
+            mi = _model_by_id.get(model_id)
+            if mi:
+                cost = estimate_cost(mi, inp, out, cache_read_input_tokens=cached, total_tokens=tt)
+            else:
+                cost = e.get("cost_usd", 0) or 0
+
+            # モデル別集計
+            m_data = by_model.setdefault(model_id, {
+                "name": model_name,
+                "calls": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_tokens": 0,
+                "thinking_tokens": 0,
+                "cost_input": 0.0,
+                "cost_output": 0.0,
+                "cost_thinking": 0.0,
+                "cost_total": 0.0,
+            })
+            m_data["calls"] += 1
+            m_data["input_tokens"] += inp
+            m_data["output_tokens"] += out
+            m_data["cache_read_tokens"] += cached
+            m_data["thinking_tokens"] += thinking
+            m_data["cost_total"] += cost
+
+            # 入力/出力/thinking の内訳コスト
+            if mi:
+                eff_cached_price = mi.cached_input_price if mi.cached_input_price is not None else mi.input_price
+                eff_reasoning_price = mi.reasoning_price if mi.reasoning_price is not None else mi.output_price
+                m_data["cost_input"] += ((inp - cached) * mi.input_price + cached * eff_cached_price) / 1_000_000
+                m_data["cost_output"] += (out * mi.output_price) / 1_000_000
+                m_data["cost_thinking"] += (thinking * eff_reasoning_price) / 1_000_000
+
+            # プレイヤー集計
+            p_data["calls"] += 1
+            p_data["cost_total"] += cost
+            p_data["input_tokens"] += inp
+            p_data["output_tokens"] += out
+            p_data["cache_read_tokens"] += cached
+            p_data["thinking_tokens"] += thinking
+
+            total_cost += cost
+
+    # 丸め
+    for m in by_model.values():
+        m["cost_total"] = round(m["cost_total"], 6)
+        m["cost_input"] = round(m["cost_input"], 6)
+        m["cost_output"] = round(m["cost_output"], 6)
+        m["cost_thinking"] = round(m["cost_thinking"], 6)
+    for p in by_player.values():
+        p["cost_total"] = round(p["cost_total"], 6)
+
+    return {
+        "by_model": by_model,
+        "by_player": by_player,
+        "total_cost": round(total_cost, 6),
+        "total_cost_jpy": round(total_cost * 150, 0),
+    }

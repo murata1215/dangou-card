@@ -1260,3 +1260,110 @@ class TestEstimateCostV2:
             entry = logger._entries[-1]
             assert entry["total_tokens"] == 180
             logger.close()
+
+
+class TestCostBreakdown:
+    """Stage 3: コスト内訳パネルのテスト"""
+
+    def _make_logs(self, tmp_path):
+        """テスト用のログファイルを作成"""
+        trial_dir = tmp_path / "trial_test_001"
+        llm_dir = trial_dir / "llm_logs"
+        llm_dir.mkdir(parents=True)
+
+        import json
+
+        # P01: gemini-3.5-flash (thinking あり: total > input + output)
+        entries_p01 = [
+            {"model_id": "gemini-3.5-flash", "cost_usd": 0.01,
+             "input_tokens": 2000, "output_tokens": 500, "total_tokens": 2800,
+             "cache_read_input_tokens": 0, "round_num": 1, "phase": "negotiation",
+             "timestamp": "2026-08-16T00:00:00Z", "response_text": "test",
+             "error": None, "elapsed_ms": 100},
+        ]
+        with open(llm_dir / "game01_P01_llm_calls.jsonl", "w") as f:
+            for e in entries_p01:
+                f.write(json.dumps(e) + "\n")
+
+        # P02: gpt-4.1-mini (cache あり、thinking なし: total = input + output)
+        entries_p02 = [
+            {"model_id": "gpt-4.1-mini", "cost_usd": 0.001,
+             "input_tokens": 3000, "output_tokens": 400, "total_tokens": 3400,
+             "cache_read_input_tokens": 1000, "round_num": 1, "phase": "negotiation",
+             "timestamp": "2026-08-16T00:01:00Z", "response_text": "test2",
+             "error": None, "elapsed_ms": 200},
+        ]
+        with open(llm_dir / "game01_P02_llm_calls.jsonl", "w") as f:
+            for e in entries_p02:
+                f.write(json.dumps(e) + "\n")
+
+        return tmp_path, "trial_test_001", "game01"
+
+    def test_cost_breakdown_aggregation(self, tmp_path):
+        """get_cost_breakdown() がモデル別・プレイヤー別に正しく集計すること"""
+        from viewer.log_parser import get_cost_breakdown
+        logs_dir, trial_dir, game_id = self._make_logs(tmp_path)
+
+        result = get_cost_breakdown(logs_dir, trial_dir, game_id)
+
+        # モデル別チェック
+        assert "gemini-3.5-flash" in result["by_model"]
+        gemini = result["by_model"]["gemini-3.5-flash"]
+        assert gemini["calls"] == 1
+        assert gemini["input_tokens"] == 2000
+        assert gemini["output_tokens"] == 500
+        assert gemini["thinking_tokens"] == 300  # 2800 - 2000 - 500
+        assert gemini["cost_thinking"] > 0  # thinking cost exists
+
+        assert "gpt-4.1-mini" in result["by_model"]
+        gpt = result["by_model"]["gpt-4.1-mini"]
+        assert gpt["cache_read_tokens"] == 1000
+        assert gpt["thinking_tokens"] == 0  # total = input + output
+
+        # プレイヤー別チェック
+        assert "P01" in result["by_player"]
+        assert result["by_player"]["P01"]["thinking_tokens"] == 300
+        assert "P02" in result["by_player"]
+        assert result["by_player"]["P02"]["cache_read_tokens"] == 1000
+
+        # 合計
+        assert result["total_cost"] > 0
+        assert result["total_cost_jpy"] > 0
+
+    def test_cost_breakdown_no_reasoning_text(self, tmp_path):
+        """get_cost_breakdown() にreasoning テキストが含まれないこと（秘匿維持）"""
+        from viewer.log_parser import get_cost_breakdown
+        logs_dir, trial_dir, game_id = self._make_logs(tmp_path)
+
+        result = get_cost_breakdown(logs_dir, trial_dir, game_id)
+
+        result_str = str(result)
+        assert "response_text" not in result_str
+        assert "reasoning_preview" not in result_str
+        # response_text の内容が混入していないこと
+        for model_data in result["by_model"].values():
+            assert "response_text" not in model_data
+            assert "reasoning" not in model_data
+        for player_data in result["by_player"].values():
+            assert "response_text" not in player_data
+            assert "reasoning" not in player_data
+
+    def test_stats_includes_token_breakdown(self, tmp_path):
+        """get_game_state() の stats にトークン内訳が含まれること"""
+        from viewer.log_parser import get_game_state
+        logs_dir, trial_dir, game_id = self._make_logs(tmp_path)
+
+        state = get_game_state(logs_dir, trial_dir, game_id)
+
+        for p in state["players"]:
+            stats = p["stats"]
+            assert "input_tokens" in stats
+            assert "output_tokens" in stats
+            assert "cache_read_tokens" in stats
+            assert "thinking_tokens" in stats
+            if p["player_id"] == "P01":
+                assert stats["thinking_tokens"] == 300
+                assert stats["input_tokens"] == 2000
+            elif p["player_id"] == "P02":
+                assert stats["cache_read_tokens"] == 1000
+                assert stats["thinking_tokens"] == 0

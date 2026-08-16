@@ -355,11 +355,15 @@ def generate_phase_c_report(
                 model = seat_map.get(p.player_id, "?")
                 lines.append(f"- {p.player_id} ({model}): Cash={p.cash:,}円")
 
-        # モデル別集計
+        # モデル別集計（Stage 3: トークン内訳付き）
         lines.append("\n### モデル別集計\n")
-        lines.append("| 座席 | モデル | JSON率 | AUTO | エラー | コール数 | コスト |")
-        lines.append("|---|---|---|---|---|---|---|")
+        lines.append("| 座席 | モデル | JSON率 | AUTO | ERR | Calls | Input | Output | Cache | Think | コスト |")
+        lines.append("|---|---|---|---|---|---|---|---|---|---|---|")
 
+        total_input = 0
+        total_output = 0
+        total_cache = 0
+        total_think = 0
         for agent in llm_agents:
             pid = agent.player_id
             model_name = seat_map.get(pid, "?")
@@ -369,7 +373,21 @@ def generate_phase_c_report(
             total_cost += cost
             # エラー数を集計
             errors = sum(1 for e in agent.llm_logger.entries if e.get("error"))
-            lines.append(f"| {pid} | {model_name} | {json_rate} ({pct:.0f}%) | {agent.auto_commit_count} | {errors} | {agent.total_calls} | ${cost:.4f} |")
+            # トークン内訳集計
+            inp_tok = sum(e.get("input_tokens", 0) or 0 for e in agent.llm_logger.entries)
+            out_tok = sum(e.get("output_tokens", 0) or 0 for e in agent.llm_logger.entries)
+            cache_tok = sum(e.get("cache_read_input_tokens", 0) or 0 for e in agent.llm_logger.entries)
+            tot_tok = sum((e.get("total_tokens", 0) or 0) or ((e.get("input_tokens", 0) or 0) + (e.get("output_tokens", 0) or 0)) for e in agent.llm_logger.entries)
+            think_tok = max(0, tot_tok - inp_tok - out_tok)
+            total_input += inp_tok
+            total_output += out_tok
+            total_cache += cache_tok
+            total_think += think_tok
+            def _fmtk(n: int) -> str:
+                if n >= 1_000_000: return f"{n/1_000_000:.1f}M"
+                if n >= 1_000: return f"{n/1_000:.0f}k"
+                return str(n)
+            lines.append(f"| {pid} | {model_name} | {json_rate} ({pct:.0f}%) | {agent.auto_commit_count} | {errors} | {agent.total_calls} | {_fmtk(inp_tok)} | {_fmtk(out_tok)} | {_fmtk(cache_tok) if cache_tok else '-'} | {_fmtk(think_tok) if think_tok else '-'} | ${cost:.4f} |")
 
         # 行動観察
         lines.append("\n### 行動観察\n")
@@ -438,11 +456,12 @@ def generate_phase_c_report(
 
     # 全体サマリ
     lines.append("## 全体サマリ\n")
-    lines.append(f"- 実コスト合計: **${total_cost:.4f}**")
+    lines.append(f"- 実コスト合計: **${total_cost:.4f}** (approx. ¥{total_cost * 150:,.0f})")
     total_calls = sum(a.total_calls for _, agents, _, _ in results for a in agents)
     total_valid = sum(a.valid_json_count for _, agents, _, _ in results for a in agents)
     lines.append(f"- 総コール数: {total_calls}")
     lines.append(f"- 有効JSON率: {total_valid}/{total_calls} ({total_valid / max(total_calls, 1) * 100:.0f}%)")
+    lines.append(f"- トークン合計: Input {total_input:,} / Output {total_output:,} / Cache {total_cache:,} / Thinking {total_think:,}")
     lines.append("")
 
     output_path.write_text("\n".join(lines), encoding="utf-8")

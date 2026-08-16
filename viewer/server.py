@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse
 
 from viewer.log_parser import (
     list_games, get_game_state, get_player_timeline, get_commentary,
-    get_round_states,
+    get_round_states, get_cost_breakdown,
 )
 
 # --- 環境変数による設定 ---
@@ -98,6 +98,12 @@ async def api_commentary(trial_dir: str, game_id: str, _=Depends(check_token)):
 async def api_rounds(trial_dir: str, game_id: str, _=Depends(check_token)):
     """ラウンド別の盤面状況を返す"""
     return get_round_states(LOGS_DIR, trial_dir, game_id)
+
+
+@app.get("/api/games/{trial_dir}/{game_id}/cost")
+async def api_cost_breakdown(trial_dir: str, game_id: str, _=Depends(check_token)):
+    """コスト内訳（モデル別・プレイヤー別）を返す"""
+    return get_cost_breakdown(LOGS_DIR, trial_dir, game_id)
 
 
 @app.get("/api/games/{trial_dir}/{game_id}/players/{pid}/timeline")
