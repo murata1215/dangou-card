@@ -196,6 +196,32 @@ class TestReflectionPhase:
         state = captured["P01"]
         assert any("山分けしよう" in m.get("message", "") for m in state["messages"])
 
+    def test_reflection_visible_state_hides_dm_from_non_party(self):
+        """§8.2是正: 非当事者のreflectionではDM本文が見えない（redactedのみ）"""
+        config = GameConfig.baseline_v1_s2(8).model_copy(update={"num_rounds": 5})
+        captured: dict[str, dict] = {}
+
+        class CapturingAgent(StubAgent):
+            def reflect(self, player_state, round_num, visible_state):
+                captured[player_state.player_id] = visible_state
+
+        agents = {f"P{i+1:02d}": CapturingAgent() for i in range(8)}
+        game = Game(config=config, agents=agents, seed=42, logger=EventLogger())
+        game._setup()
+        game._phase_market_open(1)
+        game._round_messages.append(
+            {"sender": "P01", "to": "P02", "type": "dm", "message": "M01で山分けしよう"}
+        )
+        pids = list(game.players)
+        hand = game.players[pids[0]].hand
+        game._current_commits = [_commit_for(pids[0], "M01", hand)]
+        game._phase_settlement(1)
+        game._phase_finance(1)
+        game._phase_reflection(1)
+
+        state = captured["P03"]
+        assert not any("山分けしよう" in m.get("message", "") for m in state["messages"])
+
 
 class TestReflectionPrompt:
     """build_reflection_prompt() の描画内容"""

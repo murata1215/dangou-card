@@ -57,3 +57,15 @@ Claude/DevRelayセッションはSIGALRMタイムアウトを持ち、フォア�
 参照するだけなので、reflect側で誤って空文字を書き込むと次ラウンド以降ずっと記憶が消えたまま気づかれない
 危険がある。担保テスト: `tests/test_memory.py::TestLLMAgentReflect`（`test_memory_preserved_on_api_failure` 等）・
 `TestMemorySecrecy`。
+
+## DM本文は当事者以外に対しキーごと削除する（`_visible_messages()`）
+
+`engine/game.py` の `_build_visible_state()` が返す `"messages"` は `_visible_messages(for_player_id)` を経由する。
+DM（`type == "dm"`）は送信者・宛先以外に対し **`message` キー自体を辞書から削除**して返す（`redacted: True`を付与）。
+空文字での上書きではなくキー欠落にしているのは、reasoning・memoryと同じ「構造的秘匿」パターンを踏襲するため
+（`str(state)` に本文が一切現れないことをテストで機械的に検証できる）。sender/to/turn等のメタデータは残すため、
+「密談が行われている事実」自体は非当事者にも見える。`for_player_id=None` で呼ばれた場合は誰とも一致しないため
+全DMが安全側（redacted）に倒れる。新しい可視化経路（ビューワーAPI・イベント種別・新プロンプトテンプレート等）
+を追加する際は `_round_messages` を生で（`_visible_messages()` を経由せず）他プレイヤー向け出力に混入させない
+こと。匿名通信（`anonymous_broadcast`）は本文は全員に公開するが `sender: None` で掲載者のみ秘匿する（§8.2）。
+担保テスト: `tests/test_dm_secrecy.py`（`TestFullScanNoLeak` が全プレイヤー横断の漏洩スキャンを行う）。

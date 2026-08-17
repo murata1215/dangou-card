@@ -361,10 +361,16 @@ class Game:
                     break
 
         elif isinstance(action, AnonymousBroadcastAction):
-            # 匿名通信
+            # 匿名通信（§7.1: 掲載者は秘匿、本文は全員に公開）
             p = player_ops.pay(p, self.config.anon_broadcast_fee)
             self.players[pid] = p
             self._anon_broadcast_counts[pid] = self._anon_broadcast_counts.get(pid, 0) + 1
+            self._round_messages.append({
+                "sender": None,  # §8.2: 匿名通信の掲載者は秘匿
+                "type": "anonymous_broadcast",
+                "message": action.message,
+                "turn": turn,
+            })
             self.logger.log("NEGOTIATION_ACTION", round_num, "negotiation", data={
                 "player_id": pid, "action": "anonymous_broadcast",
                 "success": True, "turn": turn,
@@ -599,7 +605,7 @@ class Game:
 
             # エージェントからCommit取得
             agent = self.agents[pid]
-            visible_state = self._build_visible_state(round_num)
+            visible_state = self._build_visible_state(round_num, for_player_id=pid)
 
             try:
                 commit_action = agent.commit(p, self._current_markets, round_num, visible_state)
@@ -832,11 +838,12 @@ class Game:
 
         # Step 2: 今ラウンドの勝者に倍掛け選択を提示（R12以外、R11が最後）
         if round_num < self.config.num_rounds:
-            visible_state = self._build_visible_state(round_num)
             for winner_id, prize_won in round_winners.items():
                 p = self.players[winner_id]
                 if not p.is_alive or prize_won <= 0:
                     continue
+
+                visible_state = self._build_visible_state(round_num, for_player_id=winner_id)
 
                 # 成功した倍掛けの2倍払い出し分は強制TAKE（連鎖禁止）
                 # → 元の市場賞金のみが倍掛け対象
@@ -944,6 +951,24 @@ class Game:
 
         return result
 
+    def _visible_messages(self, for_player_id: str | None) -> list[dict]:
+        """
+        §8.2: DM本文は秘匿情報。当事者（送信者・宛先）以外にはメタデータのみ返す。
+
+        for_player_id が None の場合（現状 commit/double_up フェイズの一部呼び出し）は
+        誰とも一致しないため、全DMが安全側（redacted）に倒れる。
+        broadcast・anonymous_broadcast は常に本文を含める（§8.1公開情報）。
+        """
+        out: list[dict] = []
+        for m in self._round_messages:
+            if m.get("type") == "dm" and for_player_id not in (m.get("sender"), m.get("to")):
+                redacted = {k: v for k, v in m.items() if k != "message"}
+                redacted["redacted"] = True
+                out.append(redacted)
+            else:
+                out.append(dict(m))
+        return out
+
     def _build_visible_state(self, round_num: int, for_player_id: str | None = None) -> dict:
         """
         公開情報の辞書を構築する（§8）
@@ -951,6 +976,7 @@ class Game:
         エージェントに渡す情報。秘匿情報は含まない。
         for_player_id が指定された場合、そのプレイヤーが当事者である
         提案中（PROPOSED）契約を contracts_pending に含める（§6.4: 内容は当事者のみ）。
+        DMの本文もfor_player_idが当事者の場合のみ含まれる（§8.2、_visible_messages参照）。
         """
         state = {
             "round_num": round_num,
@@ -987,7 +1013,7 @@ class Game:
                  "is_active": b.is_active}
                 for b in self.bounties
             ],
-            "messages": list(self._round_messages),
+            "messages": self._visible_messages(for_player_id),
             "double_ups": [
                 {"player_id": d.player_id, "deposit": d.deposit_amount,
                  "success_round": d.success_round}

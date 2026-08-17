@@ -209,7 +209,12 @@ def _render_message_list(
         text = msg.get("message", "")[:200]
         if mtype == "dm":
             to = msg.get("to", "?")
-            lines.append(f"  [{sender}→{to}] {text}")
+            if msg.get("redacted"):
+                lines.append(f"  [{sender}→{to}] （非公開のDM）")
+            else:
+                lines.append(f"  [{sender}→{to}] {text}")
+        elif mtype == "anonymous_broadcast":
+            lines.append(f"  [匿名] {text}")
         else:
             lines.append(f"  [{sender} 全体] {text}")
     return lines

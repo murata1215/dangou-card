@@ -1,5 +1,53 @@
 # Changelog
 
+## 2026-08-17: DM本文の秘匿化（§8.2是正）— 密談が全員に筒抜けだったバグの修正
+
+### 概要
+引き継ぎメモリ導入の調査中に、`_build_visible_state()`の`messages`フィールドが`for_player_id`を
+無視しており、**DM本文が全プレイヤーのプロンプトに`[P01→P02] 本文`として表示されていた**ことが
+判明した。仕様§8.2:450は「DM（direct message）内容」を秘匿情報と定義しており、
+`doc/turn_order_investigation.md`にも2026-08-14時点で既知の差異として記録されていたが未対応のまま
+放置されていた。本修正で構造的（reasoning/memoryと同様、エンジン内でキーごと削除）に是正した。
+
+このバグは前サイクルで導入した「引き継ぎメモリ」の意義にも直結する。DM本文が全員に見えている限り、
+各AIのmemoryは主観的記憶ではなく「全体の議事録の要約」にしかなり得なかった。本修正により初めて
+memoryが真に主観的な記憶として機能する。
+
+調査で以下の関連事実も判明:
+- Bot 8種は全種`DmAction`を一切使用しない（broadcastのみ）→ 本修正は`simulate.py`のBot統計に
+  構造的に影響しない（1000試合の平均生還者数0.07/8が修正前後で完全一致することを確認済み）
+- 匿名通信（`AnonymousBroadcastAction`）が`_round_messages`に積まれておらず、**本文が誰にも
+  届いていなかった**（§7.1の完全な機能不全。手数料だけ徴収されていた）
+- commit/double_upフェイズの`_build_visible_state()`呼び出しが`for_player_id`を渡しておらず、
+  `my_obligations`キーが生成されないため契約義務ブロックが常に空だった（§9.1:476「negotiation/
+  commit/double_upの3フェーズ全てに注入」という記述に対する実装漏れ）
+
+### 変更
+- **`engine/game.py`**: `_visible_messages(for_player_id)`を新設。DMは送信者・宛先以外に対し
+  `message`キーを辞書から削除し`redacted: True`を付与して返す（空文字での上書きではなくキー欠落。
+  reasoning/memoryと同じ「構造的秘匿」パターン）。sender/to/turn等のメタデータは残すため、
+  「密談が行われている事実」は非当事者にも観測できる（同盟の兆候を読む戦略性の追加）。
+  `for_player_id=None`（呼び出し側の既定）は誰とも一致しないため全DMが安全側（redacted）に倒れる。
+  `_build_visible_state()`の`"messages"`フィールドをこの関数経由に差し替え。
+  匿名通信を`_round_messages`に追加（`sender: None`で掲載者を秘匿しつつ本文は公開）。
+  commit（`_phase_commit`）・倍掛け選択（`_process_double_up`、勝者ループ内に移動）の
+  `_build_visible_state()`呼び出しに`for_player_id`を追加
+- **`llm/prompt_builder.py`**: `_render_message_list()`が`redacted`フラグを見て
+  `[P01→P02] （非公開のDM）`と描画（本文なし）。匿名通信は`[匿名] 本文`として描画（senderは出さない）
+- **`tests/test_dm_secrecy.py`（新規21件）**: 非当事者へのDM本文非開示・当事者への開示・
+  broadcast全員可視のリグレッション防止・redactedメタデータ保持・`for_player_id=None`の安全側
+  フォールバック・negotiation/commit/reflection各プロンプトへの非漏洩・全プレイヤー横断の
+  漏洩スキャン（`test_cot.py::TestCoTNoLeak`と同型）・匿名通信の配信と掲載者秘匿・
+  commit/double_upの`my_obligations`可視化を検証
+- **`tests/test_memory.py`（1件追加）**: reflectionフェイズでも非当事者にはDM本文が見えないことを検証
+
+### 影響
+- Bot戦（`simulate.py`）: DM未使用のため統計影響ゼロ（1000試合で完全一致を実測確認）
+- LLM戦: コール数・プロンプト構造は不変（メッセージ件数は変わらずメタデータのみ残るため、
+  `AUTO_PASS_ON_NO_NEWS`の判定ロジックへの影響なし）。DM本文が読めなくなる分、密談の再現性が
+  上がり、裏切り・同盟の検証可能性（memoryとの整合確認）が高まる
+- エンジンの賞金計算・契約判定ロジックは無変更
+
 ## 2026-08-17: 引き継ぎメモリ（Handover Memory）の導入 — AIに「1枚だけの記憶」を持たせる
 
 ### 概要
