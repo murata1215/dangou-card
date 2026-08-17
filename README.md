@@ -40,6 +40,16 @@ config = GameConfig.default_12()  # 12人版（テスト大会用）
 config = GameConfig(survival_cash=2_000_000)  # カスタム
 ```
 
+### 引き継ぎメモリ（Handover Memory）
+
+LLMコールは1-shotで会話履歴を持たず、チャット・戦略メモは毎ラウンド消えるため、標準構成のAIは
+前ラウンドの裏切り等を一切覚えていない。`config.memory_enabled=True`（S2プリセットのみ既定True）
+にすると、各ラウンド終了後（Settlement/Finance完了後）に専用のReflectionフェイズが走り、各AIへ
+「前ラウンドのmemory＋当ラウンドの会話・契約・結果」を材料に、次ラウンドへ持ち越す自由記述メモ
+（既定1000字、`memory_max_chars`で調整）を1枚だけ書かせる。渡すのは常に最新の1枚のみ（累積しない）。
+フォーマットは強制しないため、何を残し何を捨てるかはモデルの判断に委ねられる。詳細は
+`doc/uso8000000_dangou_card_spec_v0_8_season2.md` §9.6を参照。
+
 ## LLMトライアル実行（本番API）
 
 `scripts/llm_trial.py` を直接フォアグラウンド実行すると、Claude/DevRelayセッションのタイムアウトで長時間試合が巻き込まれてkillされることがある。12ラウンドフル試合など時間のかかるトライアルは、必ずデタッチ起動ラッパーを使うこと。
@@ -59,6 +69,26 @@ bash scripts/run_trial.sh --phase C --ruleset S2 --roster "..." --cot --rounds 1
 ```
 
 `--rounds N` でラウンド数を打ち切ることができ、スモークテスト等の低コスト確認に使う。
+
+### 低コスト6体→18体 負荷試験（インフラ耐久確認）
+
+Season 2 最大想定の18体でengine/llm/logging/viewerが耐えられるかを、安価3モデル（`L7`:Gemini 2.5 Flash-Lite / `L6`:DeepSeek V4 Flash / `L2`:GPT-4.1 Mini）構成で確認する手順。**モデルの強さ評価ではなく、最大人数でのインフラ耐久確認が目的**。
+
+```bash
+# STEP 1: 6体スモーク（正常系確認、seed=701）
+bash scripts/run_trial.sh --phase C --ruleset S2 --roster "L7,L7,L6,L6,L2,L2" --games 1 --rounds 12 --seed 701
+bash scripts/check_trial.sh
+
+# STEP 2: 6体が Completed: YES になってから実行する18体（最大人数負荷試験、seed=811）
+bash scripts/run_trial.sh --phase C --ruleset S2 --roster "L7,L7,L7,L7,L7,L7,L6,L6,L6,L6,L6,L6,L2,L2,L2,L2,L2,L2" --games 1 --rounds 12 --seed 811
+bash scripts/check_trial.sh
+ps -o rss=,etime= -p $(cat $(ls -t logs/llm/run_*.pid | head -1))   # メモリ(RSS,KB)と経過時間
+```
+
+注意事項:
+- `--roster` はカンマの後にスペースを入れないこと（`llm_trial.py` の roster解析は `.strip()` していないため、空白入りだと `Unknown model` エラーになる）
+- CoTは両方OFF（`--cot` を付けない）。低コスト負荷試験が目的で、CoT ONは出力トークン・所要時間を大きく膨らませるため
+- **18体走行中はビューワーを開きっぱなしにしない**。観戦画面は2秒間隔ポーリングで進行中ログを毎回フルパースするため、18体分のログ（試合完走時で数十MB規模）を継続的に読み続けると負荷が増す。18体の描画確認は**試合完了後**に行うこと
 
 ## JSONLイベント仕様
 

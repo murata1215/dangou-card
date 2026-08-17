@@ -151,6 +151,45 @@ def parse_response(
     return strategy, action
 
 
+def extract_memory(text: str) -> str:
+    """
+    Reflection応答から引き継ぎメモリ（memory）を抽出する
+
+    形式を強制しない自由記述フィールドのため、通常のparse_response()とは
+    別経路で処理する。JSONで {"memory": "..."} を返せなくても、
+    応答テキストそのものをメモとして採用する（ParseErrorを投げない）。
+
+    Args:
+        text: LLMのレスポンステキスト（空文字列の場合は空文字を返す）
+
+    Returns:
+        抽出したメモ文字列（前後の空白を除去）。何も取れなければ空文字列。
+    """
+    if not text:
+        return ""
+
+    data = extract_json(text)
+    if isinstance(data, dict):
+        memory = data.get("memory")
+        if isinstance(memory, str):
+            return memory.strip()
+        # memoryキーが無い/文字列でない場合でも、JSON自体は取れているので
+        # 応答全体を自由記述として採用する（自由記述ゆえに構造化を強制しない）
+
+    # JSON抽出に失敗、またはmemoryキーが無い場合は生テキストを採用
+    return text.strip()
+
+
+def normalize_memory(memory: str, max_chars: int) -> str:
+    """引き継ぎメモリを最大文字数で切り詰める"""
+    if not memory:
+        return ""
+    memory = memory.strip()
+    if max_chars > 0 and len(memory) > max_chars:
+        memory = memory[:max_chars]
+    return memory
+
+
 # 有効な感情値の集合
 VALID_EMOTIONS = {"喜", "怒", "哀", "楽", "焦", "疑", "奸"}
 

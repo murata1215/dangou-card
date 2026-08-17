@@ -17,8 +17,5 @@ API_MAX_RETRIES = 2        # 429/5xx/タイムアウト時の最大リトライ�
 COST_LIMIT_PER_GAME = 5.0   # 1エージェントあたりのコスト上限（USD）
 COST_LIMIT_TOTAL = 12.0     # 試合全体（全エージェント合計）のコスト上限（USD）
 
-# --- コンテキスト管理 ---
-CONTEXT_RECENT_ROUNDS = 2  # プロンプトに含める直近ラウンド数
-
 # --- 修正4: 交渉空回り削減 ---
 AUTO_PASS_ON_NO_NEWS = True  # 新規メッセージがない場合に自動pass（LLMコールしない）

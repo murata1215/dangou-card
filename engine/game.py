@@ -101,6 +101,7 @@ class Game:
         self.contracts: list[Contract] = []
         self.bounties: list[Bounty] = []
         self.carryovers: dict[str, int] = {}  # 市場ID → キャリーオーバー額
+        self._last_round_results: dict | None = None  # 前ラウンドの市場決着サマリ（§8.1公開情報）
         self.current_round: int = 0
         self.pending_repayments: dict[str, int] = {}  # Negotiation中のrepay記録
 
@@ -146,6 +147,7 @@ class Game:
             self._phase_commit(round_num)
             self._phase_settlement(round_num)
             self._phase_finance(round_num)
+            self._phase_reflection(round_num)
 
         return self._finalize()
 
@@ -709,6 +711,35 @@ class Game:
             "active_deposits": len([d for d in self.double_up_deposits if not d.resolved]),
         })
 
+        # 前ラウンド結果サマリを保存（§8.1公開情報: 参加者・使用カード・勝者・獲得額・高騰・繰越）
+        # 次ラウンドのvisible_stateに載せ、プレイヤーへ確実に周知する。
+        # commits: 参加者IDと使用カードランクのペア。§8.1「各市場の参加者・使用カード（決着後）」の
+        # うちカードが一度もプロンプトに描画されていなかった実装漏れの是正（participantsは後方互換で残す）。
+        # 霧のラウンド（config.fog_rounds）はカードランクを "FOG" に伏せる。
+        is_fog_round = round_num in self.config.fog_rounds
+        self._last_round_results = {
+            "round": round_num,
+            "markets": [
+                {
+                    "market_id": mr.market_id,
+                    "participants": [c.player_id for c in mr.participants],
+                    "commits": [
+                        {
+                            "player_id": c.player_id,
+                            "card_rank": "FOG" if is_fog_round else c.card.rank.name,
+                        }
+                        for c in mr.participants
+                    ],
+                    "winners": mr.winners,
+                    "prize_per_winner": mr.prize_per_winner,
+                    "total_pool": mr.total_pool,
+                    "surged": mr.surged,
+                    "carryover_to_next": new_carryovers.get(mr.market_id, 0),
+                }
+                for mr in market_results
+            ],
+        }
+
         # キャリーオーバー更新
         if round_num < self.config.num_rounds:
             # R12以外: キャリーオーバーを次ラウンドへ
@@ -862,6 +893,35 @@ class Game:
             pending_repayments={},
         )
 
+    def _phase_reflection(self, round_num: int) -> None:
+        """
+        Phase 6: Reflection（引き継ぎメモリ）
+
+        ラウンド終了後、各生存AIに「次ラウンドへ持ち越す自由記述メモ」を
+        1枚だけ書かせる。前ラウンドのmemory＋当ラウンドの会話・契約・結果を
+        材料に、何を残すかはモデルの自由（フォーマット強制なし）。
+
+        - config.memory_enabled が False なら何もしない（既定Falseで旧挙動保持）
+        - 最終ラウンドはスキップ（次ラウンドが存在せずメモが使われないため）
+        - 1体のAPI失敗でゲーム全体を止めないよう、例外は握りつぶす
+        - エンジンの計算ロジック・戻り値シグネチャには一切影響しない
+        """
+        if not self.config.memory_enabled:
+            return
+        if round_num >= self.config.num_rounds:
+            return
+
+        alive_ids = [pid for pid, p in self.players.items() if p.is_alive]
+        for pid in alive_ids:
+            agent = self.agents[pid]
+            p = self.players[pid]
+            visible_state = self._build_visible_state(round_num, for_player_id=pid)
+            try:
+                agent.reflect(p, round_num, visible_state)
+            except Exception:
+                # メモ更新の失敗はゲーム進行に影響させない（前ラウンドのmemoryを維持）
+                continue
+
     def _finalize(self) -> GameResult:
         """ゲーム終了処理"""
         result = GameResult(
@@ -895,9 +955,11 @@ class Game:
         state = {
             "round_num": round_num,
             "markets": [
-                {"market_id": m.market_id, "prize_pool": m.prize_pool}
+                {"market_id": m.market_id, "prize_pool": m.prize_pool,
+                 "base_prize": m.base_prize, "carryover": m.carryover}
                 for m in getattr(self, "_current_markets", [])
             ],
+            "last_round_results": self._last_round_results,
             "alive_players": [
                 pid for pid, p in self.players.items() if p.is_alive
             ],

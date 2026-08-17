@@ -3,6 +3,7 @@
 
 ロスター仕様書v1.0の12モデルを定義。
 モデルID・アダプタ種別・単価・API設定を管理する。
+L7は2026-08-16追加の負荷試験専用枠（12モデル仕様書には含まれない）。
 
 Step 3C-prep2: モデルIDを各社APIで確認した実在IDに確定。
 - OpenAI: gpt-4.1 / gpt-4.1-mini（最新世代）
@@ -40,7 +41,7 @@ GEMINI_OPENAI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/opena
 # --- Moonshot国際版エンドポイント ---
 MOONSHOT_BASE_URL = "https://api.moonshot.ai/v1"
 
-# --- ロスター仕様書v1.0の12モデル（疎通確認済みID） ---
+# --- ロスター仕様書v1.0の12モデル（疎通確認済みID） + L7（負荷試験用追加枠） ---
 MODEL_REGISTRY: dict[str, ModelInfo] = {
     # Tier M（中量級）
     "M1": ModelInfo(
@@ -92,6 +93,11 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         input_price=0.14, output_price=0.28,  # DeepSeek料金表 2026-08-16（V4 Flash単価）
         env_key="DEEPSEEK_API_KEY", base_url="https://api.deepseek.com",
         cached_input_price=0.0028,  # DeepSeek料金表 2026-08-16
+        # 2026-08-17: thinking既定ON(effort=high)がmax_tokens=4000を食い潰しfinish_reason=length
+        # →content空→reasoning_contentフォールバックでJSON崩壊（seed=701実測 P04 25.2%/P05 13.7%）。
+        # 8コール診断実験でthinking無効化によりreasoning_tokens=0・JSON成功率100%・latency大幅改善を確認。
+        extra_params={"thinking": {"type": "disabled"}},
+        max_tokens=2000,
     ),
     # Tier L（軽量級）
     "L1": ModelInfo(
@@ -143,6 +149,18 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         input_price=0.14, output_price=0.28,  # DeepSeek料金表 2026-08-16（V4 Flash単価）
         env_key="DEEPSEEK_API_KEY", base_url="https://api.deepseek.com",
         cached_input_price=0.0028,  # DeepSeek料金表 2026-08-16
+        # 2026-08-17: M6と同一model_idにつき同一の是正が必要（片方だけ直すと片肺暴走する）
+        extra_params={"thinking": {"type": "disabled"}},
+        max_tokens=2000,
+    ),
+    # Tier L+（負荷試験用の追加安価枠。2026-08-16追加、ロスター仕様書v1.0の12モデルとは別枠）
+    "L7": ModelInfo(
+        model_id="gemini-2.5-flash-lite",
+        provider="Google", name="Gemini 2.5 Flash-Lite",
+        adapter_type="gemini",
+        input_price=0.10, output_price=0.40,  # ユーザー指定単価 2026-08-16（18体負荷試験用）
+        env_key="GEMINI_API_KEY", base_url=GEMINI_OPENAI_BASE_URL,
+        # cached_input_price / reasoning_price: 未設定（L3/M3と同じ扱い、input/output単価を代用）
     ),
 }
 

@@ -1,5 +1,166 @@
 # Changelog
 
+## 2026-08-17: 引き継ぎメモリ（Handover Memory）の導入 — AIに「1枚だけの記憶」を持たせる
+
+### 概要
+「R5のP01は、R1でP04に裏切られた記憶を持っているか？」を調査した結果、**持っていない**ことが判明した。
+LLMコールは1-shot（チャット履歴を持たない）、`_round_messages`は毎ラウンドNegotiation冒頭でクリア、
+戦略メモ（strategy_history）は同一ラウンド内のみ参照、過去の契約違反・脱落理由もvisible_stateに一切
+含まれない。つまり現状のAIは毎ラウンド「初対面」として振る舞っており、談合ゲームの核心である
+「裏切りを覚えていて次に活かす」という戦略性が構造的に欠落していた。
+
+対処として、**前ラウンドのmemory＋当ラウンドの会話・契約・結果を材料に、次ラウンドへ持ち越す
+自由記述メモ（500〜1000字）を1枚だけ書かせる「引き継ぎメモリ」**を導入した。全ラウンドの客観的な
+公開履歴を配布する案（当初プラン）と比較検討した結果、(1) 秘匿情報の漏れリスクがほぼゼロ
+（自分の主観メモが自分に返るだけ）、(2) 何を覚え何を捨てるかが戦略になりモデル間の性能差が出る、
+(3) 常に最新1枚のみ保持のためラウンドを重ねてもトークンコストが増加しない、という理由で
+「引き継ぎメモリ」案を採用した。
+
+材料として渡す「当ラウンドの結果」を検証する過程で、前ラウンド結果の参加者表示が
+`参加6人 → 勝者 P01` のように**人数へ潰されており**、§8.1が公開情報と定義する
+「各市場の参加者・使用カード（決着後）」のうちカードが一度もプロンプトに描画されていなかった
+実装漏れも発見し、あわせて是正した（Part 0）。
+
+### 変更（Part 0: 前ラウンド結果の参加者ID・使用カードを可視化）
+- **`engine/game.py`**: `_phase_settlement()`が構築する`_last_round_results["markets"][*]`に
+  `commits: [{"player_id", "card_rank"}]`を追加（`mr.participants`から取得。既存の`participants`
+  リストは後方互換のため維持）。霧ラウンド（`config.fog_rounds`）では`card_rank`を`"FOG"`に伏せる
+- **`llm/prompt_builder.py`**: `_render_last_round_results()`の参加者描画を3段フォールバック化 —
+  `commits`があれば`P01[ROYAL_FLUSH]★, P02[FLUSH]★, ...`とID+カード+勝者マークで列挙、
+  無ければ`participants`のみ列挙、どちらも無ければ従来どおり人数のみ（後方互換）
+
+### 変更（Part 1: 引き継ぎメモリ本体）
+- **`engine/negotiation.py`**: `PlayerAgent.reflect()`を`choose_double_up()`と同様の非abstractデフォルト
+  （no-op、`None`を返す）として追加。Bot 8種・`StubAgent`は無変更で動作する
+- **`engine/game.py`**: `run()`のフェイズ順を`market_open → negotiation → commit → settlement →
+  finance → `**`reflection`**に拡張。新設した`_phase_reflection(round_num)`は
+  `config.memory_enabled=False`（既定）または最終ラウンドなら即return、生存者のみ
+  `agent.reflect(player_state, round_num, visible_state)`を呼び、1体の例外はゲーム進行を止めず
+  握りつぶす。エンジンの賞金計算・判定ロジックには一切影響しない
+- **`engine/config.py`**: `memory_enabled: bool = False`（既定、S2プリセットのみTrue）、
+  `memory_max_chars: int = 1000`を追加
+- **`llm/prompt_builder.py`**: `build_reflection_prompt()`を新設（当ラウンドの会話全件・契約・
+  市場結果・自分の資金状況を材料に`{"memory": "..."}`形式で自由記述を要求。文字数上限は
+  `config.memory_max_chars`を明示）。`build_negotiation_prompt()`/`build_commit_prompt()`に
+  `memory`引数を追加し、`_render_memory_block()`で「## あなたの記憶（前ラウンドから引き継いだメモ /
+  これが唯一の記憶です）」セクションとして挿入（`memory=None`なら何も描画しない）。
+  DM/broadcast描画ロジックを`_render_message_list()`として共通化（reflection/negotiation/commit
+  3箇所で再利用）
+- **`llm/response_parser.py`**: `extract_memory()`（JSON `{"memory": "..."}`が取れなければ応答テキスト
+  そのものを採用し、`ParseError`を絶対に投げない自由記述専用の抽出経路）と`normalize_memory()`
+  （`max_chars`超過分を切り詰め）を追加
+- **`llm/llm_agent.py`**: `LLMAgent.__init__`に`self._memory: str = ""`（常に最新の1枚のみ）と
+  `self.memory_history: list`（観戦・分析用、エージェントインスタンス内に閉じる）を追加。
+  `negotiate()`/`commit()`のプロンプト構築に`memory=self._memory or None`を渡す。新設した`reflect()`は
+  `_call_llm("reflection", ...)`を1回（リトライなし）呼び、応答が空またはmemoryが空文字なら
+  **前ラウンドの`self._memory`をそのまま維持**（空文字での上書きは絶対にしない）
+- **`llm/constants.py`**: 参照0件だった死んだ定数`CONTEXT_RECENT_ROUNDS`を削除
+- **`tests/test_prompt_market_info.py`（6件追加）・`tests/test_memory.py`（新規35件）**:
+  Part 0（commits記録・霧ラウンド伏せ・3段フォールバック描画）とPart 1（reflectionフェイズの
+  発火条件・プロンプト内容・memory注入・API失敗時の維持・秘匿性・reasoning非混入・viewerの
+  誤検出防止）を網羅的に検証
+
+### 影響
+`config.memory_enabled`の既定値は`False`のため、既存の全プリセット（`default_8/12/20`,
+`baseline_v1`）の挙動は変わらない。S2プリセット（`default_8_s2`, `baseline_v1_s2`）でのみ
+Reflectionフェイズが有効化され、1試合あたり約95コール（最終ラウンド除く生存者数分）・
+約+$0.42（実測ベース試算）のコスト増となる（`COST_LIMIT_TOTAL=12.0`に対し十分な余裕あり）。
+エンジンの賞金計算・契約判定ロジックは無変更。
+
+## 2026-08-17: 繰越（キャリーオーバー）と前ラウンド結果がプレイヤーに周知されていなかった問題の是正
+
+### 概要
+`trial_C_20260815_202246 / game01` R4でM03の賞金が¥960,000（他市場の2倍）だった件を調査した結果、
+高騰ではなく「R3でM03が参加者0＝流札し、¥480,000が繰り越された」ことが原因と確定した（賞金計算自体は仕様どおりで正しい）。
+続けて「繰越はプレイヤーに周知されているのか」を確認したところ、**§8.1が「公開情報」と定義し、システムプロンプト自身も
+「各市場の参加者・使用カード（決着後）、勝者と獲得額」を公開と明言しているにもかかわらず、visible_state/プロンプトの
+どちらにも一度も出力されていない実装漏れ**であることが判明した。実ログの全文検索では「繰越」「キャリーオーバー」「流札」の
+言及が全12R×9人ぶんでゼロ件だった一方、繰越で賞金が2倍に見えたR4だけ「高騰」への言及が89件に急増しており（R3は0件、R5は1件）、
+情報欠落が「高騰への誘引」という誤解を生みM03への参加者集中を招いていたことも確認した。
+
+### 変更
+- **`engine/game.py`**: `_build_visible_state()`のmarketsに`base_prize`/`carryover`を追加（従来は合算済みの`prize_pool`のみ）。
+  `Game.__init__`に`self._last_round_results: dict | None = None`を追加し、`_phase_settlement()`で当該ラウンドの
+  `market_results`/`new_carryovers`から参加者・勝者・獲得額・高騰有無・次ラウンドへの繰越額のサマリを構築して保持、
+  `_build_visible_state()`から`"last_round_results"`として次ラウンドのnegotiation/commit両フェイズに公開する。
+  R1は前ラウンドが存在しないため`None`のまま。エンジンの賞金計算・判定ロジック自体は無変更
+- **`llm/prompt_builder.py`**: `_render_market_line()`（市場行に`carryover>0`のときだけ「（基本◯万 + 前R繰越◯万）」の内訳を付記）と
+  `_render_last_round_results()`（「## 前ラウンド（R{n}）の結果」セクションを新設し、市場ごとに参加人数・勝者・獲得額・高騰有無、
+  参加0人の場合は「不成立。賞金◯万円は今ラウンドの{市場}へ繰越」を明示）を新設し、`build_negotiation_prompt()`/
+  `build_commit_prompt()`の「## 市場」直後に挿入
+- **`viewer/static/index.html`**: `carryover > 0`のとき賞金の直後に`sit-carry`バッジ（「繰越+¥480,000」）を表示。
+  勝者が空でも`participants === 0`（流札）のときは従来の「（結果待ち）」ではなく
+  「不成立（参加0）— 賞金は次ラウンドへ繰越」と表示するよう修正（`viewer/log_parser.py`は無変更、既に必要な値を保持していた）
+- **`viewer/static/style.css`**: `.sit-carry { color: #4a9eff; font-weight: bold; font-size: 0.85em; }`を追加（`.sit-surge`の`#ff6b35`と区別）
+- **`doc/uso8000000_dangou_card_spec_v0_8_season2.md`**: §9.1に「市場情報の内訳（基本＋繰越）」と「前ラウンドの市場決着結果」の
+  記述を追加し、実装が§8.1の公開情報定義に追いついたことを明記
+- **`tests/test_prompt_market_info.py`（新規、9件）**: visible_stateのbase_prize/carryover検証、R1で`last_round_results`が
+  Noneであること、参加者0の市場を含む決着後に正しく記録されること、negotiation/commit両プロンプトへの内訳・前ラウンド結果の
+  描画、追加情報に秘匿情報（reasoning・debt_balance等）が混入しないことを検証
+- **`tests/test_viewer.py`（2件追加）**: index.html/style.cssに表示要素が存在すること、実ログ`trial_C_20260815_202246`の
+  R3/M03（参加0）・R4/M03（carryover=480,000、prize_pool=base_prize+carryover）が正しくパースされることを検証
+
+### 影響
+プロンプトは1ラウンドあたり数行増えるのみ（トークン増は軽微）だが、エージェントが前ラウンドの決着結果と繰越の理由を
+初めて観測できるようになるため、**今後の試合での挙動は過去ログ（trial_C_20260815_202246等）とは異なりうる**。
+これはルールの追加・変更ではなく、既に公開情報と定義されていた情報の周知漏れの是正である。
+
+### 検証
+- `uv run pytest tests/test_prompt_market_info.py tests/test_viewer.py -v`: 新規11件PASSED
+- `uv run pytest tests/ -q`: **382件PASSED**（既存371件 + 新規11件、失敗ゼロ、回帰なし）
+- `uv run python scripts/dry_run.py`: Bot12人版が例外なく完走（イベント数566、繰越発生24件を確認）
+- LLM API呼び出しはこの変更の検証には使用していない（Bot/ユニットテストのみで完結）
+
+## 2026-08-17: DeepSeek V4 Flash（M6/L6）thinking暴走の是正 — 原因特定・8コール実験・恒久設定変更
+
+### 概要
+seed=701の6体12R試験で`L6`（DeepSeek V4 Flash）がAPIエラー0件にも関わらずJSON成立率P04 74%/P05 87%と低く、壁時計の78%を消費していた事象を、読み取り専用調査（実ログ集計・コード確認・DeepSeek公式仕様照合）で原因特定した。DeepSeek `deepseek-v4-flash`は**既定でthinking（effort=high）がON**であり、`llm/models.py`のM6/L6は`extra_params`未設定のためthinkingを無効化していなかった。thinkingトークンは`max_tokens=4000`枠を`completion_tokens`として消費するため、思考だけで4000に達すると`content`が空になり`finish_reason=length`となる。`llm/adapters.py`の`OpenAICompatAdapter`は`content`が空のとき生の`reasoning_content`（思考文）を本文として採用するフォールバックを持つため、JSONでない長文がゲーム側に渡りパースに失敗していた（seed=701実測: `length`時のみreasoning_tokens=output_tokens=4000、latency平均46秒 vs 通常7秒）。この仮説をL6のみ・8コール・$0.10上限の実験で検証し、thinking無効化により`reasoning_tokens=0`・JSON成功率100%・latencyが大幅改善することを確認したうえで、M6/L6双方に恒久設定変更を適用した。
+
+### 変更
+- **`scripts/model_smoke.py`**: `--suite thinking_matrix`モードを追加。thinking ON/OFF × max_tokens(4000/2000/1000)の8条件を、`llm/adapters.py`を変更せずに`extra_body`注入で再現する`complete_with_fields()`を新設し、`content`と`reasoning_content`を分離観測（既存アダプタは両者をフォールバックで混ぜてしまうため）。`HARD_MAX_CALLS`を5→8に引き上げ。条件別集計（JSON率/length率/fallback件数/latency個別値/コスト）をMDサマリに追加
+- **`tests/test_model_smoke.py`**: フェイクSDKクラス群とAPI非依存テスト10件を追加（8条件のブレークダウン検証・`reasoning_effort`不使用の確認・レジストリ非破壊確認・content/reasoning_content分離検証・fallback記録検証・HARD_MAX_CALLS=8検証等）
+- **実API実験（L6のみ・8コール・実測$0.001396）**: `baseline_4000`×2（thinking ON既定）/ `nothink_4000`×1 / `nothink_2000`×3 / `nothink_1000`×2。**8/8成功・0/8 length・8/8 JSON成功**。`nothink_*`は全条件で`reasoning_tokens=0`（無効化パラメータが効くことを確認）。latencyはbaseline 2.3〜5.0秒 → nothink 1.4〜2.8秒に改善（seed=701で観測した`length`時46秒からは大幅短縮）。副次的発見: baseline（thinking ON）の1コールは`finish_reason=stop`かつ成功にも関わらず`content`が空で`reasoning_content`側に最終回答があった＝既存フォールバックは失敗時専用ではなく成功時にも作用しうる
+- **`llm/models.py`**: `M6`/`L6`（同一`model_id="deepseek-v4-flash"`）双方に`extra_params={"thinking": {"type": "disabled"}}`・`max_tokens=2000`を追加。`max_tokens`は実験で`nothink_1000`(2/2成功)/`nothink_2000`(3/3成功)双方が合格したが、コスト・latency差が実測上ごく僅かであることと、18体本番では交渉以外のフェイズ（commit/double_up等）や多様な相手を含み出力長のばらつきが増えることを踏まえ、より安全側の2000を採用
+- **`tests/test_model_smoke.py`**: レジストリの恒久値変更に合わせ、L6の`extra_params`/`max_tokens`を`None`固定でチェックしていた2箇所を、恒久値（`{"thinking":{"type":"disabled"}}`/`2000`）を検証しつつ「実験のケース構築自体はレジストリを書き換えない」ことを検証する形に更新
+
+### 検証
+- `uv run pytest tests/test_model_smoke.py -v`: 20件PASSED
+- `uv run pytest tests/ -q`: **371件PASSED**（既存361件 + 新規10件、失敗ゼロ、MODEL_REGISTRY変更後も回帰なし）
+- 実APIコール数: **8回**（計画8回・実行8回、上限内）。実測コスト**$0.001396（約¥0.21）**、承認上限$0.10の約1.4%
+- 判定: **L6×6を18体本番投入してOK**（M6/L6のthinking無効化＋max_tokens=2000適用済み）
+
+## 2026-08-17: L7全滅の発覚とL3スモークテストによる代替確認、汎用モデルスモークスクリプト追加
+
+### 概要
+明け方に実行された seed=701 の6体低コスト負荷試験（`L7,L7,L6,L6,L2,L2`）で、`L7`（Gemini 2.5 Flash-Lite）が173コール全て404 NotFound（"no longer available to new users"）で全滅していたことが判明した（読み取り専用調査で特定、当日昨夜追加したL7定義自体は変更せず）。18体本番の前に代替候補`L3`（Gemini 3.5 Flash-Lite）を最小コストで実機検証するため、汎用モデルスモークテストスクリプトを新規作成し、L3に対して実際に4コールAPIを呼んで疎通・応答品質・コストを確認した。
+
+### 変更
+- **`scripts/model_smoke.py`（新規）**: `MODEL_REGISTRY`の1モデルを指定し、少数回のAPIコールで疎通・JSON成立率・latency・token内訳・コストを確認する汎用スクリプト。`--model`/`--calls`（絶対上限5）/`--max-cost`/`--max-tokens`/`--dry-run`をCLI指定可能。既存の`llm/models.py`（`get_model`/`estimate_cost`）・`llm/adapters.py`（`create_adapter`）・`llm/response_parser.py`（`extract_json`/`parse_response`）・`llm/prompt_builder.py`（`build_system_prompt`）をそのまま再利用し、新規ロジックはケース定義・予算ガード・記録処理のみ。`AdapterError`で200文字に切り詰められるエラーメッセージを、失敗時のみ同一クライアントで1回だけ生SDK呼び出しし直して全文（`status_code`/`body`/`response.text`）を取得する仕組みを追加（`llm/adapters.py`は無変更）。次コールの最悪コスト（`estimate_cost()`ベース）を事前試算し、`--max-cost`を超えるならAPIを呼ばずに中断するガードを実装
+- **`tests/test_model_smoke.py`（新規）**: フェイクアダプタで`create_adapter`を差し替えるAPI非依存テスト10件。dry-run時にAPI未呼び出し・`--calls`ハード上限超過の拒否・予算超過ガード・成功時のJSONL記録内容とコスト一致・`AdapterError`失敗時の記録継続と非0終了・L3のレジストリ解決を検証
+- **L3実機スモークテスト実行**: `uv run python scripts/model_smoke.py --model L3 --calls 4 --max-cost 0.10` を実行。ping 1回 + 18体S2相当のシステムプロンプト（約5,000字）を使った交渉フェイズ想定プロンプト3回、計4コール。**4/4成功、404/429/timeoutなし、JSON率100%、finish_reasonは全て`stop`**。実測コスト$0.003624（承認上限$0.10の3.6%）
+
+### 検証
+- `uv run pytest tests/test_model_smoke.py -v`: 10件PASSED
+- `uv run pytest tests/ -q`: **361件PASSED**（既存351件 + 新規10件、失敗ゼロ）
+- L3実APIコール: 計画4回・実行4回（上限5回以内、追加のエラー全文再取得コールは発火せず）
+- 18体負荷試験のGemini枠は `L7` → `L3` へ切り替え可能と判断（`llm/models.py`のL3定義・L7定義はいずれも今回変更なし）
+
+## 2026-08-16: L7（Gemini 2.5 Flash-Lite）追加 — 明日朝の6体→18体低コスト負荷試験の準備
+
+### 概要
+Season 2最大想定の18体でengine/llm/logging/viewerが耐えられるかを確認する低コスト負荷試験（6体→18体）を明日実施するため、ロースター仕様書v1.0の12モデル（M1〜M6, L1〜L6）とは別枠の負荷試験専用モデルとして`L7`（Gemini 2.5 Flash-Lite）を`MODEL_REGISTRY`に新規追加した。試合の起動・LLM API呼び出しは一切行っていない（コード追加とテスト・ドキュメント整備のみ）。
+
+### 変更
+- **`llm/models.py`**: `MODEL_REGISTRY`に`L7`エントリを新規追加。`model_id="gemini-2.5-flash-lite"`、`provider="Google"`、`adapter_type="gemini"`（既存の`GEMINI_OPENAI_BASE_URL`・`OpenAICompatAdapter`経路を再利用、コード変更なしで疎通可能）、単価は`input_price=0.10`/`output_price=0.40`（ユーザー指定、2026-08-16）。`cached_input_price`/`reasoning_price`/`extra_params`は未設定（L3/M3と同じ扱い）。既存の`L3`（Gemini 3.5 Flash-Lite）・`M3`（Gemini 3.5 Flash）は一切変更していない
+- **`tests/test_llm.py`**: 新規クラス`TestL7Gemini25FlashLite`に7件追加（登録内容・単価・アダプタ選択・model_id逆引き・コスト計算・L3/M3不変の回帰・明日朝のロースター文字列がAPI非依存で全解決できること）。うち`test_load_test_rosters_resolve`は`scripts/llm_trial.py`のroster解析が`.strip()`していない仕様（カンマ後にスペースがあると`Unknown model`エラーになる）を踏まえ、明日使う6体/18体ロースター文字列にスペースが混入しないことを固定するテスト
+- **`README.md`**: `## LLMトライアル実行（本番API）`節に`### 低コスト6体→18体 負荷試験（インフラ耐久確認）`を追記。6体スモーク（seed=701）→18体（seed=811、6体完了確認後）のコマンドと、roster空白禁止・CoT OFF・18体走行中はビューワーを開きっぱなしにしない旨の運用注意を記載
+- **`doc/uso8000000_dangou_card_spec_v0_8_season2.md`**: §11.3単価表に`L7`行を追加し、負荷試験用に2026-08-16追加された12モデル外の枠であることを明記（「現行実装が正」の方針を維持）
+
+### 検証
+- `uv run pytest tests/test_llm.py -v -k "L7 or gemini or Gemini"`: 11件PASSED
+- `uv run pytest tests/ -q`: **351件PASSED**（既存テストの失敗ゼロ、警告4件は既存かつ本変更と無関係）
+- LLM API呼び出し・試合起動は今回一切実施していない
+
 ## 2026-08-16: card_idトレード重複バグ修正・Gemini単価是正・トライアルのデタッチ起動化・CoT(A)実装
 
 ### 概要

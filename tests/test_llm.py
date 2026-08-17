@@ -259,7 +259,10 @@ class TestStep3CPrep2:
         assert MODEL_REGISTRY["M5"].model_id == "kimi-k2.6"
 
     def test_gemini_model_ids_are_3x(self):
-        """GeminiモデルIDが3.x系であること"""
+        """メインロスターのGeminiモデルID(M3/L3)が3.x系であること
+
+        L7(Gemini 2.5 Flash-Lite)は2026-08-16追加の負荷試験専用枠のため対象外。
+        """
         from llm.models import MODEL_REGISTRY
         assert "3.5" in MODEL_REGISTRY["M3"].model_id
         assert "3.5" in MODEL_REGISTRY["L3"].model_id
@@ -388,6 +391,86 @@ class TestStep3C:
         from llm.response_parser import LENGTH_TRUNCATION_HINT
         assert "出力トークン上限" in LENGTH_TRUNCATION_HINT
         assert "JSON" in LENGTH_TRUNCATION_HINT
+
+
+class TestL7Gemini25FlashLite:
+    """L7 (Gemini 2.5 Flash-Lite) 負荷試験用追加枠のテスト
+
+    2026-08-16: 6体→18体の低コストインフラ負荷試験のために追加。
+    API呼び出しは一切行わない。
+    """
+
+    def test_l7_registered(self):
+        """L7がmodel_id/provider/adapter_type/env_key/base_urlの通り登録されていること"""
+        from llm.models import MODEL_REGISTRY, GEMINI_OPENAI_BASE_URL
+        m = MODEL_REGISTRY["L7"]
+        assert m.model_id == "gemini-2.5-flash-lite"
+        assert m.provider == "Google"
+        assert m.adapter_type == "gemini"
+        assert m.env_key == "GEMINI_API_KEY"
+        assert m.base_url == GEMINI_OPENAI_BASE_URL
+
+    def test_l7_prices(self):
+        """L7の単価がユーザー指定通りであり、cache/reasoning単価は未設定(None)であること"""
+        from llm.models import MODEL_REGISTRY
+        m = MODEL_REGISTRY["L7"]
+        assert m.input_price == 0.10
+        assert m.output_price == 0.40
+        assert m.cached_input_price is None
+        assert m.reasoning_price is None
+        assert m.extra_params is None
+
+    def test_l7_uses_openai_compat_adapter(self):
+        """L7がGemini経路(OpenAICompatAdapter)にルーティングされること（APIは呼ばない）"""
+        from llm.adapters import create_adapter, OpenAICompatAdapter
+        from llm.models import get_model
+        adapter = create_adapter(get_model("L7"))
+        assert isinstance(adapter, OpenAICompatAdapter)
+
+    def test_l7_lookup_by_model_id(self):
+        """get_model()がmodel_id文字列からL7を逆引きできること（viewerのコスト内訳表示が参照する経路）"""
+        from llm.models import get_model
+        m = get_model("gemini-2.5-flash-lite")
+        assert m.name == "Gemini 2.5 Flash-Lite"
+
+    def test_l7_estimate_cost(self):
+        """L7のestimate_cost()が単価通りに計算されること"""
+        from llm.models import MODEL_REGISTRY, estimate_cost
+        m = MODEL_REGISTRY["L7"]
+        cost = estimate_cost(m, input_tokens=4000, output_tokens=200, total_tokens=4200)
+        expected = (4000 * 0.10 + 200 * 0.40) / 1_000_000
+        assert cost == pytest.approx(expected)
+
+    def test_l3_m3_unchanged(self):
+        """L7追加が既存のL3/M3(Gemini 3.5系)を壊していないことの回帰確認"""
+        from llm.models import MODEL_REGISTRY
+        l3 = MODEL_REGISTRY["L3"]
+        assert l3.model_id == "gemini-3.5-flash-lite"
+        assert l3.input_price == 0.30
+        assert l3.output_price == 2.50
+        m3 = MODEL_REGISTRY["M3"]
+        assert m3.model_id == "gemini-3.5-flash"
+        assert m3.input_price == 1.50
+        assert m3.output_price == 9.00
+
+    def test_load_test_rosters_resolve(self):
+        """明日朝の6体/18体ロースター文字列がget_model()で全解決できること
+
+        scripts/llm_trial.py の roster.split(",") は .strip() しないため、
+        カンマ後にスペースを入れない文字列であることをここで固定する。
+        """
+        from llm.models import get_model
+
+        roster_6 = "L7,L7,L6,L6,L2,L2".split(",")
+        roster_18 = "L7,L7,L7,L7,L7,L7,L6,L6,L6,L6,L6,L6,L2,L2,L2,L2,L2,L2".split(",")
+
+        assert len(roster_6) == 6
+        assert len(roster_18) == 18
+
+        for key in roster_6 + roster_18:
+            assert " " not in key, f"roster key contains stray whitespace: {key!r}"
+            model = get_model(key)  # ValueErrorが出ないこと
+            assert model is not None
 
 
 class TestStep33CacheFix:

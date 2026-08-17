@@ -114,6 +114,18 @@ class GameConfig(BaseModel):
     negotiation_max_turns: int = 10
     """Negotiationの最大巡数（§5.1: 最大10巡）"""
 
+    # --- 引き継ぎメモリ（Handover Memory） ---
+    memory_enabled: bool = False
+    """
+    True: 各ラウンド終了後、AIに次ラウンドへ引き継ぐ自由記述メモ（memory）を
+    1枚だけ書かせる。前ラウンドのmemory＋当ラウンドの会話・契約・結果を材料に、
+    次の自分に何を残すかはモデルの自由。渡すのは常に最新の1枚のみ（累積しない）。
+    既定False。S2プリセットでのみTrue。
+    """
+
+    memory_max_chars: int = 1000
+    """引き継ぎメモリの最大文字数（超過分は切り詰める）"""
+
     @field_validator("prize_tiers")
     @classmethod
     def validate_prize_tiers(cls, v: list[int]) -> list[int]:
@@ -187,6 +199,7 @@ class GameConfig(BaseModel):
             "mandatory_repay_enabled": True,
             "mandatory_repay_k": 0,
             "card_trade_enabled": True,
+            "memory_enabled": True,
         })
 
     @classmethod
@@ -227,4 +240,5 @@ class GameConfig(BaseModel):
             "mandatory_repay_enabled": True,
             "mandatory_repay_k": 0,
             "card_trade_enabled": True,
+            "memory_enabled": True,
         })

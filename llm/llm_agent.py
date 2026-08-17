@@ -26,11 +26,11 @@ from llm.constants import (
 from llm.prompt_builder import (
     build_system_prompt, build_loan_prompt,
     build_negotiation_prompt, build_commit_prompt,
-    build_double_up_prompt,
+    build_double_up_prompt, build_reflection_prompt,
 )
 from llm.response_parser import (
     parse_response, extract_json, ParseError, make_correction_message,
-    LENGTH_TRUNCATION_HINT,
+    LENGTH_TRUNCATION_HINT, extract_memory, normalize_memory,
 )
 from llm.llm_logger import LLMLogger
 
@@ -66,6 +66,11 @@ class LLMAgent(PlayerAgent):
         # 修正1: 当該ラウンドの交渉メッセージを保持
         self._current_round_messages: list[dict[str, Any]] = []
         self._current_round: int = 0
+        # 引き継ぎメモリ（Handover Memory）: 前ラウンドから引き継ぐ自由記述メモ1枚
+        # （常に最新の1枚のみ保持。累積しない）。visible_stateには絶対に入れない。
+        self._memory: str = ""
+        # memoryの全履歴（観戦・分析用。エージェントインスタンス内に閉じる）
+        self.memory_history: list[dict[str, Any]] = []
 
     def _update_last_log_emotion(self, strategy: dict[str, Any]) -> None:
         """strategyからemotion・reasoningを抽出し、llm_loggerの最新エントリに後付けする"""
@@ -205,6 +210,7 @@ class LLMAgent(PlayerAgent):
 
         user_prompt = build_negotiation_prompt(
             player_state, round_num, turn, visible_state, self._config,
+            memory=self._memory or None,
         )
 
         # リトライループ
@@ -265,6 +271,7 @@ class LLMAgent(PlayerAgent):
             player_state, markets, round_num, visible_state, self._config,
             negotiation_messages=self._current_round_messages,
             last_strategy=last_strategy,
+            memory=self._memory or None,
         )
 
         original_prompt = user_prompt
@@ -357,3 +364,40 @@ class LLMAgent(PlayerAgent):
             self.player_id, round_num,
         )
         return False
+
+    def reflect(
+        self,
+        player_state: PlayerState,
+        round_num: int,
+        visible_state: dict,
+    ) -> None:
+        """
+        引き継ぎメモリ（Handover Memory）: ラウンド終了後の振り返り
+
+        次ラウンドへ持ち越す自由記述メモを1枚だけ書かせる。
+        フォーマットは強制しない。リトライはしない（失敗しても致命的でないため）。
+
+        失敗時（空応答・API例外）は self._memory を変更しない
+        —— 前ラウンドのメモをそのまま維持する。空文字での上書きは絶対にしない。
+        """
+        if self._cost_exceeded or self._config is None:
+            return
+
+        user_prompt = build_reflection_prompt(
+            player_state, round_num, visible_state, self._config,
+            memory=self._memory or None,
+        )
+
+        text, _ = self._call_llm("reflection", round_num, user_prompt)
+        if not text:
+            # API失敗・空応答 — 前ラウンドのメモを維持
+            return
+
+        memory = extract_memory(text)
+        if not memory:
+            # 何も書かれなかった場合も前ラウンドのメモを維持
+            return
+
+        self.valid_json_count += 1
+        self._memory = normalize_memory(memory, self._config.memory_max_chars)
+        self.memory_history.append({"round": round_num, "memory": self._memory})

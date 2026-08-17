@@ -97,6 +97,124 @@ def _render_obligations_block(
     return lines
 
 
+# --- 市場賞金内訳・前ラウンド結果の可視化ヘルパー ---
+# 2026-08-17: R3流札→R4繰越で賞金が2倍に見えたが、繰越の事実が
+# プレイヤーに一切周知されていなかった問題（§8.1公開情報の欠落）の是正。
+# エンジン側の賞金計算・判定ロジックには一切影響しない、表示のみの追加。
+
+
+def _render_market_line(
+    market_id: str, prize_pool: int, base_prize: int, carryover: int,
+) -> str:
+    """市場1行を描画する（carryover>0のときだけ内訳を括弧で付記）"""
+    line = f"  {market_id}: 賞金 {prize_pool // 10_000}万円"
+    if carryover:
+        line += f"（基本{base_prize // 10_000}万 + 前R繰越{carryover // 10_000}万）"
+    return line
+
+
+def _render_last_round_results(
+    visible_state: dict[str, Any], title: str | None = None,
+) -> list[str]:
+    """
+    前ラウンドの市場決着結果を描画する（毎プロンプト注入）
+
+    §8.1公開情報（各市場の参加者・使用カード・決着後情報、勝者と獲得額）のうち、
+    従来プロンプトに一切含まれていなかった「前ラウンドの結果」を補う。
+    R1（前ラウンドが存在しない）は visible_state["last_round_results"] が
+    None のため何も描画しない。
+
+    参加者の描画は3段フォールバック:
+      1. commits（player_id + card_rank）があればID+カードを列挙（§8.1完全対応）
+      2. 無ければ participants（IDのみ）を列挙
+      3. どちらも無ければ人数のみ（後方互換: 旧形式のdictを渡すテスト等）
+
+    Args:
+        title: セクション見出しに使うラベル（省略時は "前ラウンド（R{n}）の結果"）。
+            reflectionプロンプトから「今ラウンドの結果」として使い回すために追加。
+    """
+    lrr = visible_state.get("last_round_results")
+    if not lrr:
+        return []
+
+    heading = title or f"前ラウンド（R{lrr['round']}）の結果"
+    lines: list[str] = [f"\n## {heading}"]
+    for m in lrr.get("markets", []):
+        mid = m.get("market_id", "?")
+        commits = m.get("commits")
+        participants = m.get("participants", [])
+        if not participants:
+            pool_man = m.get("total_pool", 0) // 10_000
+            lines.append(
+                f"  {mid}: 参加0人 → 不成立。賞金{pool_man}万円は今ラウンドの{mid}へ繰越"
+            )
+            continue
+        winners = m.get("winners", [])
+        per_man = m.get("prize_per_winner", 0) // 10_000
+        surge_tag = "【高騰×2】" if m.get("surged") else ""
+        if commits:
+            entrants = ", ".join(
+                f"{c.get('player_id', '?')}[{c.get('card_rank', '?')}]"
+                + ("★" if c.get("player_id") in winners else "")
+                for c in commits
+            )
+        else:
+            entrants = f"参加{len(participants)}人"
+        lines.append(
+            f"  {mid}: {entrants} → 勝者 {', '.join(winners)}"
+            f"（各{per_man}万円）{surge_tag}"
+        )
+    return lines
+
+
+# --- 引き継ぎメモリ（Handover Memory）の可視化ヘルパー ---
+# LLMは1-shot呼出しで会話履歴を持たず、チャット・戦略メモは毎ラウンド消える。
+# 前ラウンドから引き継げるのは、当人が書き残した自由記述メモ1枚のみ。
+
+
+def _render_memory_block(memory: str | None) -> list[str]:
+    """
+    前ラウンドから引き継いだメモを描画する（交渉・コミット両プロンプトの共通ヘルパー）
+
+    渡すのは常に最新の1枚のみ（累積しない）。R1やメモ未執筆時は何も描画しない。
+    """
+    if not memory:
+        return []
+    return [
+        "\n## あなたの記憶（前ラウンドから引き継いだメモ / これが唯一の記憶です）",
+        f"  {memory}",
+    ]
+
+
+def _render_message_list(
+    messages: list[dict[str, Any]], heading: str, limit: int | None = None,
+) -> list[str]:
+    """
+    DM/broadcastのメッセージ一覧を描画する共通ヘルパー
+
+    交渉プロンプトの「今ラウンドのメッセージ」、コミットプロンプトの
+    「今ラウンドの交渉内容（参考）」、reflectionプロンプトの
+    「今ラウンドの会話（全件）」で同一の描画ロジックを再利用する。
+
+    Args:
+        limit: 末尾から何件表示するか。Noneなら全件（reflection用）
+    """
+    if not messages:
+        return []
+    shown = messages[-limit:] if limit else messages
+    lines: list[str] = [f"\n## {heading}"]
+    for msg in shown:
+        sender = msg.get("sender", "?")
+        mtype = msg.get("type", "?")
+        text = msg.get("message", "")[:200]
+        if mtype == "dm":
+            to = msg.get("to", "?")
+            lines.append(f"  [{sender}→{to}] {text}")
+        else:
+            lines.append(f"  [{sender} 全体] {text}")
+    return lines
+
+
 # --- システムプロンプト（ルール詳細） ---
 # Step 3.3: キャッシュ閾値(2048トークン)超えのため仕様書v0.5準拠で詳細化
 # ルールの内容は変えず、仕様書に存在する事実を忠実に記載
@@ -291,15 +409,31 @@ def build_negotiation_prompt(
     turn: int,
     visible_state: dict[str, Any],
     config: GameConfig,
+    memory: str | None = None,
 ) -> str:
-    """Negotiationフェイズ用のユーザープロンプト"""
+    """
+    Negotiationフェイズ用のユーザープロンプト
+
+    Args:
+        memory: 前ラウンドから引き継いだ自由記述メモ（引き継ぎメモリ機能。
+            config.memory_enabled=False の場合は常にNone）
+    """
     lines: list[str] = []
     lines.append(f"=== ラウンド{round_num} / 交渉フェイズ（巡{turn}） ===\n")
 
     # 市場情報
     lines.append("## 市場")
     for m in visible_state.get("markets", []):
-        lines.append(f"  {m['market_id']}: 賞金 {m['prize_pool'] // 10_000}万円")
+        lines.append(_render_market_line(
+            m["market_id"], m["prize_pool"],
+            m.get("base_prize", m["prize_pool"]), m.get("carryover", 0),
+        ))
+
+    # 前ラウンドの結果（参加者・勝者・獲得額・高騰・流札→繰越。§8.1公開情報）
+    lines.extend(_render_last_round_results(visible_state))
+
+    # 引き継ぎメモリ（前ラウンドから持ち越した自分だけの記憶）
+    lines.extend(_render_memory_block(memory))
 
     # 自分の状態（秘匿情報）
     lines.append(f"\n## あなたの状態（{player_state.player_id}）")
@@ -318,18 +452,9 @@ def build_negotiation_prompt(
     lines.append(f"\n## 生存者: {', '.join(alive)}")
 
     # メッセージ
-    messages = visible_state.get("messages", [])
-    if messages:
-        lines.append("\n## 今ラウンドのメッセージ")
-        for msg in messages[-10:]:
-            sender = msg.get("sender", "?")
-            mtype = msg.get("type", "?")
-            text = msg.get("message", "")[:200]
-            if mtype == "dm":
-                to = msg.get("to", "?")
-                lines.append(f"  [{sender}→{to}] {text}")
-            else:
-                lines.append(f"  [{sender} 全体] {text}")
+    lines.extend(_render_message_list(
+        visible_state.get("messages", []), "今ラウンドのメッセージ", limit=10,
+    ))
 
     # 提案中の正式契約（当事者にのみ表示）
     pending = visible_state.get("contracts_pending", [])
@@ -426,12 +551,17 @@ def build_commit_prompt(
     config: GameConfig,
     negotiation_messages: list[dict[str, Any]] | None = None,
     last_strategy: dict[str, Any] | None = None,
+    memory: str | None = None,
 ) -> str:
     """
     Commitフェイズ用のユーザープロンプト
 
     修正1: 当該ラウンドの交渉ログと直前のstrategyメモを含有し、
     交渉内容との整合を促す。
+
+    Args:
+        memory: 前ラウンドから引き継いだ自由記述メモ（引き継ぎメモリ機能。
+            config.memory_enabled=False の場合は常にNone）
     """
     lines: list[str] = []
     lines.append(f"=== ラウンド{round_num} / コミットフェイズ ===\n")
@@ -439,7 +569,15 @@ def build_commit_prompt(
 
     lines.append("## 市場")
     for m in markets:
-        lines.append(f"  {m.market_id}: 賞金 {m.prize_pool // 10_000}万円")
+        lines.append(_render_market_line(
+            m.market_id, m.prize_pool, m.base_prize, m.carryover,
+        ))
+
+    # 前ラウンドの結果（参加者・勝者・獲得額・高騰・流札→繰越。§8.1公開情報）
+    lines.extend(_render_last_round_results(visible_state))
+
+    # 引き継ぎメモリ（前ラウンドから持ち越した自分だけの記憶）
+    lines.extend(_render_memory_block(memory))
 
     lines.append(f"\n## あなたの状態（{player_state.player_id}）")
     lines.append(f"  現金: {player_state.cash // 10_000}万円")
@@ -461,18 +599,10 @@ def build_commit_prompt(
             if cards:
                 lines.append(f"  {pid}: {', '.join(cards)}")
 
-    # 修正1: 交渉ログの含有
-    if negotiation_messages:
-        lines.append(f"\n## 今ラウンドの交渉内容（参考）")
-        for msg in negotiation_messages[-15:]:  # 直近15件
-            sender = msg.get("sender", "?")
-            mtype = msg.get("type", "?")
-            text = msg.get("message", "")[:200]
-            if mtype == "dm":
-                to = msg.get("to", "?")
-                lines.append(f"  [{sender}→{to}] {text}")
-            else:
-                lines.append(f"  [{sender} 全体] {text}")
+    # 修正1: 交渉ログの含有（直近15件）
+    lines.extend(_render_message_list(
+        negotiation_messages or [], "今ラウンドの交渉内容（参考）", limit=15,
+    ))
 
     # 修正1: 直前のstrategyメモ
     if last_strategy:
@@ -487,6 +617,81 @@ def build_commit_prompt(
     lines.append(
         f"\n交渉で合意・宣言した内容と整合するコミットを検討してください。"
         f"\nJSON形式で回答: {json_example}"
+    )
+
+    return "\n".join(lines)
+
+
+def build_reflection_prompt(
+    player_state: PlayerState,
+    round_num: int,
+    visible_state: dict[str, Any],
+    config: GameConfig,
+    memory: str | None = None,
+) -> str:
+    """
+    Reflectionフェイズ（引き継ぎメモリ）用のユーザープロンプト
+
+    ラウンド終了直後（Settlement/Finance完了後）に呼ばれる。
+    LLMは1-shot呼出しで会話履歴を持たず、チャット・戦略メモは毎ラウンド消える。
+    次ラウンドへ持ち越せるのは、ここで書く自由記述メモ1枚だけ。
+
+    材料として渡すのは:
+      - 前ラウンドから引き継いだメモ（あれば）
+      - 今ラウンドの会話全件（DM/broadcast。交渉/コミットプロンプトと違い件数制限なし）
+      - 今ラウンドの契約義務
+      - 今ラウンドの市場結果（誰がどの市場に何を出し、誰が勝ったか）
+      - 自分の資金状況（決着・利息計上後）
+
+    Args:
+        memory: 前ラウンドから引き継いだ自由記述メモ（R1やメモ未執筆時はNone）
+    """
+    lines: list[str] = []
+    lines.append(f"=== ラウンド{round_num} / 振り返り（引き継ぎメモリ） ===\n")
+    lines.append(
+        "このラウンドを終えました。**次のラウンドに持ち越せる記憶はこのメモ1枚だけです。**\n"
+        "交渉の会話も、契約の詳細も、ここに書かなければ全て忘れます。"
+    )
+
+    # 前ラウンドから引き継いだメモ（あれば）
+    lines.extend(_render_memory_block(memory))
+
+    # 今ラウンドの市場結果（誰が何を出し、誰が勝ったか。§8.1公開情報）
+    lines.extend(_render_last_round_results(
+        visible_state, title=f"今ラウンド（R{round_num}）の結果",
+    ))
+
+    # 今ラウンドの会話（全件。交渉/コミットプロンプトと違い件数制限なし）
+    lines.extend(_render_message_list(
+        visible_state.get("messages", []), "今ラウンドの会話（全件）",
+    ))
+
+    # 契約義務（署名済み・未履行）
+    lines.extend(_render_obligations_block(player_state.player_id, visible_state, round_num))
+
+    # 契約の存在と当事者（§8.1公開情報）
+    contracts = visible_state.get("contracts_public", [])
+    if contracts:
+        lines.append("\n## 正式契約の状況")
+        for c in contracts:
+            lines.append(
+                f"  [{c['contract_id']}] 当事者: {', '.join(c['parties'])} / 状態: {c['status']}"
+            )
+
+    # 自分の資金状況（決着・利息計上後）
+    lines.append(f"\n## あなたの状態（{player_state.player_id}）")
+    lines.append(f"  現金: {player_state.cash // 10_000}万円")
+    lines.append(f"  借金残高: {player_state.debt_balance // 10_000}万円")
+    lines.append(f"  Free Cash: {player_state.free_cash // 10_000}万円")
+    hand_names = [c.rank.name for c in sorted(player_state.hand, key=lambda c: c.rank.value)]
+    lines.append(f"  残りカード: {', '.join(hand_names)}（{len(hand_names)}枚）")
+    lines.append(f"  残りラウンド: {config.num_rounds - round_num}")
+
+    lines.append(
+        f"\n次のラウンド以降の自分に残したいことを{config.memory_max_chars}字以内で自由に書いてください。\n"
+        "形式は自由（箇条書き・散文・表、何でも構いません）。何を書き、何を書かないかもあなたの判断です。\n"
+        "例えば: 誰と何を約束したか、誰が守り誰が破ったか、次に何をするつもりか、など。\n"
+        '出力: {"memory": "（ここにメモを書く）"}'
     )
 
     return "\n".join(lines)

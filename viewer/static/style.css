@@ -387,6 +387,7 @@ body {
 }
 .sit-win { color: var(--cash); font-weight: bold; }
 .sit-surge { color: #ff6b35; font-weight: bold; font-size: 0.85em; }
+.sit-carry { color: #4a9eff; font-weight: bold; font-size: 0.85em; }
 .sit-ok { color: #5cc98a; font-weight: bold; }
 .sit-debt { color: var(--pid-alt); }
 .sit-elim { color: var(--text-muted); }

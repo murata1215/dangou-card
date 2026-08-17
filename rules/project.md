@@ -45,3 +45,15 @@ Claude/DevRelayセッションはSIGALRMタイムアウトを持ち、フォア�
 ## CoT reasoningフィールドは秘匿情報（情報リーク厳禁）
 
 `engine/config.py` の `enable_cot=True` 時、LLM応答JSONの `reasoning` フィールドは `llm/response_parser.py` で `strategy["_reasoning"]` に格納され、`llm/llm_agent.py` 経由で `llm/llm_logger.py`（神視点のみ閲覧可能なJSONLログ）にのみ記録される。**`engine/game.py` の `_build_visible_state()`・`NEGOTIATION_ACTION` イベント・他プレイヤー向けプロンプトのいずれにも `reasoning`/`_reasoning` を含めてはならない**。新しい可視化経路（ビューワーAPI・イベント種別・プロンプトテンプレート等）を追加する際は、`strategy` 辞書をそのまま他プレイヤーに公開しないこと（`_reasoning` キーの混入に注意）。担保テスト: `tests/test_cot.py::TestCoTNoLeak`。
+
+## 引き継ぎメモリ（memory）は絶対にvisible_stateへ入れない・空文字で上書きしない
+
+`config.memory_enabled=True` 時、`LLMAgent._memory` は次ラウンドへ持ち越す自由記述メモ（`llm/llm_agent.py`）。
+このメモは**エージェントインスタンス内（`self._memory`）に閉じ、`engine/game.py` の `_build_visible_state()` を
+一切経由しない**ことで秘匿性を構造的に担保している。新しい可視化経路（ビューワーAPI・イベント種別・観戦パネル等）
+を追加する際は `memory`/`memory_history` を他プレイヤー向けの出力に混入させないこと。
+また `LLMAgent.reflect()` はAPI失敗・空応答・`{"memory": ""}` のいずれの場合も**前ラウンドの `self._memory` を
+変更しない**（空文字での上書き禁止）。`negotiate()`/`commit()` へ渡す `memory` は毎回 `self._memory or None` を
+参照するだけなので、reflect側で誤って空文字を書き込むと次ラウンド以降ずっと記憶が消えたまま気づかれない
+危険がある。担保テスト: `tests/test_memory.py::TestLLMAgentReflect`（`test_memory_preserved_on_api_failure` 等）・
+`TestMemorySecrecy`。

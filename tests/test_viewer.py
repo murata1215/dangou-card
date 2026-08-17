@@ -164,6 +164,59 @@ class TestGetRoundStates:
             assert len(hand) <= 12
 
 
+class TestCarryoverDisplay:
+    """
+    繰越（キャリーオーバー）表示のテスト（2026-08-17）
+
+    trial_C_20260815_202246 R4 M03 の賞金が960,000円（R3流札→繰越480,000円）
+    だった件の是正: index.html/style.css に表示要素が存在すること、
+    log_parser の round_state に carryover が正しく載ることを検証する。
+    """
+
+    def test_index_html_renders_carryover_and_no_bid(self):
+        """index.html に繰越バッジと不成立表示、style.cssに.sit-carryが存在する"""
+        base = Path(__file__).resolve().parent.parent / "viewer" / "static"
+        html = (base / "index.html").read_text(encoding="utf-8")
+        css = (base / "style.css").read_text(encoding="utf-8")
+
+        assert "sit-carry" in html
+        assert "不成立" in html
+        assert "繰越" in html
+        assert ".sit-carry" in css
+
+    def test_round_state_carries_market_carryover(self):
+        """
+        実ログ trial_C_20260815_202246 で
+        R4/M03 の carryover==480000・prize_pool==base_prize+carryover、
+        R3/M03 の participants==0 であること
+        """
+        logs_dir = Path(__file__).resolve().parent.parent / "logs" / "llm"
+        trial_dir = logs_dir / "trial_C_20260815_202246"
+        if not trial_dir.exists():
+            pytest.skip("trial_C_20260815_202246 not found")
+
+        games = list_games(logs_dir)
+        target = next(
+            (g for g in games if g["trial_dir"] == "trial_C_20260815_202246"),
+            None,
+        )
+        if target is None:
+            pytest.skip("trial_C_20260815_202246 not found in list_games")
+
+        data = get_round_states(logs_dir, target["trial_dir"], target["game_id"])
+
+        r3 = data["rounds"].get("3")
+        r4 = data["rounds"].get("4")
+        assert r3 is not None and r4 is not None
+
+        m03_r3 = next(m for m in r3["markets"] if m["market_id"] == "M03")
+        assert m03_r3["participants"] == 0
+
+        m03_r4 = next(m for m in r4["markets"] if m["market_id"] == "M03")
+        assert m03_r4["carryover"] == 480_000
+        assert m03_r4["prize_pool"] == m03_r4["base_prize"] + m03_r4["carryover"]
+
+
 class TestTokenAuth:
     """簡易認証のテスト（サーバー起動あり、httpx使用）"""
 

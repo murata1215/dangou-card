@@ -104,6 +104,26 @@ class PlayerAgent(ABC):
         """
         return False
 
+    def reflect(
+        self,
+        player_state: PlayerState,
+        round_num: int,
+        visible_state: dict,
+    ) -> None:
+        """
+        引き継ぎメモリ（Handover Memory）: ラウンド終了後の振り返り
+
+        次ラウンドへ持ち越す自由記述メモを書く機会。デフォルトは何もしない
+        （Bot/StubAgentはメモを使わないため、サブクラスでオーバーライド不要）。
+        LLMAgentのみオーバーライドしてmemoryを更新する。
+
+        Args:
+            player_state: 自分のプレイヤー状態
+            round_num: 終了したラウンドの番号
+            visible_state: 公開情報の辞書（当ラウンドの結果を含む）
+        """
+        return None
+
 
 class StubAgent(PlayerAgent):
     """

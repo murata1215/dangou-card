@@ -774,8 +774,20 @@ function renderSituation() {
     const pay = (m.prize_per_winner != null) ? `<span class="sit-win">各 +${yen(m.prize_per_winner)}</span>` : '';
     const part = (m.participants != null) ? ` / 参加${m.participants}` : '';
     const surge = m.surged ? ' <span class="sit-surge">高騰×2</span>' : '';
-    mHtml += `<div class="sit-row"><b>${m.market_id}</b> 賞金 ${yen(m.prize_pool)}${surge}${part}`
-      + (winners ? `<br>勝者 ${winners} ${pay}` : ' <span class="sit-muted">（結果待ち）</span>') + '</div>';
+    // 繰越（前ラウンド流札）の内訳バッジ。高騰と混同しないよう別クラス・別色
+    const carry = (m.carryover > 0)
+      ? ` <span class="sit-carry" title="基本${yen(m.base_prize)} + 前R繰越${yen(m.carryover)}">繰越+${yen(m.carryover)}</span>`
+      : '';
+    let resultLine;
+    if (winners) {
+      resultLine = `<br>勝者 ${winners} ${pay}`;
+    } else if (m.participants === 0) {
+      // 流札（不成立）: 決着済みだが「結果待ち」ではなく次ラウンド繰越と明示
+      resultLine = ' <span class="sit-muted">不成立（参加0）— 賞金は次ラウンドへ繰越</span>';
+    } else {
+      resultLine = ' <span class="sit-muted">（結果待ち）</span>';
+    }
+    mHtml += `<div class="sit-row"><b>${m.market_id}</b> 賞金 ${yen(m.prize_pool)}${carry}${surge}${part}${resultLine}</div>`;
   });
   mHtml += '</div>';
 
