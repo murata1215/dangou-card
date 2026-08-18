@@ -728,6 +728,137 @@ def test_budgeted_adapter_stops_when_cost_cap_too_small():
         wrapped.complete("sys", [{"role": "user", "content": "hi" * 500}], max_tokens=500)
 
 
+# ------------------------------------------------------------
+# Phase 3: BudgetedAdapter コスト計算修正（_usage_cost()統一）
+# ------------------------------------------------------------
+
+def test_budgeted_adapter_cost_includes_gemini_hidden_thinking():
+    """M3 gemini-3.5-flash: total_tokensに含まれるhidden thinkingがspent_usdに反映されること
+    （旧estimate_cost直呼びだとinput/outputしか渡さずthinking分が消えていた）"""
+    info = MODEL_REGISTRY["M3"]
+    usage = {"input_tokens": 32, "output_tokens": 5, "total_tokens": 222,
+             "cache_read_input_tokens": 0}
+    inner = _FakeUsageRichAdapter(info, usage)
+    wrapped = mm.BudgetedAdapter(inner, info, max_calls=5, max_cost=1.0, max_tokens_cap=500)
+    wrapped.complete("sys", [{"role": "user", "content": "hi"}], max_tokens=500)
+    expected = round(mm._usage_cost(info, usage), 6)
+    naive = round(estimate_cost(info, usage["input_tokens"], usage["output_tokens"]), 6)
+    assert round(wrapped.spent_usd, 6) == pytest.approx(expected, abs=1e-9)
+    assert wrapped.spent_usd > naive  # hidden thinking分が正しく加算されている
+
+
+def test_budgeted_adapter_cost_applies_cache_discount_for_xai():
+    """M4 grok-4.5: cache_read_input_tokens分が割引単価で計算されること"""
+    info = MODEL_REGISTRY["M4"]
+    usage = {"input_tokens": 526, "output_tokens": 5, "total_tokens": 573,
+             "cache_read_input_tokens": 384}
+    inner = _FakeUsageRichAdapter(info, usage)
+    wrapped = mm.BudgetedAdapter(inner, info, max_calls=5, max_cost=1.0, max_tokens_cap=500)
+    wrapped.complete("sys", [{"role": "user", "content": "hi"}], max_tokens=500)
+    expected = round(mm._usage_cost(info, usage), 6)
+    naive = round(estimate_cost(info, usage["input_tokens"], usage["output_tokens"]), 6)
+    assert round(wrapped.spent_usd, 6) == pytest.approx(expected, abs=1e-9)
+    assert wrapped.spent_usd < naive  # cache割引分が正しく減算されている
+
+
+def test_budgeted_adapter_cost_handles_cache_and_reasoning_together():
+    """H4 grok-4.6: cache割引とreasoning(thinking)差分課金が同時に発生しても二重加算されないこと"""
+    info = MODEL_REGISTRY["H4"]
+    usage = {"input_tokens": 300, "output_tokens": 40, "total_tokens": 464,
+             "cache_read_input_tokens": 128}
+    inner = _FakeUsageRichAdapter(info, usage)
+    wrapped = mm.BudgetedAdapter(inner, info, max_calls=5, max_cost=1.0, max_tokens_cap=500)
+    wrapped.complete("sys", [{"role": "user", "content": "hi"}], max_tokens=500)
+    expected = round(mm._usage_cost(info, usage), 6)
+    assert round(wrapped.spent_usd, 6) == pytest.approx(expected, abs=1e-9)
+
+
+def test_budgeted_adapter_normalizes_anthropic_cache_usage():
+    """L1 claude-haiku: Anthropic慣習（input_tokensにcache_readを含まない）が正規化されること"""
+    info = MODEL_REGISTRY["L1"]
+    usage = {"input_tokens": 50, "output_tokens": 10, "total_tokens": 60,
+             "cache_read_input_tokens": 200}
+    inner = _FakeUsageRichAdapter(info, usage)
+    wrapped = mm.BudgetedAdapter(inner, info, max_calls=5, max_cost=1.0, max_tokens_cap=500)
+    wrapped.complete("sys", [{"role": "user", "content": "hi"}], max_tokens=500)
+    expected = round(mm._usage_cost(info, usage), 6)
+    assert round(wrapped.spent_usd, 6) == pytest.approx(expected, abs=1e-9)
+    assert wrapped.spent_usd > 0
+
+
+@pytest.mark.parametrize("key,input_tokens,output_tokens", [
+    ("M2", 42, 5),
+    ("M5", 42, 8),
+    ("M6", 35, 5),
+    ("L2", 30, 6),
+])
+def test_budgeted_adapter_cost_unchanged_for_plain_usage(key, input_tokens, output_tokens):
+    """cacheもthinkingも無い通常usageでは、旧estimate_cost直呼び出しと完全に同値であること（非回帰）"""
+    info = MODEL_REGISTRY[key]
+    usage = {"input_tokens": input_tokens, "output_tokens": output_tokens,
+             "total_tokens": input_tokens + output_tokens, "cache_read_input_tokens": 0}
+    inner = _FakeUsageRichAdapter(info, usage)
+    wrapped = mm.BudgetedAdapter(inner, info, max_calls=5, max_cost=1.0, max_tokens_cap=500)
+    wrapped.complete("sys", [{"role": "user", "content": "hi"}], max_tokens=500)
+    naive = round(estimate_cost(info, input_tokens, output_tokens), 6)
+    assert round(wrapped.spent_usd, 6) == pytest.approx(naive, abs=1e-9)
+
+
+def test_budgeted_adapter_tolerates_missing_usage_fields():
+    """total_tokens/cache_read_input_tokensが無いusageでも例外を出さず算出できること"""
+    info = MODEL_REGISTRY["L2"]
+    usage = {"input_tokens": 20, "output_tokens": 4}
+    inner = _FakeUsageRichAdapter(info, usage)
+    wrapped = mm.BudgetedAdapter(inner, info, max_calls=5, max_cost=1.0, max_tokens_cap=500)
+    wrapped.complete("sys", [{"role": "user", "content": "hi"}], max_tokens=500)
+    expected = round(estimate_cost(info, 20, 4), 6)
+    assert round(wrapped.spent_usd, 6) == pytest.approx(expected, abs=1e-9)
+
+
+def test_budgeted_adapter_accumulates_cost_over_multiple_calls():
+    """3回complete()を呼ぶと、spent_usdが3×_usage_costの合計になること
+    （Phase3は1モデルあたり複数コールが発生するため、コール単位の加算が正しいことの確認）"""
+    info = MODEL_REGISTRY["M2"]
+    usage = {"input_tokens": 42, "output_tokens": 5, "total_tokens": 47,
+             "cache_read_input_tokens": 0}
+    inner = _FakeUsageRichAdapter(info, usage)
+    wrapped = mm.BudgetedAdapter(inner, info, max_calls=5, max_cost=1.0, max_tokens_cap=500)
+    for _ in range(3):
+        wrapped.complete("sys", [{"role": "user", "content": "hi"}], max_tokens=500)
+    expected = round(3 * mm._usage_cost(info, usage), 6)
+    assert round(wrapped.spent_usd, 6) == pytest.approx(expected, abs=1e-9)
+    assert wrapped.calls_made == 3
+
+
+def test_budgeted_adapter_blocks_next_call_when_budget_reached():
+    """修正後の実コストに基づき、予算到達後は次のcomplete()がAdapterErrorになること
+    （既存の事前ガード＝worst-case予約方式の維持確認。Geminiのhidden thinkingを含む
+    実コストで2コール分ちょうどの予算を与え、3コール目がブロックされることを確認）"""
+    info = MODEL_REGISTRY["M3"]
+    usage = {"input_tokens": 32, "output_tokens": 5, "total_tokens": 222,
+             "cache_read_input_tokens": 0}
+    per_call = mm._usage_cost(info, usage)
+    inner = _FakeUsageRichAdapter(info, usage)
+    wrapped = mm.BudgetedAdapter(inner, info, max_calls=10, max_cost=per_call * 2 + 1e-9,
+                                  max_tokens_cap=50)
+    wrapped.complete("sys", [{"role": "user", "content": "hi"}], max_tokens=50)
+    wrapped.complete("sys", [{"role": "user", "content": "hi"}], max_tokens=50)
+    with pytest.raises(AdapterError):
+        wrapped.complete("sys", [{"role": "user", "content": "hi"}], max_tokens=50)
+    assert wrapped.calls_made == 2
+
+
+def test_budgeted_adapter_does_not_charge_on_inner_error():
+    """innerがAdapterErrorを投げた場合、calls_made/spent_usdとも加算されないこと（現行仕様の明文化）"""
+    info = MODEL_REGISTRY["L1"]
+    inner = _FakeErrorAdapter(info)
+    wrapped = mm.BudgetedAdapter(inner, info, max_calls=5, max_cost=1.0, max_tokens_cap=50)
+    with pytest.raises(AdapterError):
+        wrapped.complete("sys", [{"role": "user", "content": "hi"}], max_tokens=50)
+    assert wrapped.calls_made == 0
+    assert wrapped.spent_usd == 0.0
+
+
 class _FakeEvent:
     def __init__(self, event_type, data):
         self.event_type = event_type
@@ -813,6 +944,55 @@ def test_phase3_saves_logs_even_when_game_raises(tmp_path, monkeypatch):
     assert (tmp_path / "phase3" / "L1" / "game01_events.jsonl").exists()
     llm_log_files = list((tmp_path / "phase3" / "L1" / "llm_logs").glob("*.jsonl"))
     assert len(llm_log_files) >= 1
+
+
+def test_phase3_game_records_corrected_cost(tmp_path, monkeypatch):
+    """_run_one_phase3_gameが、hidden thinkingを含む実コストをcost_usdに正しく記録すること
+    （旧estimate_cost直呼びの値とは一致しないこと）"""
+    m3 = MODEL_REGISTRY["M3"]
+    usage = {"input_tokens": 32, "output_tokens": 5, "total_tokens": 222,
+             "cache_read_input_tokens": 0}
+
+    def _factory(model_info, max_retries=None):
+        return _FakeGameJsonUsageAdapter(model_info, usage)
+    monkeypatch.setattr(mm, "create_adapter", _factory)
+    result = mm._run_one_phase3_game("M3", m3, tmp_path, seed=1, max_calls=20,
+                                       max_cost_per_model=1.0, max_tokens=500)
+    per_call = mm._usage_cost(m3, usage)
+    expected = round(result["calls_made"] * per_call, 6)
+    naive = round(
+        result["calls_made"] * estimate_cost(m3, usage["input_tokens"], usage["output_tokens"]), 6)
+    assert result["calls_made"] >= 1
+    assert result["cost_usd"] == pytest.approx(expected, abs=1e-6)
+    assert result["cost_usd"] != pytest.approx(naive, abs=1e-9)
+
+
+def test_phase3_records_cost_to_state_jsonl_and_report(tmp_path, monkeypatch):
+    """state / phase3_calls.jsonl / phase3_report.md / budget.spent_usd が同一の修正後コストを示すこと"""
+    m3 = MODEL_REGISTRY["M3"]
+    usage = {"input_tokens": 32, "output_tokens": 5, "total_tokens": 222,
+             "cache_read_input_tokens": 0}
+
+    def _factory(model_info, max_retries=None):
+        return _FakeGameJsonUsageAdapter(model_info, usage)
+    monkeypatch.setattr(mm, "create_adapter", _factory)
+    monkeypatch.setenv(m3.env_key, "fake-key")
+    run_dir = tmp_path / "run1"
+    state = mm._init_state("run1", 1.0, ["M3"])
+    state["phases"]["1"] = {"status": "done"}
+    state["phases"]["2"] = {"status": "done"}
+    state["models"]["M3"]["phase1"] = {"status": "pass"}
+    state["models"]["M3"]["phase2"] = {"status": "pass"}
+    mm.run_phase3(run_dir, state, ["M3"], max_cost=1.0, max_cost_total=1.0,
+                   max_cost_per_model=1.0, max_calls=20, max_tokens=500,
+                   seed=1, resume=False, force=False, dry_run=False)
+    cost = state["models"]["M3"]["phase3"]["cost_usd"]
+    assert cost > 0
+    assert state["budget"]["spent_usd"] == pytest.approx(cost, abs=1e-9)
+    line = json.loads((run_dir / "phase3_calls.jsonl").read_text(encoding="utf-8").strip().splitlines()[0])
+    assert line["cost_usd"] == pytest.approx(cost, abs=1e-9)
+    report_text = (run_dir / "phase3_report.md").read_text(encoding="utf-8")
+    assert f"${cost:.4f}" in report_text
 
 
 # ============================================================

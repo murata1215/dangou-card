@@ -55,6 +55,25 @@ Season 2 決勝編成向けに強6モデル（H1〜H6, フラッグシップ級�
 - Phase 3 `BudgetedAdapter.complete` にも同一バグが残存することを確認したが、予算ガードロジックへの
   影響評価が必要なため今回はスコープ外として申し送り
 
+**Phase 3 BudgetedAdapterコスト計算修正（本サイクル）:**
+- `BudgetedAdapter.complete()`（`scripts/model_matrix.py`）が旧式の
+  `estimate_cost(info, input, output)` を直接呼んでおり、`cache_read_input_tokens`/`total_tokens`
+  未指定のため Gemini hidden thinking・xAI cache割引・Anthropic正規化が予算消費 `spent_usd` へ
+  反映されていなかったバグを1行修正で解消（`cost = _usage_cost(self._model_info, usage)`）
+- 事前ガード（`spent_usd + worst > max_cost` のworst-case予約チェック）は既に構造的に正しいため変更
+  せず、事後の実コスト計上のみを修正。Phase 3 は1モデルあたり3〜7回のAPI呼び出しがあり
+  `BudgetedAdapter` は既にコール単位で `spent_usd` を正しく累積しているため、集計ロジックの
+  再設計は不要と判断
+- Phase 3 は未実行で成果物が存在しなかったため、履歴の再計算・書き換えは発生せず
+- これでPhase 1/2/3すべてが `_usage_cost()` に統一され、`scripts/model_matrix.py` からの
+  `estimate_cost()` 直接呼び出しは `_usage_cost()` 内部のみに
+- テスト14件追加（Gemini hidden thinking / xAI cache割引 / cache+reasoning併存 / Anthropic正規化 /
+  通常ケース非回帰4件 / 欠損フィールド耐性 / 複数コール累積 / 予算到達ブロック / API例外時非課金 /
+  state・JSONL・report反映2件）、全570件PASS
+- 残余課題: `_worst_case_cost`（`scripts/model_smoke.py`）がhidden thinkingを見込まない事前予約の
+  過小評価、および `llm/llm_agent.py` 自前コスト計算のAnthropic正規化漏れは別課題として
+  `rules/project.md` に明記し保留
+
 ### 変更
 - `llm/models.py`: H1〜H6追加、`max_tokens_param`/`supports_temperature`フィールド新設
 - `llm/adapters.py`: `create_adapter`/`OpenAICompatAdapter` に `max_retries` パラメータ追加、

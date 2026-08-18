@@ -86,6 +86,7 @@
 - 2026-08-18 07:05 JST | 18モデル疎通テスト基盤 Phase 1 実行: 強6モデル実API疎通5/6成功、gpt-5.6-solがmax_completion_tokens要求で400失敗(報告のみ)、L6+M6+H6=18モデル累積$0.008537を確認 → 2026-08-18_070556.md
 - 2026-08-18 08:12 JST | H2(gpt-5.6-sol) Phase 1再テスト: max_tokens_param/supports_temperatureをModelInfoに追加しリトライ責務をmodel_matrixへ一本化(HTTP最大1回)、実API1コールでpass・18モデル全通過$0.0090を確認 → 2026-08-18_081245.md
 - 2026-08-18 11:04 JST | サイクルE: Phase 2 コスト計算修正: run_phase2のestimate_cost直呼びを_usage_cost()に統一(Gemini hidden thinking/xAI cache割引/Anthropic正規化を反映)、Phase2未実行のため履歴影響ゼロ、テスト12件追加で全556件PASS → 2026-08-18_110406.md
+- 2026-08-18 12:48 JST | サイクルF: Phase 3 BudgetedAdapterコスト計算修正: complete()内のestimate_cost直呼びを_usage_cost()に統一(予算消費spent_usdへhidden thinking/cache割引/Anthropic正規化を正しく反映)、Phase3未実行のため履歴影響ゼロ、テスト14件追加で全570件PASS → 2026-08-18_124843.md
 
 ### 2026-08-16 10:03 JST | コストログ化 Stage 2: 単価表拡張・estimate_cost内訳対応・確定単価反映
 

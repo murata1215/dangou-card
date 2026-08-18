@@ -658,7 +658,9 @@ class BudgetedAdapter:
         if self.spent_usd + worst > self.max_cost:
             raise AdapterError(f"BudgetedAdapter: 予算上限(${self.max_cost:.2f})超過見込み")
         text, usage = self._inner.complete(system, messages, max_tokens=clamped, temperature=temperature)
-        cost = estimate_cost(self._model_info, usage.get("input_tokens", 0), usage.get("output_tokens", 0))
+        # Phase 1/2 と同一の実測usageベース計算に統一
+        # （hidden thinking / cache割引 / Anthropic正規化を予算消費へ正しく反映）
+        cost = _usage_cost(self._model_info, usage)
         self.calls_made += 1
         self.spent_usd += cost
         return text, usage

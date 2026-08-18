@@ -81,9 +81,15 @@ total_tokens=0)` はキャッシュ割引・thinking差分課金に対応して�
 のみ`input_tokens`へ`cache_read_input_tokens`を合算してから`estimate_cost`へ渡す正規化を行う）。
 新しいコスト記録経路（新フェーズ・新スクリプト・ビューワー集計等）を追加する際は `estimate_cost()`
 を素朴にinput/outputだけで呼ばないこと。担保テスト: `tests/test_model_matrix.py`
-（`test_usage_cost_*`・`test_phase1_records_corrected_cost_*`・`test_phase2_cost_*`）。
-**既知の未修正箇所**: `scripts/model_matrix.py` の Phase 3 `BudgetedAdapter.complete` は同一バグを
-残したまま（予算ガードロジックへの影響評価が必要なため意図的にスコープ外。修正時は要注意）。
+（`test_usage_cost_*`・`test_phase1_records_corrected_cost_*`・`test_phase2_cost_*`・
+`test_budgeted_adapter_cost_*`・`test_phase3_game_records_corrected_cost`・
+`test_phase3_records_cost_to_state_jsonl_and_report`）。Phase 1/2/3 とも `_usage_cost()` へ統一済み
+（Phase 3 `BudgetedAdapter.complete` は2026-08-18に修正、予算消費判定 `spent_usd` にも正しく反映される）。
+**既知の残余課題**: (1) `_worst_case_cost`（`scripts/model_smoke.py`）は hidden thinking を見込まないため
+事前予約が過小気味（Phase 1/2/3・model_smoke共用、意図的にスコープ外）。(2) `llm/llm_agent.py`
+`_call_llm` 内の自前コスト計算は cache_read/total_tokens は渡すがAnthropic正規化（`input_tokens`への
+`cache_read_input_tokens`合算）を行っていないため、`llm_logs` のコストと `BudgetedAdapter.spent_usd`
+がAnthropicモデルでのみ乖離しうる（別課題として保留）。
 
 ## OpenAI互換アダプタのリトライは `--retries N` ⇔ HTTP最大 `N+1` 回の1対1対応を崩さない
 
