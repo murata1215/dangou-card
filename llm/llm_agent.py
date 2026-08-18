@@ -18,9 +18,11 @@ from engine.models import (
 )
 from engine.config import GameConfig
 from llm.adapters import AnthropicAdapter, OpenAICompatAdapter, GeminiStub, AdapterError, _classify_error
-from llm.models import ModelInfo, estimate_cost
+from llm.models import ModelInfo
+from llm.costing import usage_cost, worst_case_cost
+from llm.game_cost_budget import BudgetBlockedError, GameCostBudget, Reservation
 from llm.constants import (
-    DEFAULT_TEMPERATURE, DEFAULT_MAX_TOKENS, MAX_RETRIES, COST_LIMIT_PER_GAME,
+    DEFAULT_TEMPERATURE, DEFAULT_MAX_TOKENS, MAX_RETRIES,
     AUTO_PASS_ON_NO_NEWS,
 )
 from llm.prompt_builder import (
@@ -55,6 +57,7 @@ class LLMAgent(PlayerAgent):
         self._config: GameConfig | None = config
         self._system_prompt: str = ""
         self._cost_exceeded: bool = False
+        self._game_cost_budget: GameCostBudget | None = None
         # strategyメモの記録（観戦・分析用）
         self.strategy_history: list[dict[str, Any]] = []
         # AUTO COMMIT発生回数の記録
@@ -81,6 +84,10 @@ class LLMAgent(PlayerAgent):
             if reasoning is not None:
                 self.llm_logger._entries[-1]["reasoning"] = reasoning
 
+    def set_game_cost_budget(self, budget: GameCostBudget) -> None:
+        """Gameから明示注入される本戦専用の共有budget。"""
+        self._game_cost_budget = budget
+
     def _call_llm(
         self,
         phase: str,
@@ -91,13 +98,31 @@ class LLMAgent(PlayerAgent):
         """
         LLM APIを呼び出し、レスポンスとusageを返す
 
-        コスト上限超過時は空文字列を返す。
+        本戦budgetの事前予約がcapを超える場合はBudgetBlockedErrorを送出する。
+        呼出元はこれを通常のAPI/JSON失敗と区別して即fallbackへ移行する。
         修正7: AdapterError発生時にerror_typeを分類してログに記録
         """
-        if self._cost_exceeded:
-            return "", {"input_tokens": 0, "output_tokens": 0}
-
         effective_max_tokens = self.model_info.max_tokens or DEFAULT_MAX_TOKENS
+        reservation: Reservation | None = None
+        if self._game_cost_budget is not None:
+            reserved = worst_case_cost(self.model_info, self._system_prompt, user_prompt, effective_max_tokens)
+            try:
+                reservation = self._game_cost_budget.reserve(
+                    self.player_id, reserved, round_num=round_num, phase=phase, turn=turn,
+                )
+            except BudgetBlockedError as e:
+                self._cost_exceeded = True
+                self.llm_logger.log_budget_block(
+                    player_id=self.player_id, model_id=self.model_info.model_id,
+                    phase=phase, round_num=round_num, turn=turn,
+                    system_prompt=self._system_prompt, user_prompt=user_prompt,
+                    reason=e.reason, estimated_cost_usd=reserved,
+                    player_spent_usd=self._game_cost_budget.player_spent_usd.get(self.player_id, 0.0),
+                    game_spent_usd=self._game_cost_budget.game_spent_usd,
+                    per_player_cap_usd=self._game_cost_budget.per_player_cap_usd,
+                    game_cap_usd=self._game_cost_budget.game_cap_usd,
+                )
+                raise
         start = time.time()
         error_msg = None
         error_type = None
@@ -120,13 +145,12 @@ class LLMAgent(PlayerAgent):
             error_type = "other"
 
         elapsed = (time.time() - start) * 1000
-        cost = estimate_cost(
-            self.model_info,
-            usage.get("input_tokens", 0),
-            usage.get("output_tokens", 0),
-            cache_read_input_tokens=usage.get("cache_read_input_tokens", 0),
-            total_tokens=usage.get("total_tokens", 0),
-        )
+        cost = usage_cost(self.model_info, usage)
+        if reservation is not None:
+            if error_msg is None:
+                self._game_cost_budget.settle(reservation, cost)
+            else:
+                self._game_cost_budget.release(reservation)
 
         finish_reason = usage.get("finish_reason")
         self.llm_logger.log_call(
@@ -150,10 +174,6 @@ class LLMAgent(PlayerAgent):
 
         self.total_calls += 1
 
-        # コスト上限チェック
-        if self.llm_logger.total_cost > COST_LIMIT_PER_GAME:
-            self._cost_exceeded = True
-
         return text, usage
 
     def choose_loan(self, config: GameConfig) -> int:
@@ -162,7 +182,10 @@ class LLMAgent(PlayerAgent):
         self._system_prompt = build_system_prompt(self.player_id, config)
 
         user_prompt = build_loan_prompt(config)
-        text, _ = self._call_llm("loan_choice", 0, user_prompt)
+        try:
+            text, _ = self._call_llm("loan_choice", 0, user_prompt)
+        except BudgetBlockedError:
+            return 3_000_000
 
         data = extract_json(text)
         if data:
@@ -216,9 +239,12 @@ class LLMAgent(PlayerAgent):
         # リトライループ
         messages_so_far = user_prompt
         for retry in range(MAX_RETRIES + 1):
-            text, usage = self._call_llm(
-                "negotiation", round_num, messages_so_far, turn=turn,
-            )
+            try:
+                text, usage = self._call_llm(
+                    "negotiation", round_num, messages_so_far, turn=turn,
+                )
+            except BudgetBlockedError:
+                return PassAction(player_id=self.player_id)
 
             if not text:
                 return PassAction(player_id=self.player_id)
@@ -276,7 +302,11 @@ class LLMAgent(PlayerAgent):
 
         original_prompt = user_prompt
         for retry in range(MAX_RETRIES + 1):
-            text, usage = self._call_llm("commit", round_num, user_prompt)
+            try:
+                text, usage = self._call_llm("commit", round_num, user_prompt)
+            except BudgetBlockedError:
+                self.auto_commit_count += 1
+                raise
 
             if not text:
                 self.auto_commit_count += 1
@@ -330,7 +360,10 @@ class LLMAgent(PlayerAgent):
             player_state, prize_won, round_num, visible_state, self._config,
         )
 
-        text, _ = self._call_llm("double_up", round_num, user_prompt)
+        try:
+            text, _ = self._call_llm("double_up", round_num, user_prompt)
+        except BudgetBlockedError:
+            return False
         if not text:
             return False
 
@@ -388,7 +421,10 @@ class LLMAgent(PlayerAgent):
             memory=self._memory or None,
         )
 
-        text, _ = self._call_llm("reflection", round_num, user_prompt)
+        try:
+            text, _ = self._call_llm("reflection", round_num, user_prompt)
+        except BudgetBlockedError:
+            return
         if not text:
             # API失敗・空応答 — 前ラウンドのメモを維持
             return

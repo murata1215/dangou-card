@@ -98,9 +98,18 @@ class AnthropicAdapter:
     修正7: タイムアウト + リトライ
     """
 
-    def __init__(self, model_info: ModelInfo) -> None:
+    def __init__(
+        self,
+        model_info: ModelInfo,
+        max_retries: int | None = None,
+        allow_temperature_fallback: bool = True,
+    ) -> None:
         self.model_info = model_info
         self._client = None
+        # None は従来どおり adapter/SDK の既定 retry を使う。
+        # Phase 2 は 0 を渡し、クライアント側の再送を抑止する。
+        self._max_retries = max_retries
+        self._allow_temperature_fallback = allow_temperature_fallback
 
     def _get_client(self) -> Any:
         """遅延初期化でクライアントを取得（キーをログに出さない）"""
@@ -113,10 +122,13 @@ class AnthropicAdapter:
                     f"Environment variable {self.model_info.env_key} is not set"
                 )
             # モデル別タイムアウト設定
-            self._client = anthropic.Anthropic(
-                api_key=api_key,
-                timeout=httpx.Timeout(self.model_info.timeout_seconds),
-            )
+            kwargs: dict[str, Any] = {
+                "api_key": api_key,
+                "timeout": httpx.Timeout(self.model_info.timeout_seconds),
+            }
+            if self._max_retries is not None:
+                kwargs["max_retries"] = self._max_retries
+            self._client = anthropic.Anthropic(**kwargs)
         return self._client
 
     def complete(
@@ -134,7 +146,8 @@ class AnthropicAdapter:
             usage辞書にはcache_read_input_tokensも含む
         """
         last_error = None
-        for attempt in range(API_MAX_RETRIES + 1):
+        attempts = API_MAX_RETRIES if self._max_retries is None else self._max_retries
+        for attempt in range(attempts + 1):
             try:
                 client = self._get_client()
                 # 修正3: system部にcache_controlを付与
@@ -154,7 +167,11 @@ class AnthropicAdapter:
                 try:
                     response = client.messages.create(temperature=temperature, **kwargs)
                 except Exception as temp_err:
-                    if "temperature" in str(temp_err).lower() and "deprecated" in str(temp_err).lower():
+                    if (
+                        self._allow_temperature_fallback
+                        and "temperature" in str(temp_err).lower()
+                        and "deprecated" in str(temp_err).lower()
+                    ):
                         response = client.messages.create(**kwargs)
                     else:
                         raise
@@ -185,7 +202,7 @@ class AnthropicAdapter:
 
             except Exception as e:
                 last_error = e
-                if attempt < API_MAX_RETRIES and _should_retry(e):
+                if attempt < attempts and _should_retry(e):
                     # 指数バックオフ: 1秒, 2秒
                     wait = 2 ** attempt
                     time.sleep(wait)
@@ -208,13 +225,19 @@ class OpenAICompatAdapter:
     修正7: タイムアウト + リトライ
     """
 
-    def __init__(self, model_info: ModelInfo, max_retries: int | None = None) -> None:
+    def __init__(
+        self,
+        model_info: ModelInfo,
+        max_retries: int | None = None,
+        allow_temperature_fallback: bool = True,
+    ) -> None:
         self.model_info = model_info
         self._client = None
         # None → 従来どおり（アダプタ内部: API_MAX_RETRIES / SDK: 既定リトライ）
         # 0    → アダプタ内部リトライ・SDK内部リトライとも完全に無効化する
-        #        （Phase 1のmodel_matrixが唯一の再試行制御点になる呼び出し専用）
+        #        （matrixのstrict呼び出し用）
         self._max_retries = max_retries
+        self._allow_temperature_fallback = allow_temperature_fallback
 
     def _get_client(self) -> Any:
         """遅延初期化でクライアントを取得"""
@@ -267,7 +290,11 @@ class OpenAICompatAdapter:
                 try:
                     response = client.chat.completions.create(**create_kwargs)
                 except Exception as temp_err:
-                    if self.model_info.supports_temperature and "temperature" in str(temp_err).lower():
+                    if (
+                        self._allow_temperature_fallback
+                        and self.model_info.supports_temperature
+                        and "temperature" in str(temp_err).lower()
+                    ):
                         # temperature制限のあるモデル: temperature省略で再試行
                         create_kwargs.pop("temperature", None)
                         response = client.chat.completions.create(**create_kwargs)
@@ -327,21 +354,36 @@ class GeminiStub:
 
 
 def create_adapter(
-    model_info: ModelInfo, max_retries: int | None = None
+    model_info: ModelInfo,
+    max_retries: int | None = None,
+    allow_temperature_fallback: bool = True,
 ) -> AnthropicAdapter | OpenAICompatAdapter | GeminiStub:
     """
     ModelInfoからアダプタを自動選択して生成する
 
-    max_retries: openai_compat / gemini アダプタのアダプタ内部リトライ・
-    OpenAI SDK内部リトライを上書きする（None → 従来どおり）。
-    anthropicアダプタは現状 max_retries 未対応（スコープ外）。
+    max_retries: adapter / SDK の内部リトライを上書きする
+    （None → 従来どおり）。
+    allow_temperature_fallback: temperature エラー時に、temperature を外して
+    同一 logical call 内で再送する従来の互換フォールバックを許可する。
     """
     if model_info.adapter_type == "anthropic":
-        return AnthropicAdapter(model_info)
+        return AnthropicAdapter(
+            model_info,
+            max_retries=max_retries,
+            allow_temperature_fallback=allow_temperature_fallback,
+        )
     elif model_info.adapter_type == "openai_compat":
-        return OpenAICompatAdapter(model_info, max_retries=max_retries)
+        return OpenAICompatAdapter(
+            model_info,
+            max_retries=max_retries,
+            allow_temperature_fallback=allow_temperature_fallback,
+        )
     elif model_info.adapter_type == "gemini":
         # GeminiはOpenAI互換エンドポイントを使用（google-genai SDK不要）
-        return OpenAICompatAdapter(model_info, max_retries=max_retries)
+        return OpenAICompatAdapter(
+            model_info,
+            max_retries=max_retries,
+            allow_temperature_fallback=allow_temperature_fallback,
+        )
     else:
         raise ValueError(f"Unknown adapter type: {model_info.adapter_type}")

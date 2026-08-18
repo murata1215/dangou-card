@@ -109,6 +109,20 @@ uv run python scripts/model_matrix.py --phase 1 --keys H1,H2,H3 --max-cost 0.1
 uv run python scripts/model_matrix.py --phase 2 --resume
 ```
 
+Phase 2の有料比較は、各モデルにつきクライアントからの送信を1回に抑えるため、adapter/SDK retryと
+temperature互換フォールバックを無効化する。成功・parse失敗を問わず、APIが返した本文全文は
+`logs/model_matrix/<run-id>/phase2_calls.jsonl` の `response_text` に保存される。既存runを継続する場合は、
+通算上限を変えないよう `--max-cost-total` を明示する。
+
+```bash
+uv run python scripts/model_matrix.py --phase 2 --run-id run_20260818_041810 \
+  --resume --tier all --max-cost 0.22 --max-cost-per-model 0.03 \
+  --max-calls 24 --max-tokens 400 --retries 0 --max-cost-total 0.25
+```
+
+実API前には同じ引数へ `--dry-run` を付け、出力をレビューしてから別途承認する。dry-runはAPI・state・
+`phase2_calls.jsonl` を変更しないが、集計レポートを再生成する副作用がある。
+
 コスト計算は全フェーズで実測usageベースの `_usage_cost()` に統一されており、Geminiのhidden
 thinking・xAI等のキャッシュ割引・Anthropicのusage慣習差を正しく反映する。詳細は `rules/project.md`
 の該当節を参照。

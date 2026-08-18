@@ -108,7 +108,7 @@ class _FakeGameJsonUsageAdapter:
 
 
 def _fake_create_adapter_factory(cls):
-    def _factory(model_info, max_retries=None):
+    def _factory(model_info, max_retries=None, **kwargs):
         return cls(model_info)
     return _factory
 
@@ -237,7 +237,7 @@ def test_phase1_always_creates_adapter_with_zero_lower_retries(monkeypatch):
     （アダプタ内部リトライ・OpenAI SDK内部リトライを常に無効化する）"""
     captured = []
 
-    def _factory(model_info, max_retries=None):
+    def _factory(model_info, max_retries=None, **kwargs):
         captured.append(max_retries)
         return _FakeOkAdapter(model_info)
 
@@ -263,7 +263,7 @@ def test_phase1_retries_are_outer_loop_only(monkeypatch):
             complete_calls["n"] += 1
             raise AdapterError("fake 429 for test")
 
-    def _factory(model_info, max_retries=None):
+    def _factory(model_info, max_retries=None, **kwargs):
         create_calls.append(max_retries)
         return _AlwaysFailAdapter(model_info)
 
@@ -288,7 +288,7 @@ def test_phase1_zero_retries_calls_complete_once(monkeypatch):
             complete_calls["n"] += 1
             raise AdapterError("fake error for test")
 
-    def _factory(model_info, max_retries=None):
+    def _factory(model_info, max_retries=None, **kwargs):
         return _AlwaysFailAdapter(model_info)
 
     monkeypatch.setattr(mm, "create_adapter", _factory)
@@ -402,7 +402,7 @@ def test_model_match_normalizes_models_prefix():
 # ============================================================
 
 def test_phase1_records_requested_and_matching_response_model(tmp_path, monkeypatch):
-    def _factory(model_info, max_retries=None):
+    def _factory(model_info, max_retries=None, **kwargs):
         return _FakeOkAdapterWithResponseModel(model_info, response_model=model_info.model_id)
     monkeypatch.setattr(mm, "create_adapter", _factory)
     monkeypatch.setenv(MODEL_REGISTRY["L1"].env_key, "fake-key")
@@ -421,7 +421,7 @@ def test_phase1_records_requested_and_matching_response_model(tmp_path, monkeypa
 
 
 def test_phase1_records_mismatch_response_model(tmp_path, monkeypatch):
-    def _factory(model_info, max_retries=None):
+    def _factory(model_info, max_retries=None, **kwargs):
         return _FakeOkAdapterWithResponseModel(model_info, response_model="some-other-model")
     monkeypatch.setattr(mm, "create_adapter", _factory)
     monkeypatch.setenv(MODEL_REGISTRY["L1"].env_key, "fake-key")
@@ -449,7 +449,7 @@ def test_phase1_fail_records_response_model_none(tmp_path, monkeypatch):
 
 
 def test_generate_phase1_report_shows_requested_returned_and_match(tmp_path, monkeypatch):
-    def _factory(model_info, max_retries=None):
+    def _factory(model_info, max_retries=None, **kwargs):
         return _FakeOkAdapterWithResponseModel(model_info, response_model=model_info.model_id)
     monkeypatch.setattr(mm, "create_adapter", _factory)
     monkeypatch.setenv(MODEL_REGISTRY["L1"].env_key, "fake-key")
@@ -464,7 +464,7 @@ def test_generate_phase1_report_shows_requested_returned_and_match(tmp_path, mon
 
 
 def test_generate_final_report_shows_returned_column_and_mismatch_mark(tmp_path, monkeypatch):
-    def _factory(model_info, max_retries=None):
+    def _factory(model_info, max_retries=None, **kwargs):
         return _FakeOkAdapterWithResponseModel(model_info, response_model="unexpected-model-xyz")
     monkeypatch.setattr(mm, "create_adapter", _factory)
     monkeypatch.setenv(MODEL_REGISTRY["L1"].env_key, "fake-key")
@@ -542,6 +542,56 @@ def test_phase2_records_emotion_and_parse_ok(tmp_path, monkeypatch):
     assert state["models"]["L1"]["phase2"]["pure_json"] is True
 
 
+def test_phase2_uses_strict_single_request_adapter_and_records_full_response(tmp_path, monkeypatch):
+    """Phase 2 だけが再送抑止を依頼し、JSONLには本文全文を保存すること。"""
+    raw_response = (
+        "前置きの説明です。\n```json\n"
+        '{"strategy":{"reason":"' + ("長い理由" * 100) + '","emotion":"楽"},'
+        '"action":{"type":"pass"}}\n```\n後置きの説明です。'
+    )
+    captured_kwargs = {}
+
+    class RawAdapter:
+        def complete(self, *args, **kwargs):
+            return raw_response, {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "response_model": MODEL_REGISTRY["L1"].model_id,
+            }
+
+    def factory(model_info, **kwargs):
+        captured_kwargs.update(kwargs)
+        return RawAdapter()
+
+    monkeypatch.setattr(mm, "create_adapter", factory)
+    run_dir = tmp_path / "run1"
+    state = mm._init_state("run1", 1.0, ["L1"])
+    state["phases"]["1"] = {"status": "done"}
+    state["models"]["L1"]["phase1"] = {"status": "pass"}
+
+    mm.run_phase2(run_dir, state, ["L1"], max_cost=1.0, max_cost_total=1.0,
+                  max_cost_per_model=1.0, max_calls=10, max_tokens=400,
+                  resume=False, force=False, dry_run=False)
+
+    assert captured_kwargs == {"max_retries": 0, "allow_temperature_fallback": False}
+    record = json.loads((run_dir / "phase2_calls.jsonl").read_text(encoding="utf-8"))
+    assert record["response_text"] == raw_response
+    assert len(record["response_text"]) > 300
+    assert record["text_sample"] == raw_response.strip()[:300]
+    assert record["requested_model"] == MODEL_REGISTRY["L1"].model_id
+    assert record["response_model"] == MODEL_REGISTRY["L1"].model_id
+    assert record["model_match"] == "match"
+    assert state["models"]["L1"]["phase2"]["model_match"] == "match"
+
+
+def test_phase2_adapter_error_records_no_raw_response(monkeypatch):
+    """API本文を受け取れない例外では response_text を偽装保存しないこと。"""
+    monkeypatch.setattr(mm, "create_adapter", _fake_create_adapter_factory(_FakeErrorAdapter))
+    result = mm._call_once_phase2(MODEL_REGISTRY["L1"], 400)
+    assert result["response_text"] is None
+    assert result["response_model"] is None
+
+
 # ============================================================
 # Phase 2 コスト計算修正: _usage_cost() へ統一（旧estimate_cost直呼び出しのバグ修正）
 # ============================================================
@@ -550,7 +600,7 @@ def _run_phase2_single(tmp_path, key, usage, monkeypatch):
     """1モデルだけPhase2を実行し、(state, run_dir, adapter)を返す共通ヘルパー"""
     model = MODEL_REGISTRY[key]
 
-    def _factory(model_info, max_retries=None):
+    def _factory(model_info, max_retries=None, **kwargs):
         return _FakeGameJsonUsageAdapter(model_info, usage)
     monkeypatch.setattr(mm, "create_adapter", _factory)
     monkeypatch.setenv(model.env_key, "fake-key")
@@ -681,7 +731,7 @@ def test_phase2_makes_exactly_one_api_call(tmp_path, monkeypatch):
               "cache_read_input_tokens": 0}
     captured_adapter = {}
 
-    def _factory(model_info, max_retries=None):
+    def _factory(model_info, max_retries=None, **kwargs):
         adapter = _FakeGameJsonUsageAdapter(model_info, usage)
         captured_adapter["adapter"] = adapter
         return adapter
@@ -959,7 +1009,7 @@ def test_phase3_game_records_corrected_cost(tmp_path, monkeypatch):
     usage = {"input_tokens": 32, "output_tokens": 5, "total_tokens": 222,
              "cache_read_input_tokens": 0}
 
-    def _factory(model_info, max_retries=None):
+    def _factory(model_info, max_retries=None, **kwargs):
         return _FakeGameJsonUsageAdapter(model_info, usage)
     monkeypatch.setattr(mm, "create_adapter", _factory)
     result = mm._run_one_phase3_game("M3", m3, tmp_path, seed=1, max_calls=20,
@@ -979,7 +1029,7 @@ def test_phase3_records_cost_to_state_jsonl_and_report(tmp_path, monkeypatch):
     usage = {"input_tokens": 32, "output_tokens": 5, "total_tokens": 222,
              "cache_read_input_tokens": 0}
 
-    def _factory(model_info, max_retries=None):
+    def _factory(model_info, max_retries=None, **kwargs):
         return _FakeGameJsonUsageAdapter(model_info, usage)
     monkeypatch.setattr(mm, "create_adapter", _factory)
     monkeypatch.setenv(m3.env_key, "fake-key")
@@ -1143,18 +1193,36 @@ def test_phase1_records_corrected_cost_in_state_and_jsonl(tmp_path, monkeypatch)
 
 # ============================================================
 # hidden_thinking_reserve_tokens 対応（2026-08-18）
-# 事前予算ガード worst_case_cost() の見積是正 — 予算上限は変更しない
+# 事前予算ガード worst_case_cost() とPhase 2 per-model予算
 # ============================================================
 
-def test_phase_defaults_unchanged():
-    """本サイクルでは見積式のみを是正し、予算上限(PHASE_DEFAULTS/DEFAULT_MAX_COST_TOTAL)は
-    一切変更していないことをリテラル固定値で回帰保証する"""
+def test_phase_defaults_phase2_per_model_cap_is_adjusted_only():
+    """Phase 2のper-modelだけを$0.03へ上げ、他の既定予算は不変に保つ。"""
     assert mm.PHASE_DEFAULTS == {
         1: {"max_cost": 0.08, "max_cost_per_model": 0.02, "max_calls": 40, "max_tokens": 64, "retries": 1},
-        2: {"max_cost": 0.22, "max_cost_per_model": 0.02, "max_calls": 24, "max_tokens": 400, "retries": 0},
+        2: {"max_cost": 0.22, "max_cost_per_model": 0.03, "max_calls": 24, "max_tokens": 400, "retries": 0},
         3: {"max_cost": 0.20, "max_cost_per_model": 0.03, "max_calls": 96, "max_tokens": 500, "retries": 0},
     }
     assert mm.DEFAULT_MAX_COST_TOTAL == 1.00
+
+
+def test_phase2_core18_reservations_fit_new_per_model_and_phase_total_caps():
+    """実API・state・ログなしで、Phase 2の実prompt予約がCORE_18全件で通ることを確認する。"""
+    defaults = mm.PHASE_DEFAULTS[2]
+    system = mm.build_system_prompt("P01", mm.GameConfig.baseline_v1_s2(num_players=18))
+    reservations = {
+        key: mm._worst_case_cost(MODEL_REGISTRY[key], system, mm.GAME2_USER, defaults["max_tokens"])
+        for key in mm.CORE_18_KEYS
+    }
+
+    assert len(reservations) == 18
+    assert sum(reservations.values()) == pytest.approx(0.175933790, abs=1e-12)
+    assert sum(reservations.values()) <= defaults["max_cost"]
+    assert max(reservations.values()) == pytest.approx(0.027510000, abs=1e-12)
+    assert all(cost <= defaults["max_cost_per_model"] for cost in reservations.values())
+    for key in ("H1", "H2", "H4"):
+        assert reservations[key] > 0.02
+        assert reservations[key] <= defaults["max_cost_per_model"]
 
 
 def test_worst_case_cost_reserve_targets_are_core18_members():

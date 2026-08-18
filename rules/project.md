@@ -103,24 +103,29 @@ gemini_hidden_thinking`・`test_worst_case_cost_includes_xai_reasoning`・
 exactly_expected_set`）、`tests/test_model_matrix.py`（`test_phase_defaults_unchanged`・
 `test_worst_case_cost_reserve_targets_are_core18_members`・`test_phase3_guard_blocks_
 earlier_for_thinking_models`・`test_budgeted_adapter_plain_models_unaffected`）。
-(2) `llm/llm_agent.py`
-`_call_llm` 内の自前コスト計算は cache_read/total_tokens は渡すがAnthropic正規化（`input_tokens`への
-`cache_read_input_tokens`合算）を行っていないため、`llm_logs` のコストと `BudgetedAdapter.spent_usd`
-がAnthropicモデルでのみ乖離しうる（別課題として保留）。
+(2) 本戦の実績計算も `llm/costing.py:usage_cost()` に統一し、Anthropicの
+`cache_read_input_tokens`合算を適用する。GameCostBudgetが明示注入された本戦だけは、同モジュールの
+`worst_case_cost()`で事前予約し、player/gameの実績を同じ式で精算する。Phase 1/2/3は
+`scripts/model_matrix.py`の既存BudgetedAdapterだけを使い、本戦budgetは注入しない。
 (3) `scripts/model_smoke.py --suite thinking_matrix` はケース単位で`extra_params`を上書きし
 DeepSeek等でもthinkingを強制有効化するため、モデル単位の`hidden_thinking_reserve_tokens=0`
 前提が崩れる（手動診断専用・`--max-cost`明示前提のため据置、既知の残余リスクとして明記のみ）。
 
-## OpenAI互換アダプタのリトライは `--retries N` ⇔ HTTP最大 `N+1` 回の1対1対応を崩さない
+## matrixのstrict retryは下位再送・temperature fallbackも明示的に止める
 
-`llm/adapters.py` の `create_adapter(model_info, max_retries=None)` / `OpenAICompatAdapter` は、
-スクリプト外側ループ・アダプタ内部（`API_MAX_RETRIES`）・OpenAI SDK既定（`max_retries`）の3層が
-独立にリトライしうる構造になっている。`--retries N` を素朴に3層すべてへ同じ値で伝播すると
-`(N+1)^3` の多重リトライが発生し、コスト上限ガードが実際のHTTP回数を正しく見積れなくなる
-（`scripts/model_matrix.py` Phase 1で設計是正、2026-08-18）。スクリプト層が試行回数を管理する
-経路（Phase 1等）では、必ず `create_adapter(model, max_retries=0)` で下位2層のリトライを強制的に
-無効化し、1試行=HTTP1回を保証してからスクリプト側でリトライループを回すこと。ゲーム本体・
-Phase 2/3・model_smoke等、スクリプト層で試行回数を管理しない既存経路は従来のretry挙動
-（`max_retries=None`＝アダプタ内部/SDK既定のリトライが有効）を維持する。担保テスト:
+`llm/adapters.py` の `create_adapter(model_info, max_retries=None,
+allow_temperature_fallback=True)` は、スクリプト外側・adapter内部・SDK内部のretryに加え、temperature
+エラー時の「temperatureを外して再送」互換経路も持つ。`--retries N` を各層へ素朴に伝播すると多重送信と
+なり、コスト上限ガードがHTTP回数を正しく見積れない。
+
+スクリプト層が試行回数を管理するPhase 1は `max_retries=0` で下位retryを止め、外側ループだけで再試行する。
+Phase 2の有料比較は外側retryも持たないため、必ず
+`create_adapter(model, max_retries=0, allow_temperature_fallback=False)` を使い、adapter/SDK retryと
+temperature fallbackをともに止める。これによりクライアント実装からのAPI送信は1 logical callにつき最大1回となる。
+送信後のネットワーク断でproviderが受信・課金済みかどうかは確定できないが、クライアントが再送することはない。
+
+Phase 3・本戦・model_smokeなどstrict指定のない経路は既定挙動を維持する。Phase 2の監査では
+`phase2_calls.jsonl` の `response_text`（API本文全文）、`requested_model`、`response_model`、`model_match` を
+使用する。認証情報やrequest headerをJSONLへ記録してはならない。担保テスト:
 `tests/test_llm.py::TestSingleHttpRequestGuarantee`、
-`tests/test_model_matrix.py::test_phase1_always_creates_adapter_with_zero_lower_retries` 等。
+`tests/test_model_matrix.py::test_phase2_uses_strict_single_request_adapter_and_records_full_response`。

@@ -34,7 +34,7 @@ from llm.models import get_model, ModelInfo, MODEL_REGISTRY
 from llm.adapters import create_adapter
 from llm.llm_logger import LLMLogger
 from llm.llm_agent import LLMAgent
-from llm.constants import COST_LIMIT_TOTAL, COST_LIMIT_PER_GAME
+from llm.game_cost_budget import GameCostBudget
 import random as stdlib_random
 
 
@@ -82,7 +82,10 @@ def run_trial_game(
     # 逐次追記モード: 進行中でもビューワーがラウンド状況を表示できるようにする
     event_path = output_dir / f"game{game_index + 1:02d}_events.jsonl"
     event_logger = EventLogger(output_path=event_path)
-    game = Game(config=config, agents=agents, seed=game_seed, logger=event_logger)
+    budget = GameCostBudget(
+        config.per_player_game_cost_cap_usd, config.game_cost_cap_usd, event_logger,
+    )
+    game = Game(config=config, agents=agents, seed=game_seed, logger=event_logger, cost_budget=budget)
     result = game.run()
 
     # LLMログ保存
@@ -288,17 +291,15 @@ def run_trial_game_c(
     # 逐次追記モード: 進行中でもビューワーがラウンド状況を表示できるようにする
     event_path = output_dir / f"game{game_index + 1:02d}_events.jsonl"
     event_logger = EventLogger(output_path=event_path)
-    game = Game(config=config, agents=agents, seed=game_seed, logger=event_logger)
+    budget = GameCostBudget(
+        config.per_player_game_cost_cap_usd, config.game_cost_cap_usd, event_logger,
+    )
+    game = Game(config=config, agents=agents, seed=game_seed, logger=event_logger, cost_budget=budget)
 
-    # コスト上限付き実行: ラウンドごとにチェック
-    # Game.run()を使い、コスト超過はエージェントレベルで既に制御されている
-    # 全体上限はここでチェック
+    # 本戦の予算制御はGameCostBudgetがcall前に実施する。
     result = game.run()
 
-    # 全体コスト上限チェック（事後）
-    total_cost = sum(a.llm_logger.total_cost for a in llm_agents)
-    if total_cost > COST_LIMIT_TOTAL:
-        print(f"  ⚠ 全体コスト上限${COST_LIMIT_TOTAL}超過: ${total_cost:.4f}")
+    total_cost = budget.game_spent_usd
 
     # LLMログ保存（emotion/reasoning等の後付けフィールドをファイルに反映）
     for agent in llm_agents:
@@ -461,6 +462,10 @@ def generate_phase_c_report(
     # 全体サマリ
     lines.append("## 全体サマリ\n")
     lines.append(f"- 実コスト合計: **${total_cost:.4f}** (approx. ¥{total_cost * 150:,.0f})")
+    lines.append(
+        f"- 本戦コスト上限: player **${config.per_player_game_cost_cap_usd:.2f}** / "
+        f"game **${config.game_cost_cap_usd:.2f}**"
+    )
     total_calls = sum(a.total_calls for _, agents, _, _ in results for a in agents)
     total_valid = sum(a.valid_json_count for _, agents, _, _ in results for a in agents)
     lines.append(f"- 総コール数: {total_calls}")
@@ -987,6 +992,10 @@ def main() -> None:
                         help='Phase C ロスター（カンマ区切り、例: "M6,L6,M5,L2,L1,M3"）')
     parser.add_argument("--cot", action="store_true", default=False,
                         help="CoT (Chain-of-Thought) を有効化: LLMにreasoningフィールドを要求")
+    parser.add_argument("--per-player-cost-cap", type=float, default=None,
+                        help="本戦1 playerあたりのLLMコスト上限USD（GameConfigを上書き）")
+    parser.add_argument("--game-cost-cap", type=float, default=None,
+                        help="本戦1試合のLLM合計コスト上限USD（GameConfigを上書き）")
     args = parser.parse_args()
 
     # 修正8: レポート再生成モード
@@ -1041,6 +1050,14 @@ def main() -> None:
         config = config.model_copy(update={"enable_cot": True})
         print("[CoT] reasoning フィールドを要求します")
 
+    cap_updates = {}
+    if args.per_player_cost_cap is not None:
+        cap_updates["per_player_game_cost_cap_usd"] = args.per_player_cost_cap
+    if args.game_cost_cap is not None:
+        cap_updates["game_cost_cap_usd"] = args.game_cost_cap
+    if cap_updates:
+        config = config.model_copy(update=cap_updates)
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = Path(f"logs/llm/trial_{args.phase}_{timestamp}")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1061,7 +1078,7 @@ def main() -> None:
         print(f"ロスター: {', '.join(phase_c_roster)}")
 
     print(f"試合数: {num_games}, {config.num_rounds}R, 交渉{config.negotiation_max_turns}巡")
-    print(f"コスト上限: エージェント${COST_LIMIT_PER_GAME}, 全体${COST_LIMIT_TOTAL}")
+    print(f"コスト上限: player ${config.per_player_game_cost_cap_usd:.2f}, 全体 ${config.game_cost_cap_usd:.2f}")
     print(f"出力: {output_dir}")
     print("---")
 

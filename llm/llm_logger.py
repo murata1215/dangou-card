@@ -73,6 +73,8 @@ class LLMLogger:
             "cache_creation_input_tokens": usage.get("cache_creation_input_tokens", 0),
             "cache_read_input_tokens": usage.get("cache_read_input_tokens", 0),
             "cost_usd": cost,
+            "api_called": True,
+            "budget_blocked": False,
             "elapsed_ms": elapsed_ms,
             "retry_count": retry_count,
             "error": error,
@@ -137,6 +139,33 @@ class LLMLogger:
         except Exception:
             pass
         return self._file_path
+
+    def log_budget_block(
+        self, *, player_id: str, model_id: str, phase: str, round_num: int,
+        turn: int | None, system_prompt: str, user_prompt: str,
+        reason: str, estimated_cost_usd: float, player_spent_usd: float,
+        game_spent_usd: float, per_player_cap_usd: float, game_cap_usd: float,
+    ) -> None:
+        """API未実行の予算ブロックを通常callと区別して記録する。"""
+        entry = {
+            "timestamp": datetime.now(timezone.utc).isoformat(), "game_id": self.game_id,
+            "player_id": player_id, "model_id": model_id, "phase": phase,
+            "round_num": round_num, "turn": turn, "system_prompt": system_prompt,
+            "user_prompt": user_prompt, "response_text": "", "input_tokens": 0,
+            "output_tokens": 0, "total_tokens": 0, "cost_usd": 0.0,
+            "api_called": False, "budget_blocked": True, "budget_reason": reason,
+            "budget_estimated_next_cost_usd": estimated_cost_usd,
+            "player_actual_spent_usd": player_spent_usd,
+            "game_actual_spent_usd": game_spent_usd,
+            "per_player_game_cost_cap_usd": per_player_cap_usd,
+            "game_cost_cap_usd": game_cap_usd,
+        }
+        self._entries.append(entry)
+        try:
+            self._file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            self._file.flush()
+        except Exception:
+            pass
 
     def close(self) -> None:
         """ファイルハンドルを閉じる"""

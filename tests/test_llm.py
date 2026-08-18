@@ -1517,10 +1517,9 @@ class TestOpenAICompatParamPolicy:
 
 class TestSingleHttpRequestGuarantee:
     """
-    H2 再テストは成功・失敗を問わずHTTP送信最大1回であることを保証する。
-    Phase 1 は create_adapter(model, max_retries=0) を常に使うため、
-    アダプタ内部リトライ・OpenAI SDK内部リトライ・temperatureフォールバックが
-    いずれも無効化されることをフェイク注入で検証する（実APIなし）。
+    strict adapter 設定は成功・失敗を問わずクライアント再送を抑止する。
+    H2 は supports_temperature=False のため、temperature fallbackも発生しない。
+    Phase 2は max_retries=0 と allow_temperature_fallback=False を併用する。
     """
 
     def _h2_model_info(self):
@@ -1596,6 +1595,60 @@ class TestSingleHttpRequestGuarantee:
 
         assert len(calls) == 1
 
+    def test_strict_mode_suppresses_openai_temperature_fallback(self, monkeypatch):
+        """Phase 2 の strict 設定ではtemperatureエラーも同一call内で再送しない。"""
+        import llm.adapters as adapters_mod
+        from llm.adapters import OpenAICompatAdapter, AdapterError
+
+        monkeypatch.setattr(adapters_mod.time, "sleep", lambda *a, **kw: None)
+        calls: list[int] = []
+        adapter = OpenAICompatAdapter(
+            self._default_model_info(),
+            max_retries=0,
+            allow_temperature_fallback=False,
+        )
+        adapter._client = self._always_raising_client(
+            lambda: Exception("temperature does not support this value"), calls
+        )
+
+        with pytest.raises(AdapterError):
+            adapter.complete("sys", [{"role": "user", "content": "hi"}])
+
+        assert len(calls) == 1
+
+    def test_anthropic_strict_mode_suppresses_retry_and_temperature_fallback(self, monkeypatch):
+        """AnthropicもPhase 2 strict設定ならtemperatureエラーを再送しない。"""
+        import llm.adapters as adapters_mod
+        from llm.adapters import AnthropicAdapter, AdapterError
+
+        monkeypatch.setattr(adapters_mod.time, "sleep", lambda *a, **kw: None)
+        calls: list[int] = []
+
+        class FakeMessages:
+            def create(self, **kwargs):
+                calls.append(1)
+                raise Exception("temperature is deprecated")
+
+        class FakeClient:
+            messages = FakeMessages()
+
+        info = ModelInfo(
+            model_id="claude-haiku-4-5-20251001", provider="Anthropic", name="Haiku",
+            adapter_type="anthropic", input_price=1.0, output_price=5.0,
+            env_key="ANTHROPIC_API_KEY", base_url=None,
+        )
+        adapter = AnthropicAdapter(
+            info,
+            max_retries=0,
+            allow_temperature_fallback=False,
+        )
+        adapter._client = FakeClient()
+
+        with pytest.raises(AdapterError):
+            adapter.complete("sys", [{"role": "user", "content": "hi"}])
+
+        assert len(calls) == 1
+
     def test_default_adapter_still_retries_on_429(self, monkeypatch):
         """max_retries未指定なら従来どおり3回（API_MAX_RETRIES=2）呼ばれること（回帰）"""
         import llm.adapters as adapters_mod
@@ -1632,6 +1685,28 @@ class TestSingleHttpRequestGuarantee:
 
         assert captured_kwargs.get("max_retries") == 0
 
+    def test_anthropic_client_built_with_max_retries_zero(self, monkeypatch):
+        """Anthropic SDKにも strict 設定の max_retries=0 が渡ること。"""
+        import anthropic
+        from llm.adapters import AnthropicAdapter
+
+        captured_kwargs = {}
+
+        class FakeAnthropic:
+            def __init__(self, **kwargs):
+                captured_kwargs.update(kwargs)
+
+        monkeypatch.setattr(anthropic, "Anthropic", FakeAnthropic)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy")
+        info = ModelInfo(
+            model_id="claude-haiku-4-5-20251001", provider="Anthropic", name="Haiku",
+            adapter_type="anthropic", input_price=1.0, output_price=5.0,
+            env_key="ANTHROPIC_API_KEY", base_url=None,
+        )
+        AnthropicAdapter(info, max_retries=0)._get_client()
+
+        assert captured_kwargs.get("max_retries") == 0
+
     def test_client_kwargs_omit_max_retries_by_default(self, monkeypatch):
         """max_retries未指定では openai.OpenAI に max_retries キーを渡さないこと（SDK既定維持の回帰）"""
         import openai
@@ -1652,9 +1727,8 @@ class TestSingleHttpRequestGuarantee:
 
         assert "max_retries" not in captured_kwargs
 
-    def test_create_adapter_passes_max_retries(self):
-        """create_adapter(info, max_retries=0) が openai_compat / gemini に伝播すること。
-        anthropicでは現状無視される（max_retries未対応）仕様を明示する。"""
+    def test_create_adapter_passes_strict_options_to_all_adapters(self):
+        """create_adapterのstrict optionsが全adapter種別へ伝播すること。"""
         from llm.adapters import create_adapter, OpenAICompatAdapter, AnthropicAdapter
 
         openai_info = self._default_model_info()
@@ -1680,6 +1754,14 @@ class TestSingleHttpRequestGuarantee:
         )
         adapter3 = create_adapter(anthropic_info, max_retries=0)
         assert isinstance(adapter3, AnthropicAdapter)
+        assert adapter3._max_retries == 0
+
+        strict = create_adapter(
+            openai_info,
+            max_retries=0,
+            allow_temperature_fallback=False,
+        )
+        assert strict._allow_temperature_fallback is False
 
     def test_model_info_defaults(self):
         """ModelInfoの既定値: max_tokens_param=='max_tokens'、supports_temperature is True"""

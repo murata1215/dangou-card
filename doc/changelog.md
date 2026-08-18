@@ -843,3 +843,20 @@ LLMなしルールベースBot 8種（Random/Conservative/StrongCardSave/HighPri
 - 受け入れテスト16件 + 追加テスト17件（全33件パス）
 - ドライランスクリプト（12人×12ラウンド、JSONLログ出力）
 - README.md（実行方法・パラメータ設定・JSONL仕様）
+## 2026-08-18: 本戦用player/gameコストcap（$5/$40）を導入
+
+- 本戦runnerは `GameConfig.per_player_game_cost_cap_usd`（既定$5）と
+  `game_cost_cap_usd`（既定$40）を正本として `GameCostBudget` を明示注入する。
+- call前予約と成功usageの事後精算を導入。budget blockはAPIを呼ばず、parse retryを経由せず既存fallbackへ移行する。
+- 旧 `COST_LIMIT_PER_GAME` / `COST_LIMIT_TOTAL` と本戦の$5/$12停止・警告を削除した。
+- Phase 1/2/3 model_matrixは本戦budgetを注入せず、既存 `PHASE_DEFAULTS` / `BudgetedAdapter` は無変更。
+
+## 2026-08-19: Phase 2比較の単発送信化と生レスポンス保存
+
+- Phase 2だけは `create_adapter(..., max_retries=0, allow_temperature_fallback=False)` を使用し、
+  adapter・SDK retryとtemperatureエラー時の追加送信を抑止する。
+- Anthropic / OpenAI互換の両adapterが `max_retries` をSDKまで伝播できるようにした。既定引数は従来どおりで、
+  Phase 1/3・本戦のretry挙動は変更しない。
+- `phase2_calls.jsonl` に `response_text` 全文、requested/response model、match判定を記録する。
+  API例外で本文がない場合は `response_text: null` とする。認証情報・request headerは記録しない。
+- Phase 2のper-model capは `$0.03`、phase capは `$0.22` のまま。実API・dry-run・既存runのstate変更は未実施。

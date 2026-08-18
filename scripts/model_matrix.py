@@ -47,6 +47,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from llm.models import MODEL_REGISTRY, ModelInfo, estimate_cost, get_model
+from llm.costing import usage_cost as _usage_cost
 from llm.adapters import create_adapter, AdapterError
 from llm.response_parser import extract_json, parse_response, ParseError
 from llm.prompt_builder import build_system_prompt
@@ -64,7 +65,7 @@ from scripts.model_smoke import (
     GAME_USER,
     _looks_like_pure_json,
 )
-from scripts.model_smoke import worst_case_cost as _worst_case_cost  # noqa: F401 (再export)
+from llm.costing import worst_case_cost as _worst_case_cost
 
 
 # --- 対象キー: H1〜H6 / M1〜M6 / L1〜L6 の18コアキー（L7は負荷試験枠のため対象外） ---
@@ -83,7 +84,7 @@ DEFAULT_SEED = 901
 
 PHASE_DEFAULTS: dict[int, dict[str, Any]] = {
     1: {"max_cost": 0.08, "max_cost_per_model": 0.02, "max_calls": 40, "max_tokens": 64, "retries": 1},
-    2: {"max_cost": 0.22, "max_cost_per_model": 0.02, "max_calls": 24, "max_tokens": 400, "retries": 0},
+    2: {"max_cost": 0.22, "max_cost_per_model": 0.03, "max_calls": 24, "max_tokens": 400, "retries": 0},
     3: {"max_cost": 0.20, "max_cost_per_model": 0.03, "max_calls": 96, "max_tokens": 500, "retries": 0},
 }
 
@@ -319,7 +320,7 @@ _MODEL_MATCH_MARK = {"match": "✓", "alias": "≈", "mismatch": "⚠", "unknown
 # usage → コスト計算（cache割引・thinking差分課金を反映）
 # ============================================================
 
-def _usage_cost(model: ModelInfo, usage: dict[str, Any]) -> float:
+def _legacy_usage_cost(model: ModelInfo, usage: dict[str, Any]) -> float:
     """
     usage 辞書からコストを算出する。
 
@@ -492,7 +493,13 @@ def _generate_phase1_report(run_dir: Path, state: dict[str, Any]) -> None:
 # ============================================================
 
 def _call_once_phase2(model: ModelInfo, max_tokens: int) -> dict[str, Any]:
-    adapter = create_adapter(model)
+    # Phase 2 の比較実験だけは、adapter/SDK retry と temperature fallback
+    # による追加送信を抑止する。他Phaseおよび本戦の既定挙動は変更しない。
+    adapter = create_adapter(
+        model,
+        max_retries=0,
+        allow_temperature_fallback=False,
+    )
     game_system = build_system_prompt("P01", GameConfig.baseline_v1_s2(num_players=18))
     try:
         start = time.time()
@@ -507,7 +514,8 @@ def _call_once_phase2(model: ModelInfo, max_tokens: int) -> dict[str, Any]:
         return {
             "ok": False, "error": f"{type(e).__name__}: {str(e)[:300]}", "latency_ms": 0,
             "usage": {"input_tokens": 0, "output_tokens": 0}, "parse_ok": False,
-            "pure_json": False, "emotion": None,
+            "pure_json": False, "emotion": None, "response_text": None,
+            "response_model": None,
         }
 
     ok = len(text.strip()) > 0
@@ -530,6 +538,10 @@ def _call_once_phase2(model: ModelInfo, max_tokens: int) -> dict[str, Any]:
         "ok": ok, "error": None, "latency_ms": latency_ms, "usage": usage,
         "parse_ok": parse_ok, "pure_json": pure_json, "emotion": emotion,
         "parse_error": parse_error, "text_sample": text.strip()[:300],
+        # 有料の Phase 2 実験は parse 成否にかかわらず本文を完全保存する。
+        # request header / secret はこの record に含めない。
+        "response_text": text,
+        "response_model": usage.get("response_model"),
     }
 
 
@@ -592,12 +604,22 @@ def run_phase2(run_dir: Path, state: dict[str, Any], keys: list[str],
         calls_so_far += 1
 
         status = "pass" if r["parse_ok"] else "fail"
-        record = {"key": key, "model_id": info.model_id, "timestamp": datetime.now(timezone.utc).isoformat(),
-                   "cost_usd": round(cost, 6), **r}
+        response_model = r.get("response_model")
+        model_match = _model_match(info.model_id, response_model)
+        record = {
+            "key": key,
+            "model_id": info.model_id,
+            "requested_model": info.model_id,
+            "model_match": model_match,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "cost_usd": round(cost, 6),
+            **r,
+        }
         _append_jsonl(calls_path, record)
         state["models"][key]["phase2"] = {
             "status": status, "latency_ms": r["latency_ms"], "cost_usd": round(cost, 6),
             "error": r["error"] or r.get("parse_error"), "pure_json": r["pure_json"], "emotion": r["emotion"],
+            "response_model": response_model, "model_match": model_match,
         }
         _save_state(run_dir, state)
         print(f"{status} ({r['latency_ms']}ms) ${cost:.4f} | 累計${state['budget']['spent_usd']:.4f}/"

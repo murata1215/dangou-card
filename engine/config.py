@@ -126,6 +126,13 @@ class GameConfig(BaseModel):
     memory_max_chars: int = 1000
     """引き継ぎメモリの最大文字数（超過分は切り詰める）"""
 
+    # --- 本戦LLMコスト上限（GameCostBudgetを明示注入した試合だけで有効） ---
+    per_player_game_cost_cap_usd: float = 5.0
+    """本戦1試合におけるplayer単位のLLMコスト上限（USD）"""
+
+    game_cost_cap_usd: float = 40.0
+    """本戦1試合における全LLM合計コスト上限（USD）"""
+
     @field_validator("prize_tiers")
     @classmethod
     def validate_prize_tiers(cls, v: list[int]) -> list[int]:

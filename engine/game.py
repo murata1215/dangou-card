@@ -82,6 +82,7 @@ class Game:
         agents: dict[str, PlayerAgent],
         seed: int = 42,
         logger: EventLogger | None = None,
+        cost_budget: Any | None = None,
     ):
         """
         Args:
@@ -95,6 +96,13 @@ class Game:
         self.seed = seed
         self.rng = GameRng(seed)
         self.logger = logger or EventLogger()
+        # 本戦runnerだけが明示注入する。model_matrix等のスモークではNoneのまま。
+        self.cost_budget = cost_budget
+        if cost_budget is not None:
+            for agent in agents.values():
+                setter = getattr(agent, "set_game_cost_budget", None)
+                if callable(setter):
+                    setter(cost_budget)
 
         # ゲーム状態
         self.players: dict[str, PlayerState] = {}
@@ -157,15 +165,21 @@ class Game:
 
         各エージェントに借入額を選択させ、初期状態を生成する。
         """
-        self.logger.log("GAME_START", 0, "setup", data={
-            "config": {
+        game_config = {
                 "num_players": self.config.num_players,
                 "num_rounds": self.config.num_rounds,
                 "total_prize": self.config.total_prize,
                 "survival_cash": self.config.survival_cash,
                 "interest_rate": self.config.interest_rate,
                 "entry_fee": self.config.entry_fee,
-            },
+        }
+        if self.cost_budget is not None:
+            game_config.update({
+                "per_player_game_cost_cap_usd": self.config.per_player_game_cost_cap_usd,
+                "game_cost_cap_usd": self.config.game_cost_cap_usd,
+            })
+        self.logger.log("GAME_START", 0, "setup", data={
+            "config": game_config,
             "seed": self.seed,
         })
 
@@ -937,7 +951,7 @@ class Game:
             double_up_deposits=self.double_up_deposits,
         )
 
-        self.logger.log("GAME_END", self.current_round, "end", data={
+        end_data = {
             "survivors": [
                 {"player_id": p.player_id, "cash": p.cash}
                 for p in result.survivors
@@ -947,7 +961,10 @@ class Game:
                  "round": p.elimination_round}
                 for p in result.eliminated
             ],
-        })
+        }
+        if self.cost_budget is not None:
+            end_data.update(self.cost_budget.snapshot())
+        self.logger.log("GAME_END", self.current_round, "end", data=end_data)
 
         return result
 

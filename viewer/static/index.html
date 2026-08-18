@@ -21,6 +21,7 @@
     <span id="round-info">—</span>
     <span id="survivor-info">—</span>
     <span id="cost-info">—</span>
+    <span id="cost-limit-info" hidden></span>
   </div>
   <label><input type="checkbox" id="auto-refresh" checked> 自動更新</label>
   <label><input type="checkbox" id="commentary-toggle" checked> 実況</label>
@@ -236,7 +237,9 @@ async function loadState() {
 
 // 表示に関係する安定フィールドのみから署名を作る（揮発フィールド last_active_sec_ago は除外）
 function computeStateSig(state) {
-  const parts = [state.current_round, state.total_rounds, state.survivors, state.total_cost];
+  const cfg = state.config || {};
+  const parts = [state.current_round, state.total_rounds, state.survivors, state.total_cost,
+    cfg.per_player_game_cost_cap_usd, cfg.game_cost_cap_usd];
   state.players.forEach(p => {
     const isThinking = p.stats.last_active_sec_ago !== null && p.stats.last_active_sec_ago < 30;
     const s = p.strategy_summary || {};
@@ -282,6 +285,14 @@ function renderState(state) {
   costEl.style.cursor = 'pointer';
   costEl.title = 'Click for cost breakdown';
   costEl.onclick = () => openCostModal();
+  const limitEl = document.getElementById('cost-limit-info');
+  const cfg = state.config || {};
+  if (cfg.per_player_game_cost_cap_usd != null && cfg.game_cost_cap_usd != null) {
+    limitEl.textContent = `Player cap $${Number(cfg.per_player_game_cost_cap_usd).toFixed(2)} / Game cap $${Number(cfg.game_cost_cap_usd).toFixed(2)}`;
+    limitEl.hidden = false;
+  } else {
+    limitEl.hidden = true;
+  }
 
   // グリッド
   const grid = document.getElementById('player-grid');

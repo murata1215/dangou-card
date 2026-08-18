@@ -43,6 +43,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from llm.models import get_model, estimate_cost, ModelInfo
+from llm.costing import worst_case_cost
 from llm.adapters import create_adapter, AdapterError, OpenAICompatAdapter, _dump_usage_raw
 from llm.response_parser import extract_json, parse_response, ParseError
 from llm.prompt_builder import build_system_prompt
@@ -333,32 +334,6 @@ def run_thinking_case(
             "cost_usd": 0.0,
         })
         return record
-
-
-def worst_case_cost(model: ModelInfo, system: str, user: str, max_tokens: int) -> float:
-    """次コールの最悪コスト（入力全額課金 + 出力max_tokens全消費 + hidden thinking予約）を事前試算する
-
-    2026-08-18: model.hidden_thinking_reserve_tokens を加算するよう拡張。
-    Gemini/xAI系（M3/L3/H3/M4/L4/H4）は max_tokens の外側で thinking トークンが課金される
-    ことが実測で確認されており（Phase 1実測: max_tokens=64でも185〜343token発生）、
-    従来の見積は常にこの分を過小評価していた。
-
-    保証レベルの注意（重要）:
-    - Anthropic/OpenAI/Kimi/DeepSeek（hidden_thinking_reserve_tokens=0）:
-      thinking が output/completion に内包されるか無効化済みであることを実装・実測で確認済みのため、
-      従来どおり「入力全額 + max_tokens全消費」が数学的worst-caseとして妥当。
-    - Gemini/xAI（hidden_thinking_reserve_tokens=512）:
-      512 は provider が保証する上限ではなく、実測最大343（xAI L4）に対する約1.5倍の
-      **経験的安全マージン**である。関数名が worst_case_cost であっても、これらのモデルについては
-      数学的な完全保証ではなく観測ベースの保守的な予約見積であることに留意すること。
-      thinking budget / reasoning effort の上限をリクエストで指定していない限り、
-      512を超える可能性は理論上残る（超過分は次コールの予算ガードで検知・停止される）。
-    """
-    # 簡易トークン推定: 日本語混在テキストは概ね2〜3文字/token。安全側に2文字/tokenで見積もる。
-    approx_input_tokens = (len(system) + len(user)) // 2 + 50  # +50はメッセージ構造のオーバーヘッド分
-    reserve = model.hidden_thinking_reserve_tokens  # 0なら現行式と完全同値
-    total_tokens = approx_input_tokens + max_tokens + reserve
-    return estimate_cost(model, approx_input_tokens, max_tokens, total_tokens=total_tokens)
 
 
 def fetch_raw_error_detail(adapter: OpenAICompatAdapter, system: str, user: str, max_tokens: int) -> dict[str, Any]:
