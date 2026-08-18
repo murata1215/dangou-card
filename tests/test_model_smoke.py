@@ -95,6 +95,98 @@ def test_worst_case_cost_matches_estimate_cost_ordering():
     assert small > 0
 
 
+# --- hidden_thinking_reserve_tokens 対応（2026-08-18） ---
+
+_RESERVE_TARGET_KEYS = ["M3", "L3", "H3", "M4", "L4", "H4"]
+_ZERO_RESERVE_KEYS = [
+    k for k in MODEL_REGISTRY if k not in _RESERVE_TARGET_KEYS
+]
+
+
+@pytest.mark.parametrize("key", _ZERO_RESERVE_KEYS)
+@pytest.mark.parametrize("max_tokens", [16, 64, 200, 400, 500, 2000])
+def test_worst_case_cost_zero_reserve_models_unchanged(key, max_tokens):
+    """reserve=0のモデル（Anthropic/OpenAI/Kimi/DeepSeek + L7）は、
+    複数のmax_tokensにわたって旧式(estimate_cost直呼び)と数値が完全一致すること（非回帰）"""
+    model = get_model(key)
+    assert model.hidden_thinking_reserve_tokens == 0
+    system, user = "system prompt text", "user prompt text"
+    approx_input_tokens = (len(system) + len(user)) // 2 + 50
+    expected = estimate_cost(model, approx_input_tokens, max_tokens)
+    actual = worst_case_cost(model, system, user, max_tokens=max_tokens)
+    assert actual == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("key", ["M3", "L3", "H3"])
+def test_worst_case_cost_includes_gemini_hidden_thinking(key):
+    """Gemini対象3モデルは、予約分だけ旧式(estimate_cost直呼び)より高くなること。
+    差分は 512 * output_price / 1_000_000 に厳密一致する"""
+    model = get_model(key)
+    assert model.hidden_thinking_reserve_tokens == 512
+    system, user = "system prompt text", "user prompt text"
+    approx_input_tokens = (len(system) + len(user)) // 2 + 50
+    old_style = estimate_cost(model, approx_input_tokens, 64)
+    new_style = worst_case_cost(model, system, user, max_tokens=64)
+    expected_delta = 512 * model.output_price / 1_000_000
+    assert new_style > old_style
+    assert (new_style - old_style) == pytest.approx(expected_delta)
+
+
+@pytest.mark.parametrize("key", ["M4", "L4", "H4"])
+def test_worst_case_cost_includes_xai_reasoning(key):
+    """xAI対象3モデルは、予約分だけ旧式(estimate_cost直呼び)より高くなること。
+    差分は 512 * output_price / 1_000_000 に厳密一致する"""
+    model = get_model(key)
+    assert model.hidden_thinking_reserve_tokens == 512
+    system, user = "system prompt text", "user prompt text"
+    approx_input_tokens = (len(system) + len(user)) // 2 + 50
+    old_style = estimate_cost(model, approx_input_tokens, 64)
+    new_style = worst_case_cost(model, system, user, max_tokens=64)
+    expected_delta = 512 * model.output_price / 1_000_000
+    assert new_style > old_style
+    assert (new_style - old_style) == pytest.approx(expected_delta)
+
+
+def test_worst_case_cost_h2_not_double_counted():
+    """H2(gpt-5.6-sol, max_completion_tokens系)はreserve対象外(=0)であり、
+    hidden thinkingをmax_tokensと別枠で二重計上しないこと（旧式と完全一致）"""
+    model = get_model("H2")
+    assert model.hidden_thinking_reserve_tokens == 0
+    system, user = "system prompt text", "user prompt text"
+    approx_input_tokens = (len(system) + len(user)) // 2 + 50
+    expected = estimate_cost(model, approx_input_tokens, 400)
+    actual = worst_case_cost(model, system, user, max_tokens=400)
+    assert actual == pytest.approx(expected)
+
+
+def test_hidden_thinking_reserve_defaults_to_zero():
+    """ModelInfoをアドホック生成した場合、hidden_thinking_reserve_tokensの既定値は0であること"""
+    from llm.models import ModelInfo
+
+    model = ModelInfo(
+        model_id="test-model", provider="Test", name="Test Model",
+        adapter_type="openai_compat", input_price=1.0, output_price=1.0,
+        env_key="TEST_API_KEY", base_url=None,
+    )
+    assert model.hidden_thinking_reserve_tokens == 0
+
+
+def test_observed_max_thinking_fits_in_reserve():
+    """実測された最大hidden thinking量(343token, xAI L4)が予約512token以内に収まることの固定値確認。
+    注意: これは実測データの範囲内であることの確認であり、512がprovider保証の絶対上限で
+    あることを示すものではない（経験的安全マージン。scripts/model_smoke.py:worst_case_cost参照）"""
+    observed_max_thinking_tokens = 343  # Phase 1実測 (logs/model_matrix/run_20260818_041810/phase1_calls.jsonl) grok-4.3(L4)
+    reserve = get_model("L4").hidden_thinking_reserve_tokens
+    assert observed_max_thinking_tokens < reserve
+
+
+def test_worst_case_cost_reserve_targets_are_exactly_expected_set():
+    """予約>0のキー集合が {M3,L3,H3,M4,L4,H4} の6件と厳密一致し、
+    存在しないキーが紛れ込んでいないこと（CORE_18内であることはtest_model_matrixで別途検証）"""
+    reserved = {k for k, v in MODEL_REGISTRY.items() if v.hidden_thinking_reserve_tokens > 0}
+    assert reserved == {"M3", "L3", "H3", "M4", "L4", "H4"}
+
+
 def test_dry_run_does_not_call_api(monkeypatch):
     """--dry-run のときAPIが一切呼ばれないこと"""
     monkeypatch.setattr("scripts.model_smoke.create_adapter", lambda m: _RefuseToCallAdapter(m))

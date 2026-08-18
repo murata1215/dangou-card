@@ -1,5 +1,67 @@
 # Changelog
 
+## 2026-08-18: 事前予算ガード `worst_case_cost()` の hidden thinking 予約対応（予算上限は据置）
+
+### 概要
+前サイクルでPhase 1/2/3の**実績**コスト計算は`_usage_cost()`に統一済みだったが、**事前見積**
+`worst_case_cost()`（`scripts/model_smoke.py`、`scripts/model_matrix.py`から`_worst_case_cost`
+として再export）は「入力全額 + `max_tokens`全消費」のみを見込み、`max_tokens`の外側で課金される
+hidden thinking（Gemini/xAIで実測185〜343token、Phase 1実測 max_tokens=64時点）を一切見込んで
+いなかった。これによりPhase 3のH3（Gemini）で旧見積が実支出の56%しか捕捉できず、実際には予算
+上限の112%まで超過するケースを確認。**本サイクルの目的は見積式の是正であり、予算上限の引き上げ
+ではない**（`PHASE_DEFAULTS`/`DEFAULT_MAX_COST_TOTAL`は一切変更していない）。
+
+### 詳細
+
+**設計**: `ModelInfo`に`hidden_thinking_reserve_tokens: int = 0`を追加し、
+`worst_case_cost()`が`estimate_cost(model, approx_input, max_tokens, total_tokens=
+approx_input+max_tokens+reserve)`を呼ぶよう拡張（実質3行）。reserve=0のモデルは
+数値が旧式と完全一致（複数max_tokensで非回帰確認済み）。
+
+**対象モデル（CORE_18内の6件のみ、実測/API特性で正当化されるもののみ）**:
+`M3`/`L3`/`H3`（Gemini）・`M4`/`L4`/`H4`（xAI）に`hidden_thinking_reserve_tokens=512`を設定。
+512は実測最大343（xAI L4）に対する約1.5倍の**経験的安全マージン**であり、provider側で
+thinking budget/reasoning effortの上限を送信していない以上、**provider保証の数学的worst-case
+上限ではない**ことを`ModelInfo`のコメント・関数docstring・`rules/project.md`に明記した。
+Anthropic/OpenAI/Kimi/DeepSeekの12モデルは、thinkingがoutput/completionに内包される
+（または無効化済み）ことを実装・実測で確認済みのため、従来どおりの見積保証を維持する。
+core外の`L7`（`gemini-2.5-flash-lite`）は本サイクルでは`reserve=0`のまま据置（既知の残余ギャップ）。
+
+**予算上限は不変。現行上限下での影響（意図した是正結果として可視化）**:
+- Phase 1: 新規ブロックなし
+- Phase 2: `H4`が新規にper-model上限超過（`H1`/`H2`は変更前から超過、既存の欠陥）
+- Phase 3: 許容コール数が減るのは`H3`(2→1)・`H4`(1→0)のみ。両者とも変更前から3コール完走
+  不可であり、完走できていたモデルが完走不可になるケースはゼロ。H3は旧見積で実支出が上限の
+  112%まで超過していたのが、新見積では1コールで止まり56%に収まる（予算を変えずに超過を解消）
+- `model_smoke`（既定`--max-tokens 2000 --max-cost 0.10`）: `H3`が新規に実行前中断
+
+**テスト**: `tests/test_model_smoke.py`に9件追加
+（reserve=0モデル×複数max_tokensの完全一致・Gemini/xAI予約加算量の厳密一致・H2非二重計上・
+既定0・実測343が512に収まる固定確認[512を絶対上限として検証はしない]・予約対象キー集合の厳密一致）。
+`tests/test_model_matrix.py`に4件追加（`PHASE_DEFAULTS`不変の回帰・予約対象がCORE_18内である
+ことの確認・reserve=0モデルの事前ガード非回帰・H3相当での早期ブロック実演）。既存の
+`test_budgeted_adapter_blocks_next_call_when_budget_reached`（M3対象）はreserve導入で
+worst見積自体が変わるため、`mm._worst_case_cost`から動的にmax_costを算出する形に修正。
+`tests/test_registry_18.py`のフィールド数固定テストも新フィールドを追加して更新。
+全663件PASS（実API呼び出し0件）。
+
+### 変更
+- `llm/models.py`: `ModelInfo`に`hidden_thinking_reserve_tokens: int = 0`を追加、
+  `M3`/`L3`/`H3`/`M4`/`L4`/`H4`の6件のみ`=512`を設定
+- `scripts/model_smoke.py`: `worst_case_cost()`をreserve対応に拡張、docstringに保証レベルの
+  注意を明記
+- `scripts/model_matrix.py`: 変更なし（`_worst_case_cost`は再exportのため自動反映。
+  `PHASE_DEFAULTS`/`DEFAULT_MAX_COST_TOTAL`は据置）
+- `tests/test_model_smoke.py`・`tests/test_model_matrix.py`・`tests/test_registry_18.py`:
+  テスト追加・更新
+- `rules/project.md`: 残余課題(1)を予約方式での緩和状況に更新、保証レベル区分・L7残余ギャップ・
+  thinking_matrix suiteの残余リスクを明記
+
+### 対象外（別課題として維持）
+provider側thinking budget送信による完全保証／予算値変更（人間が別サイクルで判断）／
+`max_tokens`clamp・残予算逆算／`L7`への予約設定／`llm/llm_agent.py`のAnthropic正規化漏れ／
+リトライ失敗コールのusage欠落／モデル価格表見直し／Phase 2・3の実API実行。
+
 ## 2026-08-18: 18モデル体制（H1〜H6）整備・Phase 1/2 コスト計算修正・リトライ責務一本化
 
 ### 概要

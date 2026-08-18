@@ -833,13 +833,19 @@ def test_budgeted_adapter_accumulates_cost_over_multiple_calls():
 def test_budgeted_adapter_blocks_next_call_when_budget_reached():
     """修正後の実コストに基づき、予算到達後は次のcomplete()がAdapterErrorになること
     （既存の事前ガード＝worst-case予約方式の維持確認。Geminiのhidden thinkingを含む
-    実コストで2コール分ちょうどの予算を与え、3コール目がブロックされることを確認）"""
+    実コストで2コール分ちょうどの予算を与え、3コール目がブロックされることを確認）
+
+    2026-08-18: M3のhidden_thinking_reserve_tokens=512化により、事前ガードworstの値自体が
+    変わった（reserveを含む）。max_costは実装のworst算出(mm._worst_case_cost)から動的に算出し、
+    「2コール成功・3コール目でブロック」という挙動を維持する。"""
     info = MODEL_REGISTRY["M3"]
     usage = {"input_tokens": 32, "output_tokens": 5, "total_tokens": 222,
              "cache_read_input_tokens": 0}
     per_call = mm._usage_cost(info, usage)
+    worst = mm._worst_case_cost(info, "sys", "hi", 50)
+    max_cost = per_call + worst + 1e-9
     inner = _FakeUsageRichAdapter(info, usage)
-    wrapped = mm.BudgetedAdapter(inner, info, max_calls=10, max_cost=per_call * 2 + 1e-9,
+    wrapped = mm.BudgetedAdapter(inner, info, max_calls=10, max_cost=max_cost,
                                   max_tokens_cap=50)
     wrapped.complete("sys", [{"role": "user", "content": "hi"}], max_tokens=50)
     wrapped.complete("sys", [{"role": "user", "content": "hi"}], max_tokens=50)
@@ -1133,3 +1139,103 @@ def test_phase1_records_corrected_cost_in_state_and_jsonl(tmp_path, monkeypatch)
     assert expected_cost != naive
     line = json.loads((run_dir / "phase1_calls.jsonl").read_text(encoding="utf-8").strip().splitlines()[0])
     assert line["cost_usd"] == pytest.approx(expected_cost, abs=1e-9)
+
+
+# ============================================================
+# hidden_thinking_reserve_tokens 対応（2026-08-18）
+# 事前予算ガード worst_case_cost() の見積是正 — 予算上限は変更しない
+# ============================================================
+
+def test_phase_defaults_unchanged():
+    """本サイクルでは見積式のみを是正し、予算上限(PHASE_DEFAULTS/DEFAULT_MAX_COST_TOTAL)は
+    一切変更していないことをリテラル固定値で回帰保証する"""
+    assert mm.PHASE_DEFAULTS == {
+        1: {"max_cost": 0.08, "max_cost_per_model": 0.02, "max_calls": 40, "max_tokens": 64, "retries": 1},
+        2: {"max_cost": 0.22, "max_cost_per_model": 0.02, "max_calls": 24, "max_tokens": 400, "retries": 0},
+        3: {"max_cost": 0.20, "max_cost_per_model": 0.03, "max_calls": 96, "max_tokens": 500, "retries": 0},
+    }
+    assert mm.DEFAULT_MAX_COST_TOTAL == 1.00
+
+
+def test_worst_case_cost_reserve_targets_are_core18_members():
+    """予約>0のキー集合が {M3,L3,H3,M4,L4,H4} と一致し、すべてCORE_18_KEYSに含まれること
+    （存在しないキーが計画に混入していないことの確認）"""
+    reserved = {k for k in mm.CORE_18_KEYS if MODEL_REGISTRY[k].hidden_thinking_reserve_tokens > 0}
+    assert reserved == {"M3", "L3", "H3", "M4", "L4", "H4"}
+    for key in reserved:
+        assert key in mm.CORE_18_KEYS
+
+
+def test_budgeted_adapter_plain_models_unaffected():
+    """reserve=0の通常モデル(M2/L1/M6)では、事前ガードの挙動が修正前と完全に同じであること（非回帰）
+    （同一usage・同一max_costで、修正前と同じ回数だけ通ること）"""
+    for key, usage in [
+        ("M2", {"input_tokens": 42, "output_tokens": 5, "total_tokens": 47, "cache_read_input_tokens": 0}),
+        ("L1", {"input_tokens": 30, "output_tokens": 6, "total_tokens": 36, "cache_read_input_tokens": 0}),
+        ("M6", {"input_tokens": 35, "output_tokens": 5, "total_tokens": 40, "cache_read_input_tokens": 0}),
+    ]:
+        info = MODEL_REGISTRY[key]
+        assert info.hidden_thinking_reserve_tokens == 0
+        per_call = mm._usage_cost(info, usage)
+        worst = mm._worst_case_cost(info, "sys", "hi", 50)
+        # 旧式(estimate_cost直呼び)とworstが一致すること（=事前ガードの厳しさが変わっていない）
+        naive_worst = estimate_cost(info, (len("sys") + len("hi")) // 2 + 50, 50)
+        assert worst == pytest.approx(naive_worst)
+        max_cost = per_call + worst + 1e-9
+        inner = _FakeUsageRichAdapter(info, usage)
+        wrapped = mm.BudgetedAdapter(inner, info, max_calls=10, max_cost=max_cost, max_tokens_cap=50)
+        wrapped.complete("sys", [{"role": "user", "content": "hi"}], max_tokens=50)
+        wrapped.complete("sys", [{"role": "user", "content": "hi"}], max_tokens=50)
+        with pytest.raises(AdapterError):
+            wrapped.complete("sys", [{"role": "user", "content": "hi"}], max_tokens=50)
+        assert wrapped.calls_made == 2
+
+
+def test_phase3_guard_blocks_earlier_for_thinking_models():
+    """H3(Gemini)相当で、旧見積(reserve無し)なら通っていたはずの2コール目が、
+    新見積(reserve込み)では事前ガードでブロックされること
+    （§4-4のH3 2→1コール縮小をユニットレベルで再現）。
+
+    max_costは「新見積(new_worst)で1コール目はちょうど通り、
+    2コール目は旧見積(old_worst)なら通るが新見積では通らない」範囲に設定する:
+      per_call + old_worst <= max_cost < per_call + new_worst
+    """
+    info = MODEL_REGISTRY["H3"]
+    usage = {"input_tokens": 32, "output_tokens": 9, "total_tokens": 226,
+             "cache_read_input_tokens": 0}
+    per_call = mm._usage_cost(info, usage)
+    old_worst = estimate_cost(info, (len("sys") + len("hi")) // 2 + 50, 500)
+    new_worst = mm._worst_case_cost(info, "sys", "hi", 500)
+    assert new_worst > old_worst  # 是正により見積が上がっていること
+    assert per_call + old_worst < new_worst  # このモデル・usageで2値が交差することの前提確認
+
+    max_cost = new_worst + 1e-9
+    inner = _FakeUsageRichAdapter(info, usage)
+    wrapped = mm.BudgetedAdapter(inner, info, max_calls=10, max_cost=max_cost, max_tokens_cap=500)
+    wrapped.complete("sys", [{"role": "user", "content": "hi"}], max_tokens=500)
+    # 新見積(reserve込み)の事前ガードにより、2コール目が旧見積の想定より早くブロックされる
+    # （旧見積なら per_call+old_worst <= max_cost のため通っていたはず）
+    with pytest.raises(AdapterError):
+        wrapped.complete("sys", [{"role": "user", "content": "hi"}], max_tokens=500)
+    assert wrapped.calls_made == 1
+
+
+def test_budgeted_adapter_spent_stays_within_cap_for_thinking_model():
+    """H3のようなhidden thinkingモデルで、ブロック時点の実績spent_usdが上限を超えないこと
+    （旧実装ではreserveが無いため、ブロック前に上限を超過しうる欠陥があった）"""
+    info = MODEL_REGISTRY["H3"]
+    usage = {"input_tokens": 32, "output_tokens": 9, "total_tokens": 226,
+             "cache_read_input_tokens": 0}
+    max_cost_per_model = 0.03  # PHASE_DEFAULTS[3]と同一の値
+    inner = _FakeUsageRichAdapter(info, usage)
+    wrapped = mm.BudgetedAdapter(inner, info, max_calls=10, max_cost=max_cost_per_model,
+                                  max_tokens_cap=500)
+    calls_ok = 0
+    for _ in range(10):
+        try:
+            wrapped.complete("sys", [{"role": "user", "content": "hi"}], max_tokens=500)
+            calls_ok += 1
+        except AdapterError:
+            break
+    assert calls_ok >= 1
+    assert wrapped.spent_usd <= max_cost_per_model

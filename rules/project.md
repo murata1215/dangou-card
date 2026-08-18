@@ -85,11 +85,31 @@ total_tokens=0)` はキャッシュ割引・thinking差分課金に対応して�
 `test_budgeted_adapter_cost_*`・`test_phase3_game_records_corrected_cost`・
 `test_phase3_records_cost_to_state_jsonl_and_report`）。Phase 1/2/3 とも `_usage_cost()` へ統一済み
 （Phase 3 `BudgetedAdapter.complete` は2026-08-18に修正、予算消費判定 `spent_usd` にも正しく反映される）。
-**既知の残余課題**: (1) `_worst_case_cost`（`scripts/model_smoke.py`）は hidden thinking を見込まないため
-事前予約が過小気味（Phase 1/2/3・model_smoke共用、意図的にスコープ外）。(2) `llm/llm_agent.py`
+**既知の残余課題**: (1) 2026-08-18、`_worst_case_cost`（`scripts/model_smoke.py:worst_case_cost`）に
+`ModelInfo.hidden_thinking_reserve_tokens`（既定0）を追加し、`estimate_cost(..., total_tokens=
+approx_input+max_tokens+reserve)` で hidden thinking 分を事前予約するよう是正した（**予算上限
+`PHASE_DEFAULTS`/`DEFAULT_MAX_COST_TOTAL` は変更していない**。見積是正の結果ブロックされる
+モデルが増えるのは意図した結果）。対象は実測でmax_tokens外の課金が確認されたGemini/xAIの
+CORE_18内6モデルのみ: `M3`/`L3`/`H3`（Gemini）・`M4`/`L4`/`H4`（xAI）。512は実測最大343
+（xAI L4, max_tokens=64時点）に対する**約1.5倍の経験的安全マージン**であり、provider側で
+thinking budget/reasoning effortの上限を送っていない以上、**provider保証の数学的worst-case
+上限ではない**（関数名が`worst_case_cost`でも、この6モデルについては観測ベースの保守的
+予約見積であることに留意）。Anthropic/OpenAI/Kimi/DeepSeekの12モデルとcore外の`L7`は
+`hidden_thinking_reserve_tokens=0`のまま（`L7`は既知の残余ギャップ、CORE_18対象外のため
+本サイクルでは未対応）。担保テスト: `tests/test_model_smoke.py`
+（`test_worst_case_cost_zero_reserve_models_unchanged`・`test_worst_case_cost_includes_
+gemini_hidden_thinking`・`test_worst_case_cost_includes_xai_reasoning`・
+`test_worst_case_cost_h2_not_double_counted`・`test_worst_case_cost_reserve_targets_are_
+exactly_expected_set`）、`tests/test_model_matrix.py`（`test_phase_defaults_unchanged`・
+`test_worst_case_cost_reserve_targets_are_core18_members`・`test_phase3_guard_blocks_
+earlier_for_thinking_models`・`test_budgeted_adapter_plain_models_unaffected`）。
+(2) `llm/llm_agent.py`
 `_call_llm` 内の自前コスト計算は cache_read/total_tokens は渡すがAnthropic正規化（`input_tokens`への
 `cache_read_input_tokens`合算）を行っていないため、`llm_logs` のコストと `BudgetedAdapter.spent_usd`
 がAnthropicモデルでのみ乖離しうる（別課題として保留）。
+(3) `scripts/model_smoke.py --suite thinking_matrix` はケース単位で`extra_params`を上書きし
+DeepSeek等でもthinkingを強制有効化するため、モデル単位の`hidden_thinking_reserve_tokens=0`
+前提が崩れる（手動診断専用・`--max-cost`明示前提のため据置、既知の残余リスクとして明記のみ）。
 
 ## OpenAI互換アダプタのリトライは `--retries N` ⇔ HTTP最大 `N+1` 回の1対1対応を崩さない
 

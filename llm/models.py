@@ -52,6 +52,12 @@ class ModelInfo:
     cached_input_price: float | None = None  # キャッシュヒット入力単価（$/1Mトークン）。None → input_price と同値
     reasoning_price: float | None = None     # thinkingトークン単価（$/1Mトークン）。None → output_price と同値
     tier: str = ""           # "H"(強)/"M"(中)/"L"(軽)。"" = 未分類（テスト用アドホック生成のデフォルト）
+    hidden_thinking_reserve_tokens: int = 0
+    # max_tokens の外側で課金される hidden thinking/reasoning の事前予約トークン数（worst_case_cost用）。
+    # 0 = thinking が output/completion に内包される（Anthropic/OpenAI）か、
+    #     thinking 無効化済み（Kimi/DeepSeek）→ 予約不要（計算は現行と完全同値）。
+    # >0 の場合も provider が保証する上限ではない。実測最大値に対する経験的安全マージンであり、
+    # 数学的worst-case完全保証ではない（scripts/model_smoke.py:worst_case_cost の docstring参照）。
 
     @property
     def vendor(self) -> str:
@@ -94,6 +100,9 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         env_key="GEMINI_API_KEY", base_url=GEMINI_OPENAI_BASE_URL,
         # TODO: Geminiキャッシュ単価はContext Caching API別体系（$/1M tokens/hour）。ここでは未設定=input同値
         tier="M",
+        # 2026-08-18: Phase 1実測(max_tokens=64)でhidden thinking 185tok（completion外課金）を確認。
+        # 512は実測最大343（L4実測）の約1.5倍の経験的安全マージン。provider保証の上限ではない。
+        hidden_thinking_reserve_tokens=512,
     ),
     "M4": ModelInfo(
         model_id="grok-4.5",
@@ -103,6 +112,9 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         env_key="GROK_API_KEY", base_url="https://api.x.ai/v1",
         cached_input_price=0.30,  # xAI料金表 2026-08-16
         tier="M",
+        # 2026-08-18: Phase 1実測(max_tokens=64)でhidden thinking 42tok（completion外課金）を確認。
+        # 512は実測最大343（L4実測）の約1.5倍の経験的安全マージン。provider保証の上限ではない。
+        hidden_thinking_reserve_tokens=512,
     ),
     "M5": ModelInfo(
         model_id="kimi-k2.6",
@@ -156,6 +168,11 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         env_key="GEMINI_API_KEY", base_url=GEMINI_OPENAI_BASE_URL,
         # TODO: Geminiキャッシュ単価はContext Caching API別体系。ここでは未設定=input同値
         tier="L",
+        # 2026-08-18: Phase 1実測(max_tokens=64)ではこの試行のhidden thinking差分は0だったが、
+        # M3/H3と同一Geminiエンドポイント・同一thinking課金構造のため安全側に予約を設定。
+        # 512は他Gemini/xAIモデルの実測最大343（L4実測）の約1.5倍の経験的安全マージン。
+        # provider保証の上限ではない。
+        hidden_thinking_reserve_tokens=512,
     ),
     "L4": ModelInfo(
         model_id="grok-4.3",
@@ -165,6 +182,9 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         env_key="GROK_API_KEY", base_url="https://api.x.ai/v1",
         cached_input_price=0.20,  # xAI料金表 2026-08-16
         tier="L",
+        # 2026-08-18: Phase 1実測(max_tokens=64)でhidden thinking 343tok（全モデル中最大、completion外課金）を確認。
+        # 512は実測最大343の約1.5倍の経験的安全マージン。provider保証の上限ではない。
+        hidden_thinking_reserve_tokens=512,
     ),
     "L5": ModelInfo(
         model_id="kimi-k2.6",
@@ -231,6 +251,9 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         input_price=2.0, output_price=12.0,  # roster_v1_0.md §3 (2026-08-09時点) 要再確認。2M文脈
         env_key="GEMINI_API_KEY", base_url=GEMINI_OPENAI_BASE_URL,
         tier="H",
+        # 2026-08-18: Phase 1実測(max_tokens=64)でhidden thinking 185tok（completion外課金）を確認。
+        # 512は実測最大343（L4実測）の約1.5倍の経験的安全マージン。provider保証の上限ではない。
+        hidden_thinking_reserve_tokens=512,
     ),
     "H4": ModelInfo(
         model_id="grok-4.6",
@@ -241,6 +264,9 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         input_price=5.0, output_price=15.0,
         env_key="GROK_API_KEY", base_url="https://api.x.ai/v1",
         tier="H",
+        # 2026-08-18: Phase 1実測(max_tokens=64)でhidden thinking 124tok（completion外課金）を確認。
+        # 512は実測最大343（L4実測）の約1.5倍の経験的安全マージン。provider保証の上限ではない。
+        hidden_thinking_reserve_tokens=512,
     ),
     "H5": ModelInfo(
         model_id="kimi-k3",

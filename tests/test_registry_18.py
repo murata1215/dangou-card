@@ -208,13 +208,17 @@ def test_tier_order_and_vendor_order_constants():
 
 
 def test_model_info_field_count_unchanged_except_tier():
-    """ModelInfoのフィールド数が既知の値であること（想定外フィールド追加の検知）"""
+    """ModelInfoのフィールド数が既知の値であること（想定外フィールド追加の検知）
+
+    2026-08-18: hidden_thinking_reserve_tokens を追加（worst_case_costのhidden thinking
+    予約対応。既定0で全モデルの計算を変えない。scripts/model_smoke.py:worst_case_cost参照）。"""
     names = [f.name for f in fields(ModelInfo)]
     assert names == [
         "model_id", "provider", "name", "adapter_type", "input_price", "output_price",
         "env_key", "base_url", "timeout_seconds", "max_tokens",
         "max_tokens_param", "supports_temperature", "extra_params",
         "cached_input_price", "reasoning_price", "tier",
+        "hidden_thinking_reserve_tokens",
     ]
 
 
