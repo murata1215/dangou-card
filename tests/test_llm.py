@@ -1147,6 +1147,547 @@ class TestUsageCapture:
         assert result is None
 
 
+class TestResponseModelCapture:
+    """
+    API返却モデル名（response.model）が usage 辞書に requested_model/response_model
+    として伝播することを検証する。実クライアントは注入せず、_client に直接
+    フェイクを代入して complete() の実経路を通す（API呼び出し・キー不要）。
+    """
+
+    def _anthropic_model_info(self):
+        return ModelInfo(
+            model_id="claude-haiku-4-5-20251001", provider="Anthropic", name="Haiku",
+            adapter_type="anthropic",
+            input_price=1.0, output_price=5.0,
+            env_key="ANTHROPIC_API_KEY", base_url=None,
+        )
+
+    def _openai_model_info(self):
+        return ModelInfo(
+            model_id="deepseek-chat", provider="DeepSeek", name="DeepSeek",
+            adapter_type="openai_compat",
+            input_price=0.5, output_price=1.5,
+            env_key="DEEPSEEK_API_KEY", base_url="https://api.deepseek.com",
+        )
+
+    def test_anthropic_response_model_propagates(self):
+        """AnthropicAdapter.complete() が response.model を usage["response_model"] に伝播すること"""
+        from llm.adapters import AnthropicAdapter
+
+        class FakeBlock:
+            text = "ok"
+
+        class FakeUsage:
+            input_tokens = 10
+            output_tokens = 5
+            cache_creation_input_tokens = 0
+            cache_read_input_tokens = 0
+            output_tokens_details = None
+
+        class FakeResponse:
+            content = [FakeBlock()]
+            usage = FakeUsage()
+            stop_reason = "end_turn"
+            model = "claude-haiku-4-5-20251001"
+
+        class FakeMessages:
+            def create(self, **kwargs):
+                return FakeResponse()
+
+        class FakeClient:
+            messages = FakeMessages()
+
+        info = self._anthropic_model_info()
+        adapter = AnthropicAdapter(info)
+        adapter._client = FakeClient()
+        text, usage = adapter.complete("sys", [{"role": "user", "content": "hi"}])
+        assert text == "ok"
+        assert usage["requested_model"] == "claude-haiku-4-5-20251001"
+        assert usage["response_model"] == "claude-haiku-4-5-20251001"
+
+    def test_anthropic_response_model_none_when_missing(self):
+        """response.model 属性が無い場合、response_model は None のまま（requestedで埋めない）"""
+        from llm.adapters import AnthropicAdapter
+
+        class FakeBlock:
+            text = "ok"
+
+        class FakeUsage:
+            input_tokens = 10
+            output_tokens = 5
+            cache_creation_input_tokens = 0
+            cache_read_input_tokens = 0
+            output_tokens_details = None
+
+        class FakeResponse:
+            content = [FakeBlock()]
+            usage = FakeUsage()
+            stop_reason = "end_turn"
+            # model属性を意図的に持たせない
+
+        class FakeMessages:
+            def create(self, **kwargs):
+                return FakeResponse()
+
+        class FakeClient:
+            messages = FakeMessages()
+
+        info = self._anthropic_model_info()
+        adapter = AnthropicAdapter(info)
+        adapter._client = FakeClient()
+        _, usage = adapter.complete("sys", [{"role": "user", "content": "hi"}])
+        assert usage["response_model"] is None
+        assert usage["requested_model"] == "claude-haiku-4-5-20251001"
+
+    def test_openai_compat_response_model_propagates(self):
+        """OpenAICompatAdapter.complete() が response.model を usage["response_model"] に伝播すること"""
+        from llm.adapters import OpenAICompatAdapter
+
+        class FakeMessage:
+            content = "ok"
+
+        class FakeChoice:
+            message = FakeMessage()
+            finish_reason = "stop"
+
+        class FakeUsage:
+            prompt_tokens = 20
+            completion_tokens = 10
+            total_tokens = 30
+            completion_tokens_details = None
+            prompt_tokens_details = None
+
+        class FakeResponse:
+            choices = [FakeChoice()]
+            usage = FakeUsage()
+            model = "deepseek-chat"
+
+        class FakeCompletions:
+            def create(self, **kwargs):
+                return FakeResponse()
+
+        class FakeChat:
+            completions = FakeCompletions()
+
+        class FakeClient:
+            chat = FakeChat()
+
+        info = self._openai_model_info()
+        adapter = OpenAICompatAdapter(info)
+        adapter._client = FakeClient()
+        text, usage = adapter.complete("sys", [{"role": "user", "content": "hi"}])
+        assert text == "ok"
+        assert usage["requested_model"] == "deepseek-chat"
+        assert usage["response_model"] == "deepseek-chat"
+
+    def test_openai_compat_response_model_empty_string_normalizes_to_none(self):
+        """response.model が空文字の場合、response_model は None に正規化されること"""
+        from llm.adapters import OpenAICompatAdapter
+
+        class FakeMessage:
+            content = "ok"
+
+        class FakeChoice:
+            message = FakeMessage()
+            finish_reason = "stop"
+
+        class FakeUsage:
+            prompt_tokens = 20
+            completion_tokens = 10
+            total_tokens = 30
+            completion_tokens_details = None
+            prompt_tokens_details = None
+
+        class FakeResponse:
+            choices = [FakeChoice()]
+            usage = FakeUsage()
+            model = "   "
+
+        class FakeCompletions:
+            def create(self, **kwargs):
+                return FakeResponse()
+
+        class FakeChat:
+            completions = FakeCompletions()
+
+        class FakeClient:
+            chat = FakeChat()
+
+        info = self._openai_model_info()
+        adapter = OpenAICompatAdapter(info)
+        adapter._client = FakeClient()
+        _, usage = adapter.complete("sys", [{"role": "user", "content": "hi"}])
+        assert usage["response_model"] is None
+
+    def test_logger_entry_has_response_model(self):
+        """LLMLogger.log_call() が usage["response_model"] をエントリに転記すること"""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            logger = LLMLogger(tmpdir, game_id="test_rm")
+            logger.log_call(
+                player_id="P01", model_id="deepseek-chat", phase="negotiation",
+                round_num=1, turn=1, system_prompt="sys", user_prompt="user",
+                response_text="resp",
+                usage={"input_tokens": 10, "output_tokens": 5, "response_model": "deepseek-chat"},
+                cost=0.01, elapsed_ms=100,
+            )
+            entry = logger._entries[-1]
+            assert entry["response_model"] == "deepseek-chat"
+            logger.close()
+
+    def test_logger_entry_response_model_defaults_none(self):
+        """usage に response_model が無い場合、エントリでは None になること"""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            logger = LLMLogger(tmpdir, game_id="test_rm2")
+            logger.log_call(
+                player_id="P01", model_id="test", phase="negotiation",
+                round_num=1, turn=1, system_prompt="sys", user_prompt="user",
+                response_text="resp",
+                usage={"input_tokens": 10, "output_tokens": 5},
+                cost=0.01, elapsed_ms=100,
+            )
+            entry = logger._entries[-1]
+            assert entry["response_model"] is None
+            logger.close()
+
+
+class TestOpenAICompatParamPolicy:
+    """
+    H2 (gpt-5.6-sol) 再テスト対応: max_tokens_param / supports_temperature の
+    データ駆動パラメータ切替を検証する。実クライアントは注入せず、_client に
+    直接フェイクを代入して complete() の実経路を通す（API呼び出し・キー不要）。
+    """
+
+    def _h2_model_info(self):
+        return ModelInfo(
+            model_id="gpt-5.6-sol", provider="OpenAI", name="GPT-5.6 Sol",
+            adapter_type="openai_compat",
+            input_price=5.0, output_price=30.0,
+            env_key="OPENAI_API_KEY", base_url=None,
+            max_tokens_param="max_completion_tokens",
+            supports_temperature=False,
+        )
+
+    def _default_model_info(self, extra_params=None):
+        return ModelInfo(
+            model_id="deepseek-chat", provider="DeepSeek", name="DeepSeek",
+            adapter_type="openai_compat",
+            input_price=0.5, output_price=1.5,
+            env_key="DEEPSEEK_API_KEY", base_url="https://api.deepseek.com",
+            extra_params=extra_params,
+        )
+
+    def _fake_client(self, create_fn):
+        from llm.adapters import OpenAICompatAdapter  # noqa: F401 (型参照用)
+
+        class FakeMessage:
+            content = "ok"
+
+        class FakeChoice:
+            message = FakeMessage()
+            finish_reason = "stop"
+
+        class FakeUsage:
+            prompt_tokens = 20
+            completion_tokens = 10
+            total_tokens = 30
+            completion_tokens_details = None
+            prompt_tokens_details = None
+
+        class FakeResponse:
+            choices = [FakeChoice()]
+            usage = FakeUsage()
+            model = "gpt-5.6-sol"
+
+        class FakeCompletions:
+            def create(self, **kwargs):
+                return create_fn(kwargs, FakeResponse)
+
+        class FakeChat:
+            completions = FakeCompletions()
+
+        class FakeClient:
+            chat = FakeChat()
+
+        return FakeClient()
+
+    def test_h2_sends_max_completion_tokens_not_max_tokens(self):
+        """H2は max_completion_tokens のみを送り、max_tokens は送らないこと"""
+        from llm.adapters import OpenAICompatAdapter
+
+        captured = []
+
+        def create_fn(kwargs, resp_cls):
+            captured.append(kwargs)
+            return resp_cls()
+
+        info = self._h2_model_info()
+        adapter = OpenAICompatAdapter(info)
+        adapter._client = self._fake_client(create_fn)
+        adapter.complete("sys", [{"role": "user", "content": "hi"}], max_tokens=3072)
+
+        assert len(captured) == 1
+        assert "max_completion_tokens" in captured[0]
+        assert captured[0]["max_completion_tokens"] == 3072
+        assert "max_tokens" not in captured[0]
+
+    def test_h2_does_not_send_temperature(self):
+        """H2は temperature を一切送らないこと"""
+        from llm.adapters import OpenAICompatAdapter
+
+        captured = []
+
+        def create_fn(kwargs, resp_cls):
+            captured.append(kwargs)
+            return resp_cls()
+
+        info = self._h2_model_info()
+        adapter = OpenAICompatAdapter(info)
+        adapter._client = self._fake_client(create_fn)
+        adapter.complete("sys", [{"role": "user", "content": "hi"}], temperature=0.0)
+
+        assert len(captured) == 1
+        assert "temperature" not in captured[0]
+
+    def test_default_model_sends_max_tokens_and_temperature(self):
+        """既定モデル（H2以外）は従来どおり max_tokens + temperature を送ること（回帰）"""
+        from llm.adapters import OpenAICompatAdapter
+
+        captured = []
+
+        def create_fn(kwargs, resp_cls):
+            captured.append(kwargs)
+            return resp_cls()
+
+        info = self._default_model_info()
+        adapter = OpenAICompatAdapter(info)
+        adapter._client = self._fake_client(create_fn)
+        adapter.complete("sys", [{"role": "user", "content": "hi"}], max_tokens=1000, temperature=0.5)
+
+        assert len(captured) == 1
+        assert captured[0]["max_tokens"] == 1000
+        assert "max_completion_tokens" not in captured[0]
+        assert captured[0]["temperature"] == 0.5
+
+    def test_default_model_still_falls_back_on_temperature_error(self):
+        """既定モデルはtemperatureエラーで2回目が飛び、2回目にtemperatureが無いこと（既存挙動維持）"""
+        from llm.adapters import OpenAICompatAdapter
+
+        captured = []
+
+        def create_fn(kwargs, resp_cls):
+            captured.append(kwargs)
+            if len(captured) == 1:
+                raise Exception("temperature does not support this value")
+            return resp_cls()
+
+        info = self._default_model_info()
+        adapter = OpenAICompatAdapter(info)
+        adapter._client = self._fake_client(create_fn)
+        adapter.complete("sys", [{"role": "user", "content": "hi"}], temperature=0.5)
+
+        assert len(captured) == 2
+        assert "temperature" in captured[0]
+        assert "temperature" not in captured[1]
+
+    def test_extra_params_and_usage_capture_unaffected(self):
+        """extra_body保持、requested_model/response_model/finish_reason/usageが無傷であること"""
+        from llm.adapters import OpenAICompatAdapter
+
+        captured = []
+
+        def create_fn(kwargs, resp_cls):
+            captured.append(kwargs)
+            return resp_cls()
+
+        info = self._default_model_info(extra_params={"thinking": {"type": "disabled"}})
+        adapter = OpenAICompatAdapter(info)
+        adapter._client = self._fake_client(create_fn)
+        text, usage = adapter.complete("sys", [{"role": "user", "content": "hi"}])
+
+        assert captured[0]["extra_body"] == {"thinking": {"type": "disabled"}}
+        assert text == "ok"
+        assert usage["requested_model"] == "deepseek-chat"
+        assert usage["response_model"] == "gpt-5.6-sol"
+        assert usage["finish_reason"] == "stop"
+        assert usage["input_tokens"] == 20
+        assert usage["output_tokens"] == 10
+
+
+class TestSingleHttpRequestGuarantee:
+    """
+    H2 再テストは成功・失敗を問わずHTTP送信最大1回であることを保証する。
+    Phase 1 は create_adapter(model, max_retries=0) を常に使うため、
+    アダプタ内部リトライ・OpenAI SDK内部リトライ・temperatureフォールバックが
+    いずれも無効化されることをフェイク注入で検証する（実APIなし）。
+    """
+
+    def _h2_model_info(self):
+        return ModelInfo(
+            model_id="gpt-5.6-sol", provider="OpenAI", name="GPT-5.6 Sol",
+            adapter_type="openai_compat",
+            input_price=5.0, output_price=30.0,
+            env_key="OPENAI_API_KEY", base_url=None,
+            max_tokens_param="max_completion_tokens",
+            supports_temperature=False,
+        )
+
+    def _default_model_info(self):
+        return ModelInfo(
+            model_id="deepseek-chat", provider="DeepSeek", name="DeepSeek",
+            adapter_type="openai_compat",
+            input_price=0.5, output_price=1.5,
+            env_key="DEEPSEEK_API_KEY", base_url="https://api.deepseek.com",
+        )
+
+    def _always_raising_client(self, exc_factory, call_counter):
+        class FakeCompletions:
+            def create(self, **kwargs):
+                call_counter.append(1)
+                raise exc_factory()
+
+        class FakeChat:
+            completions = FakeCompletions()
+
+        class FakeClient:
+            chat = FakeChat()
+
+        return FakeClient()
+
+    @pytest.mark.parametrize("error_message", [
+        "400 Bad Request: Unsupported parameter",
+        "429 Too Many Requests",
+        "500 Internal Server Error",
+        "Request timeout",
+        "Connection error",
+    ])
+    def test_no_resend_for_any_error(self, error_message, monkeypatch):
+        """max_retries=0 なら400/429/500/timeout/connectionいずれでも create() は1回だけ"""
+        import llm.adapters as adapters_mod
+        from llm.adapters import OpenAICompatAdapter, AdapterError
+
+        monkeypatch.setattr(adapters_mod.time, "sleep", lambda *a, **kw: None)
+        calls: list[int] = []
+        info = self._default_model_info()
+        adapter = OpenAICompatAdapter(info, max_retries=0)
+        adapter._client = self._always_raising_client(lambda: Exception(error_message), calls)
+
+        with pytest.raises(AdapterError):
+            adapter.complete("sys", [{"role": "user", "content": "hi"}])
+
+        assert len(calls) == 1
+
+    def test_h2_like_model_no_resend_even_on_temperature_error(self, monkeypatch):
+        """supports_temperature=False かつ max_retries=0 なら「temperature」400でも create() は1回"""
+        import llm.adapters as adapters_mod
+        from llm.adapters import OpenAICompatAdapter, AdapterError
+
+        monkeypatch.setattr(adapters_mod.time, "sleep", lambda *a, **kw: None)
+        calls: list[int] = []
+        info = self._h2_model_info()
+        adapter = OpenAICompatAdapter(info, max_retries=0)
+        adapter._client = self._always_raising_client(
+            lambda: Exception("temperature is not supported for this model"), calls
+        )
+
+        with pytest.raises(AdapterError):
+            adapter.complete("sys", [{"role": "user", "content": "hi"}])
+
+        assert len(calls) == 1
+
+    def test_default_adapter_still_retries_on_429(self, monkeypatch):
+        """max_retries未指定なら従来どおり3回（API_MAX_RETRIES=2）呼ばれること（回帰）"""
+        import llm.adapters as adapters_mod
+        from llm.adapters import OpenAICompatAdapter, AdapterError
+
+        monkeypatch.setattr(adapters_mod.time, "sleep", lambda *a, **kw: None)
+        calls: list[int] = []
+        info = self._default_model_info()
+        adapter = OpenAICompatAdapter(info)  # max_retries未指定
+        adapter._client = self._always_raising_client(lambda: Exception("429 rate limit"), calls)
+
+        with pytest.raises(AdapterError):
+            adapter.complete("sys", [{"role": "user", "content": "hi"}])
+
+        assert len(calls) == 3
+
+    def test_client_built_with_max_retries_zero(self, monkeypatch):
+        """max_retries=0 のアダプタは openai.OpenAI(max_retries=0) でクライアントを生成すること"""
+        import openai
+        from llm.adapters import OpenAICompatAdapter
+
+        captured_kwargs = {}
+
+        class FakeOpenAI:
+            def __init__(self, **kwargs):
+                captured_kwargs.update(kwargs)
+
+        monkeypatch.setattr(openai, "OpenAI", FakeOpenAI)
+        monkeypatch.setenv("OPENAI_API_KEY", "dummy")
+
+        info = self._h2_model_info()
+        adapter = OpenAICompatAdapter(info, max_retries=0)
+        adapter._get_client()
+
+        assert captured_kwargs.get("max_retries") == 0
+
+    def test_client_kwargs_omit_max_retries_by_default(self, monkeypatch):
+        """max_retries未指定では openai.OpenAI に max_retries キーを渡さないこと（SDK既定維持の回帰）"""
+        import openai
+        from llm.adapters import OpenAICompatAdapter
+
+        captured_kwargs = {}
+
+        class FakeOpenAI:
+            def __init__(self, **kwargs):
+                captured_kwargs.update(kwargs)
+
+        monkeypatch.setattr(openai, "OpenAI", FakeOpenAI)
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "dummy")
+
+        info = self._default_model_info()
+        adapter = OpenAICompatAdapter(info)
+        adapter._get_client()
+
+        assert "max_retries" not in captured_kwargs
+
+    def test_create_adapter_passes_max_retries(self):
+        """create_adapter(info, max_retries=0) が openai_compat / gemini に伝播すること。
+        anthropicでは現状無視される（max_retries未対応）仕様を明示する。"""
+        from llm.adapters import create_adapter, OpenAICompatAdapter, AnthropicAdapter
+
+        openai_info = self._default_model_info()
+        adapter = create_adapter(openai_info, max_retries=0)
+        assert isinstance(adapter, OpenAICompatAdapter)
+        assert adapter._max_retries == 0
+
+        gemini_info = ModelInfo(
+            model_id="gemini-3.5-flash", provider="Google", name="Gemini",
+            adapter_type="gemini",
+            input_price=0.1, output_price=0.4,
+            env_key="GEMINI_API_KEY", base_url="https://example.invalid",
+        )
+        adapter2 = create_adapter(gemini_info, max_retries=0)
+        assert isinstance(adapter2, OpenAICompatAdapter)
+        assert adapter2._max_retries == 0
+
+        anthropic_info = ModelInfo(
+            model_id="claude-haiku-4-5-20251001", provider="Anthropic", name="Haiku",
+            adapter_type="anthropic",
+            input_price=1.0, output_price=5.0,
+            env_key="ANTHROPIC_API_KEY", base_url=None,
+        )
+        adapter3 = create_adapter(anthropic_info, max_retries=0)
+        assert isinstance(adapter3, AnthropicAdapter)
+
+    def test_model_info_defaults(self):
+        """ModelInfoの既定値: max_tokens_param=='max_tokens'、supports_temperature is True"""
+        info = self._default_model_info()
+        assert info.max_tokens_param == "max_tokens"
+        assert info.supports_temperature is True
+
+
 class TestLoggerNewFields:
     """Stage 1: ログエントリに新フィールドが正しく記録されることを検証"""
 

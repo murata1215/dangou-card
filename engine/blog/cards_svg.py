@@ -62,6 +62,12 @@ MODEL_TAGLINES: dict[str, str] = {
     "L4": "廉価版の暴れ馬。安さで場を掻き回す。",
     "L5": "熟考派の弟。安価に論理を回す。",
     "L6": "実利のバジェット枠。堅実に安く。",
+    "H1": "頂点の読み合い。格の違いを見せつける。",
+    "H2": "最上位の交渉巧者。隙のない完成形。",
+    "H3": "圧倒的な情報処理力。桁違いの精度。",
+    "H4": "旗艦の中の旗艦。破格の一手を放つ。",
+    "H5": "極限の熟考。時間をかけて必ず勝つ。",
+    "H6": "頂点の実利主義。強さもコスパも譲らない。",
 }
 
 
@@ -126,12 +132,35 @@ def _wrap(text: str, n: int) -> list[str]:
     return lines
 
 
+def _registry_tier(model_key: str) -> str | None:
+    """MODEL_REGISTRYからtier("H"/"M"/"L")を引く。未登録キーやレジストリ未定義（tier==""）はNone。"""
+    try:
+        from llm.models import get_model
+        tier = get_model(model_key).tier
+        return tier or None
+    except Exception:
+        return None
+
+
 def _tier_label(model_key: str) -> str:
-    return "中量級 ・ フラッグシップ級" if model_key.startswith("M") else "軽量級 ・ ライトウェイト"
+    tier = _registry_tier(model_key)
+    if tier is None:
+        # レジストリ未登録キー向けフォールバック（従来ヒューリスティック）
+        tier = "M" if model_key.startswith("M") else "L"
+    if tier == "H":
+        return "強量級 ・ フラッグシップ級"
+    if tier == "M":
+        return "中量級 ・ フラッグシップ級"
+    return "軽量級 ・ ライトウェイト"
 
 
 def _price_pitch(model_key: str, output_price: float) -> str:
-    if model_key.startswith("M"):
+    tier = _registry_tier(model_key)
+    if tier is None:
+        tier = "M" if model_key.startswith("M") else "L"
+    if tier == "H":
+        return "文句なしの最上位級。頂点の思考力に懸ける。"
+    if tier == "M":
         if output_price <= 4.5:
             return "旗艦級の実力ながら、価格の安さで市場を席巻中。"
         return "実力本位のフラッグシップ。相応の価格。"

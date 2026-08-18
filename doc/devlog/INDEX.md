@@ -78,6 +78,14 @@
 - 2026-08-17 21:10 JST | 繰越（キャリーオーバー）と前ラウンド結果の周知漏れ是正: R4 M03賞金2倍の原因究明→visible_state/プロンプト/viewer表示追加 → 2026-08-17_211003.md
 - 2026-08-17 22:15 JST | 引き継ぎメモリ（Handover Memory）導入: AIに1枚だけの自由記述メモを次ラウンドへ持ち越させる新フェイズ追加 → 2026-08-17_221503.md
 - 2026-08-17 22:49 JST | DM本文の秘匿化（§8.2是正）: 密談が全員に筒抜けだったバグ修正 + 匿名通信配信漏れ・commit/double_up義務可視化漏れも是正 → 2026-08-17_224915.md
+- 2026-08-17 23:55 JST | 18モデル疎通テスト基盤の構築: Hティア6体を$0発見で確定・追加、Phase 0〜3段階スモークテスト（model_matrix.py）を新設 → 2026-08-17_235539.md
+- 2026-08-18 00:17 JST | 18モデル疎通テスト基盤 Phase 1 実行: 弱6モデル実API疎通6/6成功、xAIのreasoning_tokensコスト計上漏れを発見 → 2026-08-18_001755.md
+- 2026-08-18 04:18 JST | API返却モデル名の取得・記録対応: requested/returned一致判定(match/alias/mismatch)をPhase1に追加、弱6モデル再実測でOpenAIのエイリアス解決を実例確認 → 2026-08-18_041844.md
+- 2026-08-18 06:22 JST | 18モデル疎通テスト基盤 Phase 1 実行: 中6モデル実API疎通6/6成功、gpt-4.1のエイリアス解決を再現確認、run_id追記でL6+M6=12モデル累積表に → 2026-08-18_062256.md
+- 2026-08-18 06:43 JST | Phase 1 コスト計算バグ修正: run_phase1のestimate_cost呼び出しにcache_read/total_tokensを渡す修正、Anthropicのcache慣習差(Finding B)も吸収、既存12モデルログ再集計で修正合計$0.004026を確認 → 2026-08-18_064320.md
+- 2026-08-18 07:05 JST | 18モデル疎通テスト基盤 Phase 1 実行: 強6モデル実API疎通5/6成功、gpt-5.6-solがmax_completion_tokens要求で400失敗(報告のみ)、L6+M6+H6=18モデル累積$0.008537を確認 → 2026-08-18_070556.md
+- 2026-08-18 08:12 JST | H2(gpt-5.6-sol) Phase 1再テスト: max_tokens_param/supports_temperatureをModelInfoに追加しリトライ責務をmodel_matrixへ一本化(HTTP最大1回)、実API1コールでpass・18モデル全通過$0.0090を確認 → 2026-08-18_081245.md
+- 2026-08-18 11:04 JST | サイクルE: Phase 2 コスト計算修正: run_phase2のestimate_cost直呼びを_usage_cost()に統一(Gemini hidden thinking/xAI cache割引/Anthropic正規化を反映)、Phase2未実行のため履歴影響ゼロ、テスト12件追加で全556件PASS → 2026-08-18_110406.md
 
 ### 2026-08-16 10:03 JST | コストログ化 Stage 2: 単価表拡張・estimate_cost内訳対応・確定単価反映
 

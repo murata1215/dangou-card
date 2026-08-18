@@ -82,6 +82,7 @@ class LLMLogger:
             "finish_reason": finish_reason,
             "reasoning_tokens": usage.get("reasoning_tokens", 0),
             "usage_raw": usage.get("usage_raw"),  # 生usageダンプ（Gemini等の未知フィールド炙り出し用）
+            "response_model": usage.get("response_model"),  # API実返却モデル名（取得不能時はNone）
             "unit_price_input": unit_price_input,   # 単価スナップショット（$/1Mトークン）
             "unit_price_output": unit_price_output,  # 単価スナップショット（$/1Mトークン）
         }

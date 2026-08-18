@@ -833,9 +833,11 @@ def get_cost_breakdown(
     from llm.models import ModelInfo, estimate_cost, MODEL_REGISTRY
 
     # model_id → ModelInfo のルックアップ（レジストリから）
+    # setdefault で先勝ち統一（llm.models.get_model() の逆引きと同じ意味論）。
+    # M5/L5, M6/L6 のようにmodel_idが重複するエントリでは宣言順が早い方(M5/M6)が勝つ。
     _model_by_id: dict[str, ModelInfo] = {}
     for mi in MODEL_REGISTRY.values():
-        _model_by_id[mi.model_id] = mi
+        _model_by_id.setdefault(mi.model_id, mi)
 
     trial_dir = logs_dir / trial_dir_name
     llm_logs_dir = trial_dir / "llm_logs"

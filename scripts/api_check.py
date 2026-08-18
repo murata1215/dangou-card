@@ -1,13 +1,19 @@
 """
-6社12モデル API疎通チェックスクリプト
+6社(最大18モデル) API疎通チェックスクリプト
 
 各モデルに2コール（疎通+ゲームJSON）を実行し、
 結果をdoc/api_check_report.mdに出力する。
 
+MODEL_REGISTRYにH1〜H6（強量級・フラッグシップ）が追加されたため、
+デフォルトの全走査には高額モデルが含まれる。全走査は明示的な
+--all指定なしでは実行しない（誤って$10級モデルをまとめて叩かないための安全策）。
+
 使用方法:
-    uv run python scripts/api_check.py
+    uv run python scripts/api_check.py --keys M1,L1,M2      # 対象を絞って実行（推奨）
+    uv run python scripts/api_check.py --all                # 全モデル走査（要注意・高額）
 """
 
+import argparse
 import os
 import sys
 import time
@@ -53,6 +59,7 @@ def check_model(
     key: str,
     model: ModelInfo,
     cost_budget: list[float],
+    max_cost: float = 0.5,
 ) -> dict[str, Any]:
     """1モデルの疎通チェックを実行する"""
     result: dict[str, Any] = {
@@ -109,7 +116,7 @@ def check_model(
     result["ping_error"] = ping_error
     result["ping_tokens"] = ping_tokens
 
-    if cost_budget[0] > 0.5:
+    if cost_budget[0] > max_cost:
         result["status"] = "BUDGET"
         result["json_ok"] = False
         return result
@@ -165,8 +172,9 @@ def check_model(
 
 def generate_report(results: list[dict], total_cost: float, elapsed: float, output_path: Path) -> None:
     """疎通結果レポートを生成する"""
+    n = len(results)
     lines: list[str] = []
-    lines.append("# 6社12モデル API疎通チェックレポート\n")
+    lines.append(f"# {n}モデル API疎通チェックレポート\n")
     lines.append(f"- 実行日: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     lines.append(f"- 実行時間: {elapsed:.1f}秒")
     lines.append(f"- 総コスト: ${total_cost:.4f}")
@@ -178,7 +186,7 @@ def generate_report(results: list[dict], total_cost: float, elapsed: float, outp
     skip = sum(1 for r in results if r["status"] == "SKIP")
     fail = sum(1 for r in results if r["status"] in ("FAIL", "ERROR"))
 
-    lines.append(f"## サマリ: 疎通OK {ok_count}/12, JSON成立 {sum(1 for r in results if r.get('json_ok'))}/12\n")
+    lines.append(f"## サマリ: 疎通OK {ok_count}/{n}, JSON成立 {sum(1 for r in results if r.get('json_ok'))}/{n}\n")
 
     lines.append("## 結果表\n")
     lines.append("| # | ベンダー | モデル | 疎通 | レイテンシ | JSON | JSON ms | コスト | 備考 |")
@@ -232,19 +240,39 @@ def generate_report(results: list[dict], total_cost: float, elapsed: float, outp
 
 
 def main() -> None:
-    print("=== 6社12モデル API疎通チェック ===")
-    print(f"コスト上限: $0.50")
+    parser = argparse.ArgumentParser(description="モデルAPI疎通チェック（既定は全走査せず--keys必須）")
+    parser.add_argument("--keys", default="", help="カンマ区切りの対象キー（例: M1,L1,M2）")
+    parser.add_argument("--all", action="store_true",
+                         help="全モデルを走査する（H1〜H6の高額モデルを含むため要注意・明示指定必須）")
+    parser.add_argument("--max-cost", type=float, default=0.5, help="総コスト上限USD（既定0.5）")
+    args = parser.parse_args()
+
+    if args.keys:
+        keys = [k.strip() for k in args.keys.split(",") if k.strip()]
+        unknown = [k for k in keys if k not in MODEL_REGISTRY]
+        if unknown:
+            print(f"不明なキー: {unknown}")
+            sys.exit(1)
+    elif args.all:
+        keys = sorted(MODEL_REGISTRY.keys())
+    else:
+        print("--keys で対象を指定するか、--all で全モデル走査を明示してください"
+              "（H1〜H6は高額モデルのため誤爆防止で既定は何もしません）")
+        sys.exit(1)
+
+    print(f"=== {len(keys)}モデル API疎通チェック ===")
+    print(f"コスト上限: ${args.max_cost:.2f}")
     print("---")
 
     start = time.time()
     cost_budget = [0.0]  # mutableで渡すためリスト
     results: list[dict] = []
 
-    for key in sorted(MODEL_REGISTRY.keys()):
+    for key in keys:
         model = MODEL_REGISTRY[key]
         print(f"{key} ({model.provider} {model.name})...", end=" ", flush=True)
 
-        if cost_budget[0] > 0.5:
+        if cost_budget[0] > args.max_cost:
             print("BUDGET超過")
             results.append({
                 "key": key, "model_id": model.model_id, "provider": model.provider,
@@ -253,7 +281,7 @@ def main() -> None:
             })
             continue
 
-        r = check_model(key, model, cost_budget)
+        r = check_model(key, model, cost_budget, max_cost=args.max_cost)
         results.append(r)
         status = r["status"]
         detail = ""

@@ -97,6 +97,22 @@ ps -o rss=,etime= -p $(cat $(ls -t logs/llm/run_*.pid | head -1))   # メモリ(
 - CoTは両方OFF（`--cot` を付けない）。低コスト負荷試験が目的で、CoT ONは出力トークン・所要時間を大きく膨らませるため
 - **18体走行中はビューワーを開きっぱなしにしない**。観戦画面は2秒間隔ポーリングで進行中ログを毎回フルパースするため、18体分のログ（試合完走時で数十MB規模）を継続的に読み続けると負荷が増す。18体の描画確認は**試合完了後**に行うこと
 
+### 18モデル段階的スモークテスト（`scripts/model_matrix.py`）
+
+6社18モデル（強6:H1〜H6 / 中6:M1〜M6 / 軽6:L1〜L6）の実API疎通・課金実測を、Phase 0（在庫確認,$0）
+→ Phase 1（疎通確認）→ Phase 2（談合カードJSON互換）→ Phase 3（ミニゲーム統合）の4段階でコスト・
+コール数上限ガード付きに実行するスクリプト。進行状況は `state.json` で管理し `--resume` で再開できる。
+
+```bash
+uv run python scripts/model_matrix.py --phase 1 --keys H1,H2,H3 --dry-run   # 見積のみ（$0）
+uv run python scripts/model_matrix.py --phase 1 --keys H1,H2,H3 --max-cost 0.1
+uv run python scripts/model_matrix.py --phase 2 --resume
+```
+
+コスト計算は全フェーズで実測usageベースの `_usage_cost()` に統一されており、Geminiのhidden
+thinking・xAI等のキャッシュ割引・Anthropicのusage慣習差を正しく反映する。詳細は `rules/project.md`
+の該当節を参照。
+
 ## JSONLイベント仕様
 
 `logs/` にJSONL形式で全イベントを出力。各行は1イベント:

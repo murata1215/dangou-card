@@ -69,3 +69,32 @@ DM（`type == "dm"`）は送信者・宛先以外に対し **`message` キー自
 を追加する際は `_round_messages` を生で（`_visible_messages()` を経由せず）他プレイヤー向け出力に混入させない
 こと。匿名通信（`anonymous_broadcast`）は本文は全員に公開するが `sender: None` で掲載者のみ秘匿する（§8.2）。
 担保テスト: `tests/test_dm_secrecy.py`（`TestFullScanNoLeak` が全プレイヤー横断の漏洩スキャンを行う）。
+
+## LLMコストは常に `_usage_cost(model, usage)` 経由で算出する（`estimate_cost()` を直接input/outputだけで呼ばない）
+
+`llm/models.py` の `estimate_cost(model, input_tokens, output_tokens, cache_read_input_tokens=0,
+total_tokens=0)` はキャッシュ割引・thinking差分課金に対応しているが、`cache_read_input_tokens`/
+`total_tokens` を渡さずに呼ぶと **Geminiのhidden thinkingが無料扱い・xAI等のキャッシュ割引が
+未反映・Anthropicのusage慣習差（`input_tokens`にcache_readが含まれない）が正規化されない**まま
+過小/過大請求になる（`scripts/model_matrix.py` Phase 1で実測発覚、2026-08-18）。usageから課金額を
+求める箇所は必ず `scripts/model_matrix.py` の `_usage_cost(model, usage)` を経由すること（Anthropic
+のみ`input_tokens`へ`cache_read_input_tokens`を合算してから`estimate_cost`へ渡す正規化を行う）。
+新しいコスト記録経路（新フェーズ・新スクリプト・ビューワー集計等）を追加する際は `estimate_cost()`
+を素朴にinput/outputだけで呼ばないこと。担保テスト: `tests/test_model_matrix.py`
+（`test_usage_cost_*`・`test_phase1_records_corrected_cost_*`・`test_phase2_cost_*`）。
+**既知の未修正箇所**: `scripts/model_matrix.py` の Phase 3 `BudgetedAdapter.complete` は同一バグを
+残したまま（予算ガードロジックへの影響評価が必要なため意図的にスコープ外。修正時は要注意）。
+
+## OpenAI互換アダプタのリトライは `--retries N` ⇔ HTTP最大 `N+1` 回の1対1対応を崩さない
+
+`llm/adapters.py` の `create_adapter(model_info, max_retries=None)` / `OpenAICompatAdapter` は、
+スクリプト外側ループ・アダプタ内部（`API_MAX_RETRIES`）・OpenAI SDK既定（`max_retries`）の3層が
+独立にリトライしうる構造になっている。`--retries N` を素朴に3層すべてへ同じ値で伝播すると
+`(N+1)^3` の多重リトライが発生し、コスト上限ガードが実際のHTTP回数を正しく見積れなくなる
+（`scripts/model_matrix.py` Phase 1で設計是正、2026-08-18）。スクリプト層が試行回数を管理する
+経路（Phase 1等）では、必ず `create_adapter(model, max_retries=0)` で下位2層のリトライを強制的に
+無効化し、1試行=HTTP1回を保証してからスクリプト側でリトライループを回すこと。ゲーム本体・
+Phase 2/3・model_smoke等、スクリプト層で試行回数を管理しない既存経路は従来のretry挙動
+（`max_retries=None`＝アダプタ内部/SDK既定のリトライが有効）を維持する。担保テスト:
+`tests/test_llm.py::TestSingleHttpRequestGuarantee`、
+`tests/test_model_matrix.py::test_phase1_always_creates_adapter_with_zero_lower_retries` 等。

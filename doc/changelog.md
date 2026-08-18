@@ -1,5 +1,78 @@
 # Changelog
 
+## 2026-08-18: 18モデル体制（H1〜H6）整備・Phase 1/2 コスト計算修正・リトライ責務一本化
+
+### 概要
+Season 2 決勝編成向けに強6モデル（H1〜H6, フラッグシップ級）を `MODEL_REGISTRY` へ追加し、
+6社18モデル体制（強6+中6+軽6）が確定した。これに伴い新設した `scripts/model_matrix.py`
+（Phase 0〜3 段階的スモークテスト）で全18モデルの実API疎通・課金実測を行い、その過程で発覚した
+コスト計算バグ（Gemini hidden thinking の計上漏れ・キャッシュ割引の未反映・Anthropic usage慣習差の
+未正規化）とリトライ多重化の設計不備を是正した。
+
+### 詳細
+
+**18モデル体制整備:**
+- `llm/models.py`: H1〜H6（強量級）6モデルを追加。`ModelInfo` に `max_tokens_param`
+  （既定`"max_tokens"`、reasoning系は`"max_completion_tokens"`）と `supports_temperature`
+  （既定True、reasoning系はFalse）を新設。H2 (`gpt-5.6-sol`) は実測で400エラーを確認したため
+  この2フィールドをH2専用に上書き
+- `engine/blog/cards_svg.py`: ブログカード生成が `MODEL_REGISTRY` の `tier`（H/M/L）を直接参照する
+  ように変更。H1〜H6用のタグライン・価格訴求文・強量級ラベルを追加
+- `scripts/api_check.py`: 全18モデル一括走査で高額なH系モデルを誤爆しないよう、既定では何も
+  実行せず `--keys` での対象絞り込みか `--all`（明示指定）を必須化
+- `scripts/llm_trial.py`: `SEASON2_ROSTER_18`（6社18モデルフルロスター）を新設
+- `viewer/log_parser.py`: `model_id` 重複時（例: M5/L5がKimi K2.6を共有）に宣言順で先勝ち統一する
+  `setdefault` へ修正（`get_model()` の逆引きと意味論を一致させる）
+- `llm/llm_logger.py`: ログに `response_model`（API実返却モデル名）を追加記録
+
+**scripts/model_matrix.py（新設）— 18モデル段階的スモークテスト:**
+- Phase 0（在庫確認, $0）→ Phase 1（疎通確認）→ Phase 2（談合カードJSON互換）→ Phase 3（ミニゲーム統合）
+  の4段階を `state.json` でゲート管理。`--resume`/`--force`/`--dry-run`/コスト・コール数上限ガード対応
+- Phase 1 実測で以下を発見・修正:
+  - xAIの `reasoning_tokens` がコスト計上から漏れていた（cache_read/total_tokensをestimate_costへ
+    渡していなかった）→ `_usage_cost(model, usage)` を新設し、cache割引・thinking差分課金・
+    Anthropicのusage慣習差（`input_tokens`にcache_readが含まれない）を正規化してからestimate_costへ
+    渡す方式に統一
+  - APIの実返却モデル名（`response_model`）を記録し、requested/returnedの一致判定
+    （match/alias/mismatch）をレポートに追加
+  - H2 (`gpt-5.6-sol`) が `max_tokens` パラメータを拒否する400エラーを実測 → `max_tokens_param`/
+    `supports_temperature` フィールド追加で解消し、H2再テストで通過（全18モデル$0.0090で完走）
+- **リトライ責務の一本化**: 従来はスクリプト外側ループ・アダプタ内部（`API_MAX_RETRIES=2`）・
+  OpenAI SDK既定（`max_retries=2`）の3層が独立にリトライしており `--retries N` を素朴に伝播すると
+  `(N+1)^3` の多重リトライになりうる欠陥があった。Phase 1呼び出し側で
+  `create_adapter(model, max_retries=0)` を常に使い下位2層のリトライを強制的に無効化することで、
+  `--retries N` → HTTP最大 `N+1` 回の1対1対応を保証する設計に統一（`llm/adapters.py`:
+  `create_adapter(model_info, max_retries=None)` / `OpenAICompatAdapter.__init__(max_retries=None)`）。
+  Phase 2/3・ゲーム本体・model_smoke等、Phase 1以外は従来のretry挙動を維持
+
+**Phase 2 コスト計算修正（本サイクル）:**
+- `scripts/model_matrix.py` の `run_phase2()` が旧式の `estimate_cost(info, input, output)` を
+  直接呼んでおり、Phase 1で導入した `_usage_cost()` の恩恵（hidden thinking計上・cache割引・
+  Anthropic正規化）を受けていなかったバグを1行修正で解消（`cost = _usage_cost(info, usage)`）
+- Phase 2 は1モデルにつきAPI呼び出しがちょうど1回（parse correction再送・スクリプト層リトライなし）
+  であることを確認したため、usage合算処理は不要と判断
+- Phase 2 は未実行で成果物が存在しなかったため、履歴の再計算・書き換えは発生せず
+- Phase 3 `BudgetedAdapter.complete` にも同一バグが残存することを確認したが、予算ガードロジックへの
+  影響評価が必要なため今回はスコープ外として申し送り
+
+### 変更
+- `llm/models.py`: H1〜H6追加、`max_tokens_param`/`supports_temperature`フィールド新設
+- `llm/adapters.py`: `create_adapter`/`OpenAICompatAdapter` に `max_retries` パラメータ追加、
+  `max_tokens_param`/`supports_temperature` に応じたリクエスト組み立て分岐
+- `llm/llm_logger.py`: `response_model` フィールド記録
+- `scripts/model_matrix.py`（新設）: Phase 0〜3 段階的スモークテストランナー、`_usage_cost()`
+  （Phase 1/2共通）
+- `scripts/discover_models.py`（新設）、`scripts/run_matrix.sh`（新設）
+- `scripts/api_check.py`: `--keys`/`--all`/`--max-cost` オプション追加（既定は何もしない安全策）
+- `scripts/llm_trial.py`: `SEASON2_ROSTER_18` 追加
+- `engine/blog/cards_svg.py`: tier別タグライン・価格訴求文・強量級ラベル追加
+- `viewer/log_parser.py`: model_id重複時の先勝ち統一（`setdefault`）
+- テスト: `tests/test_llm.py`（H2パラメータポリシー・単一HTTPリクエスト保証等16件追加）、
+  `tests/test_registry_18.py`（新設）、`tests/test_model_matrix.py`（新設。Phase1/2コスト計算
+  検証を含む）。全556テストPASS
+- レポート: `doc/model_matrix_report.md`、`.devrelay-output/phase1_h2_retest_report.md`、
+  `.devrelay-output/phase2_cost_fix_report.md`
+
 ## 2026-08-17: DM本文の秘匿化（§8.2是正）— 密談が全員に筒抜けだったバグの修正
 
 ### 概要

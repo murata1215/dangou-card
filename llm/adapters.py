@@ -34,6 +34,24 @@ def _dump_usage_raw(usage_obj: Any) -> dict[str, Any] | None:
         return None
 
 
+def _norm_response_model(value: Any) -> str | None:
+    """
+    API応答の response.model 相当を安全に正規化する。
+
+    取得不能・非文字列・空白のみの場合は None を返す
+    （requested model_id で埋めて「返却された」と偽装しない）。
+    """
+    try:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            return None
+        stripped = value.strip()
+        return stripped if stripped else None
+    except Exception:
+        return None
+
+
 class AdapterError(Exception):
     """APIアダプタのエラー（キー情報を含まない安全なメッセージのみ）"""
     pass
@@ -107,7 +125,7 @@ class AnthropicAdapter:
         messages: list[dict[str, str]],
         max_tokens: int = 1000,
         temperature: float = 0.7,
-    ) -> tuple[str, dict[str, int]]:
+    ) -> tuple[str, dict[str, Any]]:
         """
         APIコールを実行する（リトライ付き）
 
@@ -160,6 +178,8 @@ class AnthropicAdapter:
                     "reasoning_tokens": getattr(_otd, "thinking_tokens", 0) or 0,
                     "finish_reason": getattr(response, "stop_reason", None),
                     "usage_raw": _dump_usage_raw(response.usage),
+                    "requested_model": self.model_info.model_id,
+                    "response_model": _norm_response_model(getattr(response, "model", None)),
                 }
                 return text, usage
 
@@ -188,9 +208,13 @@ class OpenAICompatAdapter:
     修正7: タイムアウト + リトライ
     """
 
-    def __init__(self, model_info: ModelInfo) -> None:
+    def __init__(self, model_info: ModelInfo, max_retries: int | None = None) -> None:
         self.model_info = model_info
         self._client = None
+        # None → 従来どおり（アダプタ内部: API_MAX_RETRIES / SDK: 既定リトライ）
+        # 0    → アダプタ内部リトライ・SDK内部リトライとも完全に無効化する
+        #        （Phase 1のmodel_matrixが唯一の再試行制御点になる呼び出し専用）
+        self._max_retries = max_retries
 
     def _get_client(self) -> Any:
         """遅延初期化でクライアントを取得"""
@@ -207,6 +231,8 @@ class OpenAICompatAdapter:
             }
             if self.model_info.base_url:
                 kwargs["base_url"] = self.model_info.base_url
+            if self._max_retries is not None:
+                kwargs["max_retries"] = self._max_retries  # OpenAI SDK内部リトライを明示的に上書き
             self._client = openai.OpenAI(**kwargs)
         return self._client
 
@@ -216,30 +242,34 @@ class OpenAICompatAdapter:
         messages: list[dict[str, str]],
         max_tokens: int = 1000,
         temperature: float = 0.7,
-    ) -> tuple[str, dict[str, int]]:
+    ) -> tuple[str, dict[str, Any]]:
         """APIコールを実行する（リトライ付き）"""
         last_error = None
-        for attempt in range(API_MAX_RETRIES + 1):
+        attempts = API_MAX_RETRIES if self._max_retries is None else self._max_retries
+        for attempt in range(attempts + 1):
             try:
                 client = self._get_client()
                 full_messages = [{"role": "system", "content": system}] + messages
-                create_kwargs = {
+                create_kwargs: dict[str, Any] = {
                     "model": self.model_info.model_id,
                     "messages": full_messages,
-                    "max_tokens": max_tokens,
+                    self.model_info.max_tokens_param: max_tokens,
                 }
                 # per-model API固有パラメータ (例: thinking制御)
                 # openai SDKは未知のkwargsを拒否するため extra_body で送信
                 if self.model_info.extra_params:
                     create_kwargs["extra_body"] = self.model_info.extra_params
-                # temperatureフォールバック: 一部モデル(Kimi k2.6等)は特定値のみ許可
+                if self.model_info.supports_temperature:
+                    create_kwargs["temperature"] = temperature
+                # temperatureフォールバック: 一部モデル(Kimi k2.6等)は特定値のみ許可。
+                # supports_temperature=False のモデルは元から temperature を送っていない
+                # ためこのフォールバック経路には入らない（到達不能）。
                 try:
-                    response = client.chat.completions.create(
-                        temperature=temperature, **create_kwargs,
-                    )
+                    response = client.chat.completions.create(**create_kwargs)
                 except Exception as temp_err:
-                    if "temperature" in str(temp_err).lower():
+                    if self.model_info.supports_temperature and "temperature" in str(temp_err).lower():
                         # temperature制限のあるモデル: temperature省略で再試行
+                        create_kwargs.pop("temperature", None)
                         response = client.chat.completions.create(**create_kwargs)
                     else:
                         raise
@@ -264,12 +294,14 @@ class OpenAICompatAdapter:
                     "reasoning_tokens": getattr(_ctd, "reasoning_tokens", 0) or 0,
                     "finish_reason": finish_reason,
                     "usage_raw": _dump_usage_raw(response.usage),
+                    "requested_model": self.model_info.model_id,
+                    "response_model": _norm_response_model(getattr(response, "model", None)),
                 }
                 return text, usage
 
             except Exception as e:
                 last_error = e
-                if attempt < API_MAX_RETRIES and _should_retry(e):
+                if attempt < attempts and _should_retry(e):
                     wait = 2 ** attempt
                     time.sleep(wait)
                     continue
@@ -294,14 +326,22 @@ class GeminiStub:
         )
 
 
-def create_adapter(model_info: ModelInfo) -> AnthropicAdapter | OpenAICompatAdapter | GeminiStub:
-    """ModelInfoからアダプタを自動選択して生成する"""
+def create_adapter(
+    model_info: ModelInfo, max_retries: int | None = None
+) -> AnthropicAdapter | OpenAICompatAdapter | GeminiStub:
+    """
+    ModelInfoからアダプタを自動選択して生成する
+
+    max_retries: openai_compat / gemini アダプタのアダプタ内部リトライ・
+    OpenAI SDK内部リトライを上書きする（None → 従来どおり）。
+    anthropicアダプタは現状 max_retries 未対応（スコープ外）。
+    """
     if model_info.adapter_type == "anthropic":
         return AnthropicAdapter(model_info)
     elif model_info.adapter_type == "openai_compat":
-        return OpenAICompatAdapter(model_info)
+        return OpenAICompatAdapter(model_info, max_retries=max_retries)
     elif model_info.adapter_type == "gemini":
         # GeminiはOpenAI互換エンドポイントを使用（google-genai SDK不要）
-        return OpenAICompatAdapter(model_info)
+        return OpenAICompatAdapter(model_info, max_retries=max_retries)
     else:
         raise ValueError(f"Unknown adapter type: {model_info.adapter_type}")

@@ -40,8 +40,12 @@ import random as stdlib_random
 
 HAIKU_MODEL_KEY = "L1"  # claude-haiku-4-5-20251001
 
-# Phase Cロスター: 6社8モデル
+# Phase Cロスター: 6社8モデル（変更禁止。tests/test_llm.py が長さ8を検査する）
 PHASE_C_ROSTER = ["M1", "L1", "M2", "L2", "M3", "M4", "M5", "M6"]
+
+# Season 2 決勝編成ロスター: 6社18モデル（強6+中6+軽6）。
+# scripts/model_matrix.py の18モデル疎通テスト基盤が対象とするフルロスター。
+SEASON2_ROSTER_18 = [f"{t}{i}" for t in ("H", "M", "L") for i in range(1, 7)]
 
 
 def run_trial_game(
