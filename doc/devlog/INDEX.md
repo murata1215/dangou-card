@@ -117,3 +117,5 @@ Stage 1 で捕捉したトークン内訳（cached/reasoning/total）を活用�
 - 2026-08-20 08:32 JST | サイクルH: H1 Phase 2 timeout延長: H1だけPhase 2で300秒、retry=0とStructured Outputs設定を維持、外部API未実行、全695件PASS → 2026-08-20_083212.md
 - 2026-08-20 10:30 JST | サイクルI: H1 Phase 2 light Structured Output schema: H1だけflat transport schemaと厳格normalizerへ分離、外部API未実行、全722件PASS → 2026-08-20_103022.md
 - 2026-08-20 10:56 JST | サイクルJ: M3/H3 Phase 2 reasoning budget tuning: M3をminimal、H3を912 tokensへ局所調整、外部API未実行、全723件PASS → 2026-08-20_105619.md
+- 2026-08-20 20:05 JST | サイクルK: Phase 3 runtime overrides: H1 effort/H4 timeoutのPhase 3限定overrideと実効監査値を追加、外部API未実行、全732件PASS → 2026-08-20_200521.md
+- 2026-08-20 21:34 JST | サイクルL: APIコスト検証の固定記録: Phase 3最終値・再試験・Console提供値・R12実績を区分して固定、外部API未実行 → 2026-08-20_213407.md

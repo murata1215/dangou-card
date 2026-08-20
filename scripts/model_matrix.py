@@ -36,7 +36,7 @@ import json
 import os
 import sys
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -750,6 +750,49 @@ def _generate_phase2_report(run_dir: Path, state: dict[str, Any]) -> None:
 # Phase 3: ミニゲーム統合テスト
 # ============================================================
 
+_PHASE3_EFFORT_CHOICES = ("low", "medium", "high", "xhigh", "max")
+
+
+@dataclass(frozen=True)
+class Phase3RuntimeOverrides:
+    """Phase 3だけで使う非永続のrequest/runtime上書き。"""
+
+    effort: str | None = None
+    timeout_seconds: int | None = None
+
+
+def _is_h1_phase3_effort_model(model: ModelInfo) -> bool:
+    """Adaptive thinkingのeffortを送れるモデルを意図的にH1だけへ絞る。"""
+    return (
+        model.adapter_type == "anthropic"
+        and model.model_id == MODEL_REGISTRY["H1"].model_id
+    )
+
+
+def _phase3_effective_model(model: ModelInfo, max_tokens: int,
+                            timeout_seconds: int | None) -> ModelInfo:
+    """Return a Phase-3-only copy carrying the actual request limits.
+
+    LLMAgent resolves its output limit from ModelInfo, while BudgetedAdapter
+    clamps that same call.  Keeping both on this copy makes an audit value such
+    as 8000 describe the request that was actually sent, without mutating the
+    registry used by other phases or normal games.
+    """
+    updates: dict[str, Any] = {"max_tokens": max_tokens}
+    if timeout_seconds is not None:
+        updates["timeout_seconds"] = timeout_seconds
+    return replace(model, **updates)
+
+
+def _phase3_request_options(model: ModelInfo, effort: str | None) -> dict[str, Any] | None:
+    """Return the provider payload for an actually supported Phase-3 effort."""
+    if effort is None or not _is_h1_phase3_effort_model(model):
+        return None
+    return {
+        "thinking": {"type": "adaptive"},
+        "output_config": {"effort": effort},
+    }
+
 class BudgetedAdapter:
     """
     LLMAgentへ渡すアダプタラッパ。MODEL_REGISTRY（ModelInfo）は一切書き換えず、
@@ -758,12 +801,13 @@ class BudgetedAdapter:
     """
 
     def __init__(self, inner: Any, model_info: ModelInfo, max_calls: int, max_cost: float,
-                 max_tokens_cap: int) -> None:
+                 max_tokens_cap: int, request_options: dict[str, Any] | None = None) -> None:
         self._inner = inner
         self._model_info = model_info
         self.max_calls = max_calls
         self.max_cost = max_cost
         self.max_tokens_cap = max_tokens_cap
+        self._request_options = request_options
         self.calls_made = 0
         self.spent_usd = 0.0
 
@@ -776,7 +820,14 @@ class BudgetedAdapter:
                                   " ".join(m.get("content", "") for m in messages), clamped)
         if self.spent_usd + worst > self.max_cost:
             raise AdapterError(f"BudgetedAdapter: 予算上限(${self.max_cost:.2f})超過見込み")
-        text, usage = self._inner.complete(system, messages, max_tokens=clamped, temperature=temperature)
+        complete_kwargs: dict[str, Any] = {
+            "max_tokens": clamped,
+            "temperature": temperature,
+        }
+        # None の場合は従来と完全に同じinner呼出しを維持する。
+        if self._request_options is not None:
+            complete_kwargs["request_options"] = self._request_options
+        text, usage = self._inner.complete(system, messages, **complete_kwargs)
         # Phase 1/2 と同一の実測usageベース計算に統一
         # （hidden thinking / cache割引 / Anthropic正規化を予算消費へ正しく反映）
         cost = _usage_cost(self._model_info, usage)
@@ -847,17 +898,23 @@ def _phase3_model_audit(info: ModelInfo, agent: LLMAgent, llm_logger: LLMLogger)
 
 
 def _run_one_phase3_game(key: str, info: ModelInfo, run_dir: Path, seed: int,
-                          max_calls: int, max_cost_per_model: float, max_tokens: int) -> dict[str, Any]:
+                          max_calls: int, max_cost_per_model: float, max_tokens: int,
+                          runtime_overrides: Phase3RuntimeOverrides | None = None) -> dict[str, Any]:
+    overrides = runtime_overrides or Phase3RuntimeOverrides()
+    effective_info = _phase3_effective_model(info, max_tokens, overrides.timeout_seconds)
+    request_options = _phase3_request_options(effective_info, overrides.effort)
+    runtime_effort = overrides.effort if request_options is not None else None
     model_dir = run_dir / "phase3" / key
     model_dir.mkdir(parents=True, exist_ok=True)
     llm_logger = LLMLogger(model_dir / "llm_logs", game_id=f"{key}_P01")
     # Phase 3 matrix runs are strict experiments: a logical call is allowed one
     # transport send only.  Keep this isolated from Phase 1/2 and normal games.
-    raw_adapter = create_adapter(info, max_retries=0, allow_temperature_fallback=False)
-    budgeted = BudgetedAdapter(raw_adapter, info, max_calls=max_calls,
-                                max_cost=max_cost_per_model, max_tokens_cap=max_tokens)
+    raw_adapter = create_adapter(effective_info, max_retries=0, allow_temperature_fallback=False)
+    budgeted = BudgetedAdapter(raw_adapter, effective_info, max_calls=max_calls,
+                                max_cost=max_cost_per_model, max_tokens_cap=max_tokens,
+                                request_options=request_options)
     config = build_phase3_config()
-    agent = LLMAgent("P01", info, budgeted, llm_logger, config)
+    agent = LLMAgent("P01", effective_info, budgeted, llm_logger, config)
     agents: dict[str, Any] = {"P01": agent}
     for i in range(1, config.num_players):
         pid = f"P{i + 1:02d}"
@@ -880,14 +937,18 @@ def _run_one_phase3_game(key: str, info: ModelInfo, run_dir: Path, seed: int,
     return {
         "error": error, "elapsed_ms": elapsed_ms,
         "calls_made": budgeted.calls_made, "cost_usd": round(budgeted.spent_usd, 6),
-        **verdict, **_phase3_model_audit(info, agent, llm_logger),
+        **verdict, **_phase3_model_audit(effective_info, agent, llm_logger),
+        "effective_max_tokens": effective_info.max_tokens,
+        "runtime_effort": runtime_effort,
+        "runtime_timeout_seconds": overrides.timeout_seconds,
     }
 
 
 def run_phase3(run_dir: Path, state: dict[str, Any], keys: list[str],
                 max_cost: float, max_cost_total: float, max_cost_per_model: float,
                 max_calls: int, max_tokens: int, seed: int,
-                resume: bool, force: bool, dry_run: bool) -> str:
+                resume: bool, force: bool, dry_run: bool,
+                runtime_overrides: Phase3RuntimeOverrides | None = None) -> str:
     if state["phases"]["1"]["status"] not in ("done", "aborted_budget") or \
        state["phases"]["2"]["status"] not in ("done", "aborted_budget"):
         print("Phase 1/2 が未完了です。先に --phase 1, --phase 2 を実行してください。")
@@ -923,13 +984,27 @@ def run_phase3(run_dir: Path, state: dict[str, Any], keys: list[str],
             )
         except BudgetError as e:
             print(f"{key}: 予算中断 ({e})")
-            state["models"][key]["phase3"] = {"status": "skipped_budget", "reason": str(e)}
+            overrides = runtime_overrides or Phase3RuntimeOverrides()
+            effective_info = _phase3_effective_model(info, max_tokens, overrides.timeout_seconds)
+            state["models"][key]["phase3"] = {
+                "status": "skipped_budget", "reason": str(e),
+                "effective_max_tokens": effective_info.max_tokens,
+                "runtime_effort": (
+                    overrides.effort
+                    if _phase3_request_options(effective_info, overrides.effort) is not None
+                    else None
+                ),
+                "runtime_timeout_seconds": overrides.timeout_seconds,
+            }
             aborted = True
             _save_state(run_dir, state)
             continue
 
         print(f"{key} ({info.provider} {info.name})...", end=" ", flush=True)
-        r = _run_one_phase3_game(key, info, run_dir, seed, max_calls, max_cost_per_model, max_tokens)
+        r = _run_one_phase3_game(
+            key, info, run_dir, seed, max_calls, max_cost_per_model, max_tokens,
+            runtime_overrides=runtime_overrides,
+        )
         phase_spent += r["cost_usd"]
         state["budget"]["spent_usd"] += r["cost_usd"]
         state["budget"]["calls_made"] += r["calls_made"]
@@ -948,6 +1023,9 @@ def run_phase3(run_dir: Path, state: dict[str, Any], keys: list[str],
             "negotiation_corrections": r["negotiation_corrections"],
             "commit_corrections": r["commit_corrections"],
             "parse_corrections_total": r["parse_corrections_total"],
+            "effective_max_tokens": r["effective_max_tokens"],
+            "runtime_effort": r["runtime_effort"],
+            "runtime_timeout_seconds": r["runtime_timeout_seconds"],
         }
         _save_state(run_dir, state)
         print(f"{status} ({r['elapsed_ms']}ms) ${r['cost_usd']:.4f} | "
@@ -964,8 +1042,8 @@ def run_phase3(run_dir: Path, state: dict[str, Any], keys: list[str],
 
 def _generate_phase3_report(run_dir: Path, state: dict[str, Any]) -> None:
     lines = ["# Phase 3 ミニゲーム統合レポート\n"]
-    lines.append("| key | provider | model | returned | match | 状態 | elapsed | cost | calls | corrections | auto_commit | valid_json | 備考 |")
-    lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+    lines.append("| key | provider | model | returned | match | 状態 | elapsed | cost | calls | corrections | max tokens | effort | timeout | auto_commit | valid_json | 備考 |")
+    lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for key, m in sorted(state["models"].items(), key=lambda kv: kv[1]["order"]):
         p3 = m.get("phase3", {})
         status = p3.get("status", "pending")
@@ -974,8 +1052,13 @@ def _generate_phase3_report(run_dir: Path, state: dict[str, Any]) -> None:
         note = (p3.get("error") or "")[:80] if p3.get("error") else ""
         returned = p3.get("response_model") or ", ".join(p3.get("response_models", [])) or "—"
         corrections = p3.get("parse_corrections_total", "")
+        effective_max_tokens = p3.get("effective_max_tokens", "—")
+        runtime_effort = p3.get("runtime_effort") or "—"
+        runtime_timeout = p3.get("runtime_timeout_seconds")
+        runtime_timeout_s = runtime_timeout if runtime_timeout is not None else "—"
         lines.append(f"| {key} | {m['provider']} | {m['model_id']} | {returned} | {p3.get('model_match', '—')} | "
                      f"{status} | {elapsed} | {cost} | {p3.get('logical_calls', '')} | {corrections} | "
+                     f"{effective_max_tokens} | {runtime_effort} | {runtime_timeout_s} | "
                      f"{p3.get('auto_commit_count', '')} | {p3.get('valid_json_count', '')} | {note} |")
     (run_dir / "phase3_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -1007,6 +1090,13 @@ def generate_final_report(run_dir: Path, state: dict[str, Any], out_paths: list[
         latency = p1.get("latency_ms") or p2.get("latency_ms") or "—"
         latency_s = f"{latency}ms" if isinstance(latency, int) else "—"
         note_parts = [p1.get("error") or "", p2.get("error") or "", p3.get("error") or ""]
+        if any(field in p3 for field in ("effective_max_tokens", "runtime_effort", "runtime_timeout_seconds")):
+            note_parts.append(
+                "P3 runtime: "
+                f"max_tokens={p3.get('effective_max_tokens', '—')}, "
+                f"effort={p3.get('runtime_effort') or '—'}, "
+                f"timeout={p3.get('runtime_timeout_seconds') or '—'}"
+            )
         note = "; ".join(n for n in note_parts if n)[:100]
         returned = p1.get("response_model")
         match = p1.get("model_match")
@@ -1051,6 +1141,51 @@ def generate_final_report(run_dir: Path, state: dict[str, Any], out_paths: list[
 # main / CLI
 # ============================================================
 
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("正の整数を指定してください") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("正の整数を指定してください")
+    return parsed
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="18モデル段階的スモークテスト（Phase 0〜3）")
+    parser.add_argument("--phase", type=int, choices=[0, 1, 2, 3], help="実行フェーズ")
+    parser.add_argument("--tier", default="all", help="weak,mid,strong（既定: all）")
+    parser.add_argument("--models", default="", help="対象キーを明示指定（カンマ区切り、--tierを上書き）")
+    parser.add_argument("--run-id", default="", help="ラン用ディレクトリを明示指定")
+    parser.add_argument("--max-cost", type=float, default=None, help="このフェーズ起動の累計USD上限")
+    parser.add_argument("--max-cost-total", type=float, default=DEFAULT_MAX_COST_TOTAL, help="全フェーズ通算のハード上限")
+    parser.add_argument("--max-cost-per-model", type=float, default=None, help="1モデル上限USD")
+    parser.add_argument("--max-calls", type=int, default=None, help="絶対コール数天井")
+    parser.add_argument("--max-tokens", type=int, default=None, help="出力上限")
+    parser.add_argument("--effort", choices=_PHASE3_EFFORT_CHOICES, default=None,
+                        help="Phase 3のH1 adaptive thinking effort")
+    parser.add_argument("--timeout-seconds", type=_positive_int, default=None,
+                        help="Phase 3だけのAPI timeout override（秒）")
+    parser.add_argument(
+        "--retries", type=int, default=None,
+        help="Phase 1の再試行回数（スクリプト側のみ。アダプタ内部・OpenAI SDK内部のリトライは常に0＝1試行あたりHTTP1回）",
+    )
+    parser.add_argument("--resume", action="store_true", help="既済モデルをスキップ")
+    retry_group = parser.add_mutually_exclusive_group()
+    retry_group.add_argument("--force", action="store_true", help="既済モデルも再実行")
+    retry_group.add_argument("--retry-failed", action="store_true", help="直近Phase 2でfailのモデルだけを再実行")
+    parser.add_argument("--dry-run", action="store_true", help="計画と最悪コストのみ、APIコールゼロ")
+    parser.add_argument("--report", action="store_true", help="state.jsonから最終表を再生成、APIコールゼロ")
+    parser.add_argument("--out", default=str(DEFAULT_OUT_DIR), help="出力先ディレクトリ")
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="Phase3のゲームseed")
+    return parser
+
+
+def _validate_phase3_runtime_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    if args.phase != 3 and (args.effort is not None or args.timeout_seconds is not None):
+        parser.error("--effort と --timeout-seconds は --phase 3 でのみ指定できます")
+
+
 def _resolve_run_dir(args: argparse.Namespace, out_dir: Path) -> tuple[Path, str, bool]:
     """(run_dir, run_id, is_new) を返す"""
     if args.run_id:
@@ -1069,28 +1204,7 @@ def _resolve_run_dir(args: argparse.Namespace, out_dir: Path) -> tuple[Path, str
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="18モデル段階的スモークテスト（Phase 0〜3）")
-    parser.add_argument("--phase", type=int, choices=[0, 1, 2, 3], help="実行フェーズ")
-    parser.add_argument("--tier", default="all", help="weak,mid,strong（既定: all）")
-    parser.add_argument("--models", default="", help="対象キーを明示指定（カンマ区切り、--tierを上書き）")
-    parser.add_argument("--run-id", default="", help="ラン用ディレクトリを明示指定")
-    parser.add_argument("--max-cost", type=float, default=None, help="このフェーズ起動の累計USD上限")
-    parser.add_argument("--max-cost-total", type=float, default=DEFAULT_MAX_COST_TOTAL, help="全フェーズ通算のハード上限")
-    parser.add_argument("--max-cost-per-model", type=float, default=None, help="1モデル上限USD")
-    parser.add_argument("--max-calls", type=int, default=None, help="絶対コール数天井")
-    parser.add_argument("--max-tokens", type=int, default=None, help="出力上限")
-    parser.add_argument(
-        "--retries", type=int, default=None,
-        help="Phase 1の再試行回数（スクリプト側のみ。アダプタ内部・OpenAI SDK内部のリトライは常に0＝1試行あたりHTTP1回）",
-    )
-    parser.add_argument("--resume", action="store_true", help="既済モデルをスキップ")
-    retry_group = parser.add_mutually_exclusive_group()
-    retry_group.add_argument("--force", action="store_true", help="既済モデルも再実行")
-    retry_group.add_argument("--retry-failed", action="store_true", help="直近Phase 2でfailのモデルだけを再実行")
-    parser.add_argument("--dry-run", action="store_true", help="計画と最悪コストのみ、APIコールゼロ")
-    parser.add_argument("--report", action="store_true", help="state.jsonから最終表を再生成、APIコールゼロ")
-    parser.add_argument("--out", default=str(DEFAULT_OUT_DIR), help="出力先ディレクトリ")
-    parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="Phase3のゲームseed")
+    parser = _build_parser()
     args = parser.parse_args()
 
     out_dir = Path(args.out)
@@ -1105,6 +1219,8 @@ def main() -> None:
     if args.phase is None:
         print("--phase {0,1,2,3} または --report を指定してください。")
         sys.exit(3)
+
+    _validate_phase3_runtime_args(args, parser)
 
     try:
         tiers = _parse_tiers(args.tier)
@@ -1143,8 +1259,13 @@ def main() -> None:
         result = run_phase2(run_dir, state, keys, max_cost, args.max_cost_total, max_cost_per_model,
                             max_calls, max_tokens, args.resume, args.force, args.dry_run, args.retry_failed)
     else:
+        runtime_overrides = Phase3RuntimeOverrides(
+            effort=args.effort,
+            timeout_seconds=args.timeout_seconds,
+        )
         result = run_phase3(run_dir, state, keys, max_cost, args.max_cost_total, max_cost_per_model,
-                             max_calls, max_tokens, args.seed, args.resume, args.force, args.dry_run)
+                             max_calls, max_tokens, args.seed, args.resume, args.force, args.dry_run,
+                             runtime_overrides=runtime_overrides)
 
     generate_final_report(run_dir, state, [run_dir / "matrix_report.md", Path("doc/model_matrix_report.md")])
 

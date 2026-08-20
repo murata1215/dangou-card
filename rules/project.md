@@ -147,3 +147,21 @@ H1（Claude Opus 5）はcanonical schemaを直接送らず、flat transport sche
 `reasoning_effort="minimal"`、H3は`"low"`を送り、`thinking_level`/`thinking_budget`と併送しない。H3の912-token
 overrideはPhase 2だけであり、487 hidden-thinking実測 + 400 visible JSON allowance + 25 safety marginから導出したもの。
 M3/H3の両方を再試行する際は、total capを引き上げず、M3の実績コストを確認してからH3の予約ゲートを評価する。
+
+## Phase 3 runtime overrideは非破壊・監査可能・対応モデル限定にする
+
+Phase 3に限り、`scripts/model_matrix.py` の `--effort` と `--timeout-seconds` を明示的な再試験条件として使える。
+`_phase3_effective_model()` はregistryを変更せず、実効`max_tokens`とtimeoutを持つ`ModelInfo` copyを作る。
+`--effort`は現在H1 (`claude-opus-5`) のAnthropic adaptive-thinking経路だけへ
+`thinking={"type": "adaptive"}` と `output_config.effort` として送る。非対応モデルには送信せず、
+実効effortもnullとして扱う。
+
+結果は、CLI入力をそのまま記録するのではなく、実際に適用した
+`effective_max_tokens`、`runtime_effort`、`runtime_timeout_seconds`を`phase3_calls.jsonl`、state、
+Phase 3 report、最終matrix reportへ追加フィールドとして保存する。未指定値はnull（レポートでは`—`）とし、
+過去runの欠損フィールドを壊さない。overrideはretry、temperature fallback、コスト計算、hidden reserve、
+parse correction仕様を変更してはならない。担保テスト: `tests/test_model_matrix.py` の
+`test_phase3_h1_effort_reaches_anthropic_request_and_is_audited`、
+`test_phase3_unsupported_effort_is_not_sent_and_audits_null`、
+`test_phase3_timeout_override_reaches_openai_sdk_without_registry_mutation`、
+`test_phase3_runtime_cli_parse_and_rejects_non_phase3_overrides`。

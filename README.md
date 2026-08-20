@@ -135,6 +135,16 @@ JSON parse correctionは意図した別logical callとして最大7 call/model�
 `phase3_calls.jsonl` 集計にはrequested/response model、model match、logical calls、negotiation/commit
 correction数を追加し、raw response・usage・finish reason・latency・costは従来どおり個別LLMログに保存する。
 
+Phase 3だけは、明示的な再試験で `--effort {low,medium,high,xhigh,max}` と
+`--timeout-seconds N` を使える。effortは現在H1（Claude Opus 5）のadaptive thinking対応経路だけへ送信し、
+timeoutはregistryを書き換えないruntime `ModelInfo` copyへ適用する。実行結果には
+`effective_max_tokens`、`runtime_effort`、`runtime_timeout_seconds` をJSONL・state・レポートへ保存するため、
+attempt条件を保存ログから再現できる。未指定時のrequest specは従来どおりである。
+
+2026-08-20の18モデルPhase 3最終cost、H1/H4再試験、Provider Console提供値、およびM3のR12実績は
+[`doc/cost/api_cost_estimate_2026-08-20.md`](doc/cost/api_cost_estimate_2026-08-20.md) に固定している。
+Console値とR12円建て実績はユーザー提供値であり、run内usageからの実測とは区別している。
+
 コスト計算は全フェーズで実測usageベースの `_usage_cost()` に統一されており、Geminiのhidden
 thinking・xAI等のキャッシュ割引・Anthropicのusage慣習差を正しく反映する。詳細は `rules/project.md`
 の該当節を参照。

@@ -6,6 +6,8 @@ API を一切呼ばない。create_adapter / Game をフェイクに差し替え
 """
 
 import json
+import sys
+import types
 
 import pytest
 
@@ -1097,6 +1099,94 @@ def test_phase3_uses_strict_adapter_and_records_model_audit_and_corrections(tmp_
     assert all("finish_reason" in entry and "usage_raw" in entry for entry in entries)
 
 
+@pytest.mark.parametrize("effort", ["low", "medium", "high"])
+def test_phase3_h1_effort_reaches_anthropic_request_and_is_audited(tmp_path, monkeypatch, effort):
+    captured: dict[str, object] = {}
+
+    class Adapter(_FakeOkAdapter):
+        def complete(self, *args, **kwargs):
+            captured["request_options"] = kwargs.get("request_options")
+            captured["max_tokens"] = kwargs.get("max_tokens")
+            return super().complete(*args, **kwargs)
+
+    def factory(info, **kwargs):
+        captured["info"] = info
+        captured["strict"] = kwargs
+        return Adapter(info)
+
+    monkeypatch.setattr(mm, "create_adapter", factory)
+    result = mm._run_one_phase3_game(
+        "H1", MODEL_REGISTRY["H1"], tmp_path, seed=1, max_calls=20,
+        max_cost_per_model=10.0, max_tokens=8000,
+        runtime_overrides=mm.Phase3RuntimeOverrides(effort=effort),
+    )
+
+    assert captured["strict"] == {"max_retries": 0, "allow_temperature_fallback": False}
+    assert captured["request_options"] == {
+        "thinking": {"type": "adaptive"},
+        "output_config": {"effort": effort},
+    }
+    assert captured["max_tokens"] == 8000
+    assert captured["info"].max_tokens == 8000
+    assert MODEL_REGISTRY["H1"].max_tokens is None
+    assert result["effective_max_tokens"] == 8000
+    assert result["runtime_effort"] == effort
+    assert result["runtime_timeout_seconds"] is None
+
+
+def test_phase3_unsupported_effort_is_not_sent_and_audits_null(tmp_path, monkeypatch):
+    captured: dict[str, object] = {}
+
+    class Adapter(_FakeOkAdapter):
+        def complete(self, *args, **kwargs):
+            captured["request_options"] = kwargs.get("request_options")
+            return super().complete(*args, **kwargs)
+
+    monkeypatch.setattr(mm, "create_adapter", lambda info, **kwargs: Adapter(info))
+    result = mm._run_one_phase3_game(
+        "M1", MODEL_REGISTRY["M1"], tmp_path, seed=1, max_calls=20,
+        max_cost_per_model=10.0, max_tokens=2000,
+        runtime_overrides=mm.Phase3RuntimeOverrides(effort="high"),
+    )
+
+    assert captured["request_options"] is None
+    assert result["runtime_effort"] is None
+    assert result["effective_max_tokens"] == 2000
+    assert result["runtime_timeout_seconds"] is None
+
+
+def test_phase3_timeout_override_reaches_openai_sdk_without_registry_mutation(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=FakeOpenAI))
+    monkeypatch.setenv(MODEL_REGISTRY["H4"].env_key, "fake-key")
+    effective = mm._phase3_effective_model(MODEL_REGISTRY["H4"], 2000, 180)
+    adapter = mm.create_adapter(effective, max_retries=0, allow_temperature_fallback=False)
+    adapter._get_client()
+
+    assert captured["timeout"] == 180
+    assert captured["max_retries"] == 0
+    assert effective.max_tokens == 2000
+    assert MODEL_REGISTRY["H4"].timeout_seconds == 60
+    assert MODEL_REGISTRY["H4"].max_tokens is None
+
+
+def test_phase3_runtime_cli_parse_and_rejects_non_phase3_overrides():
+    parser = mm._build_parser()
+    args = parser.parse_args(["--phase", "3", "--effort", "high", "--timeout-seconds", "180"])
+    assert args.effort == "high"
+    assert args.timeout_seconds == 180
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--phase", "3", "--timeout-seconds", "0"])
+    args = parser.parse_args(["--phase", "2", "--effort", "low"])
+    with pytest.raises(SystemExit):
+        mm._validate_phase3_runtime_args(args, parser)
+
+
 def test_phase3_saves_logs_even_when_game_raises(tmp_path, monkeypatch):
     monkeypatch.setattr(mm, "create_adapter", _fake_create_adapter_factory(_FakeOkAdapter))
 
@@ -1166,11 +1256,19 @@ def test_phase3_records_cost_to_state_jsonl_and_report(tmp_path, monkeypatch):
     assert line["cost_usd"] == pytest.approx(cost, abs=1e-9)
     for key in ("requested_model", "response_model", "response_models", "model_match",
                 "logical_calls", "negotiation_corrections", "commit_corrections",
-                "parse_corrections_total"):
+                "parse_corrections_total", "effective_max_tokens", "runtime_effort",
+                "runtime_timeout_seconds"):
         assert key in line
         assert key in state["models"]["M3"]["phase3"]
+    assert line["effective_max_tokens"] == 500
+    assert line["runtime_effort"] is None
+    assert line["runtime_timeout_seconds"] is None
     report_text = (run_dir / "phase3_report.md").read_text(encoding="utf-8")
     assert f"${cost:.4f}" in report_text
+    assert "max tokens" in report_text
+    mm.generate_final_report(run_dir, state, [run_dir / "matrix_report.md"])
+    final_report = (run_dir / "matrix_report.md").read_text(encoding="utf-8")
+    assert "P3 runtime: max_tokens=500, effort=—, timeout=—" in final_report
 
 
 # ============================================================

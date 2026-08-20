@@ -903,3 +903,14 @@ LLMなしルールベースBot 8種（Random/Conservative/StrongCardSave/HighPri
 - `phase2_calls.jsonl` に `response_text` 全文、requested/response model、match判定を記録する。
   API例外で本文がない場合は `response_text: null` とする。認証情報・request headerは記録しない。
 - Phase 2のper-model capは `$0.03`、phase capは `$0.22` のまま。実API・dry-run・既存runのstate変更は未実施。
+
+## 2026-08-20: Phase 3 runtime override監査とコスト検証記録
+
+- Phase 3限定で `--effort` と `--timeout-seconds` を追加。H1のadaptive thinking effortとH4のtimeoutを、
+  registryを変更しないruntime overrideとして明示指定できるようにした。
+- 実際に適用されたmax tokens / effort / timeoutを、Phase 3 JSONL・state・レポートへ監査値として保存する。
+  非対応モデルへeffortは送らず、未指定・非対応はnullとして記録する。
+- `run_20260818_041810` ではH1を`8000/high/600`で完走、H4を`2000/null/180`で完走した。
+  18モデルの最終Phase 3 state合計は`$0.927449`。再試験履歴を含むPhase 3合計とは区別する。
+- `doc/cost/api_cost_estimate_2026-08-20.md`に、Provider Consoleのユーザー提供値、M3 R12実績、
+  棄却した線形外挿、および段階的R12計測方針を固定した。
