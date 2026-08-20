@@ -46,8 +46,11 @@ class ModelInfo:
     base_url: str | None    # OpenAI互換のbase_url（Noneなら公式）
     timeout_seconds: int = 60  # APIコールのタイムアウト（秒）。reasoning系は長めに設定
     max_tokens: int | None = None       # per-model出力トークン上限（None → DEFAULT_MAX_TOKENS）
+    phase2_max_tokens: int | None = None  # Phase 2だけの出力上限override（None → CLI/phase既定値）
+    phase2_timeout_seconds: int | None = None  # Phase 2だけのtimeout override（None → 通常timeout）
     max_tokens_param: str = "max_tokens"  # OpenAI互換APIへ送るトークン上限のキー名。GPT-5系reasoningは "max_completion_tokens"
     supports_temperature: bool = True     # False なら temperature を一切送らない（reasoning系で拒否されるモデル用）
+    temperature_override: float | None = None  # providerが要求する固定temperature（None → 呼出側の指定値）
     extra_params: dict | None = None    # API固有パラメータ（例: {"thinking": {"type": "disabled"}}）
     cached_input_price: float | None = None  # キャッシュヒット入力単価（$/1Mトークン）。None → input_price と同値
     reasoning_price: float | None = None     # thinkingトークン単価（$/1Mトークン）。None → output_price と同値
@@ -80,6 +83,7 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         adapter_type="anthropic",
         input_price=2.0, output_price=10.0,  # Anthropic料金表 2026-08-16
         env_key="CLAUDE_API_KEY", base_url=None,
+        supports_temperature=False,
         # cached_input_price: 記載なし→input同値（安全側）
         tier="M",
     ),
@@ -100,6 +104,7 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         env_key="GEMINI_API_KEY", base_url=GEMINI_OPENAI_BASE_URL,
         # TODO: Geminiキャッシュ単価はContext Caching API別体系（$/1M tokens/hour）。ここでは未設定=input同値
         tier="M",
+        phase2_max_tokens=512,
         # 2026-08-18: Phase 1実測(max_tokens=64)でhidden thinking 185tok（completion外課金）を確認。
         # 512は実測最大343（L4実測）の約1.5倍の経験的安全マージン。provider保証の上限ではない。
         hidden_thinking_reserve_tokens=512,
@@ -113,8 +118,8 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         cached_input_price=0.30,  # xAI料金表 2026-08-16
         tier="M",
         # 2026-08-18: Phase 1実測(max_tokens=64)でhidden thinking 42tok（completion外課金）を確認。
-        # 512は実測最大343（L4実測）の約1.5倍の経験的安全マージン。provider保証の上限ではない。
-        hidden_thinking_reserve_tokens=512,
+        # Phase 2実測811tokenを覆う経験的安全マージン。provider保証の上限ではない。
+        hidden_thinking_reserve_tokens=1024,
     ),
     "M5": ModelInfo(
         model_id="kimi-k2.6",
@@ -124,6 +129,7 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         env_key="KIMI_API_KEY", base_url=MOONSHOT_BASE_URL,
         timeout_seconds=90,
         extra_params={"thinking": {"type": "disabled"}},
+        temperature_override=0.6,
         # cached_input_price: 記載なし→input同値
         tier="M",
     ),
@@ -183,8 +189,8 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         cached_input_price=0.20,  # xAI料金表 2026-08-16
         tier="L",
         # 2026-08-18: Phase 1実測(max_tokens=64)でhidden thinking 343tok（全モデル中最大、completion外課金）を確認。
-        # 512は実測最大343の約1.5倍の経験的安全マージン。provider保証の上限ではない。
-        hidden_thinking_reserve_tokens=512,
+        # Phase 2実測526tokenを覆う経験的安全マージン。provider保証の上限ではない。
+        hidden_thinking_reserve_tokens=768,
     ),
     "L5": ModelInfo(
         model_id="kimi-k2.6",
@@ -194,6 +200,7 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         env_key="KIMI_API_KEY", base_url=MOONSHOT_BASE_URL,
         timeout_seconds=90,
         extra_params={"thinking": {"type": "disabled"}},
+        temperature_override=0.6,
         # cached_input_price: 記載なし→input同値
         tier="L",
     ),
@@ -230,6 +237,11 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         adapter_type="anthropic",
         input_price=5.0, output_price=25.0,  # roster_v1_0.md §3 (2026-08-09時点) 要再確認
         env_key="CLAUDE_API_KEY", base_url=None,
+        supports_temperature=False,
+        # Structured Outputs + thinking disabled のPhase 2試験では visible JSON を優先する。
+        phase2_max_tokens=400,
+        # 初回Structured Outputs schema compilationが通常60秒を超える場合だけ待機する。
+        phase2_timeout_seconds=300,
         tier="H",
     ),
     "H2": ModelInfo(
@@ -251,6 +263,12 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         input_price=2.0, output_price=12.0,  # roster_v1_0.md §3 (2026-08-09時点) 要再確認。2M文脈
         env_key="GEMINI_API_KEY", base_url=GEMINI_OPENAI_BASE_URL,
         tier="H",
+        # Phase 2 retry_failed attempt 3 (2026-08-19): 487 hidden-thinking
+        # tokens + 21 visible tokens exhausted the former 512-token cap.  Keep
+        # the existing 400-token canonical JSON allowance plus the 25-token
+        # margin to the 512-token hidden-thinking reserve: 487 + 400 + 25 = 912.
+        # This is Phase-2-only; normal calls and other phases remain unchanged.
+        phase2_max_tokens=912,
         # 2026-08-18: Phase 1実測(max_tokens=64)でhidden thinking 185tok（completion外課金）を確認。
         # 512は実測最大343（L4実測）の約1.5倍の経験的安全マージン。provider保証の上限ではない。
         hidden_thinking_reserve_tokens=512,
@@ -265,8 +283,8 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         env_key="GROK_API_KEY", base_url="https://api.x.ai/v1",
         tier="H",
         # 2026-08-18: Phase 1実測(max_tokens=64)でhidden thinking 124tok（completion外課金）を確認。
-        # 512は実測最大343（L4実測）の約1.5倍の経験的安全マージン。provider保証の上限ではない。
-        hidden_thinking_reserve_tokens=512,
+        # Phase 2実測1355tokenを覆う経験的安全マージン。provider保証の上限ではない。
+        hidden_thinking_reserve_tokens=1536,
     ),
     "H5": ModelInfo(
         model_id="kimi-k3",
@@ -276,6 +294,7 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         env_key="KIMI_API_KEY", base_url=MOONSHOT_BASE_URL,
         timeout_seconds=90,
         extra_params={"thinking": {"type": "disabled"}},  # M5/L5と同じ理由でthinking無効化
+        temperature_override=0.6,
         tier="H",
     ),
     "H6": ModelInfo(

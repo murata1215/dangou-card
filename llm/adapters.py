@@ -137,6 +137,7 @@ class AnthropicAdapter:
         messages: list[dict[str, str]],
         max_tokens: int = 1000,
         temperature: float = 0.7,
+        request_options: dict[str, Any] | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """
         APIコールを実行する（リトライ付き）
@@ -162,19 +163,29 @@ class AnthropicAdapter:
                     "messages": messages,
                     "max_tokens": max_tokens,
                 }
-                # temperature非対応モデル（Sonnet 5等のextended thinking）の判定:
-                # まずtemperature付きで試し、400エラーなら省略してリトライ
-                try:
-                    response = client.messages.create(temperature=temperature, **kwargs)
-                except Exception as temp_err:
-                    if (
-                        self._allow_temperature_fallback
-                        and "temperature" in str(temp_err).lower()
-                        and "deprecated" in str(temp_err).lower()
-                    ):
-                        response = client.messages.create(**kwargs)
-                    else:
-                        raise
+                if request_options:
+                    kwargs.update(request_options)
+                # Sonnet/Opusなどtemperatureを廃止したモデルは、ModelInfoで明示的に省略する。
+                # Haiku等の対応モデルには従来どおり呼出側の値を送る。
+                if self.model_info.supports_temperature:
+                    effective_temperature = (
+                        self.model_info.temperature_override
+                        if self.model_info.temperature_override is not None
+                        else temperature
+                    )
+                    try:
+                        response = client.messages.create(temperature=effective_temperature, **kwargs)
+                    except Exception as temp_err:
+                        if (
+                            self._allow_temperature_fallback
+                            and "temperature" in str(temp_err).lower()
+                            and "deprecated" in str(temp_err).lower()
+                        ):
+                            response = client.messages.create(**kwargs)
+                        else:
+                            raise
+                else:
+                    response = client.messages.create(**kwargs)
                 # Sonnet 5等はThinkingBlockを返す場合がある。TextBlockのみ抽出
                 text = ""
                 for block in (response.content or []):
@@ -265,6 +276,7 @@ class OpenAICompatAdapter:
         messages: list[dict[str, str]],
         max_tokens: int = 1000,
         temperature: float = 0.7,
+        request_options: dict[str, Any] | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """APIコールを実行する（リトライ付き）"""
         last_error = None
@@ -282,8 +294,14 @@ class OpenAICompatAdapter:
                 # openai SDKは未知のkwargsを拒否するため extra_body で送信
                 if self.model_info.extra_params:
                     create_kwargs["extra_body"] = self.model_info.extra_params
+                if request_options:
+                    create_kwargs.update(request_options)
                 if self.model_info.supports_temperature:
-                    create_kwargs["temperature"] = temperature
+                    create_kwargs["temperature"] = (
+                        self.model_info.temperature_override
+                        if self.model_info.temperature_override is not None
+                        else temperature
+                    )
                 # temperatureフォールバック: 一部モデル(Kimi k2.6等)は特定値のみ許可。
                 # supports_temperature=False のモデルは元から temperature を送っていない
                 # ためこのフォールバック経路には入らない（到達不能）。

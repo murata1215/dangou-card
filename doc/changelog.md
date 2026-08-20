@@ -1,5 +1,37 @@
 # Changelog
 
+## 2026-08-20: Phase 2 Structured Outputs のモデル別適応と再試行監査
+
+### 概要
+
+Phase 2のJSON互換試験を、各providerのStructured Outputs制約とreasoning消費に合わせて局所適応した。
+H1（Claude Opus 5）はcanonical schemaがprovider compileで拒否されたため、Phase 2だけflat transport
+schemaと厳格normalizerを導入し、attempt 7でStructured Outputs compile・transport→canonical→parserを
+通過した。Geminiの残存失敗モデルは、M3を`reasoning_effort="minimal"`・512 tokens、H3を`low`・
+912 tokensとして次回の単発再試行へ備える。Phase 1/3、本戦、成功済みモデルのrequest挙動は変更しない。
+
+### 詳細
+
+- H1だけは19 required field・root object 1個のtransport schemaを使い、raw responseを監査用に保存してから
+  action別whitelist normalizerで既存canonical dictへ戻す。既存`GAME2_USER`は使用せず、同一helperから
+  専用prompt/schemaを実送信とreserve計算へ渡す。
+- M3/H3はcanonical schemaを維持する。M3だけ`reasoning_effort="minimal"`、H3は最小設定の`low`のままとし、
+  `thinking_level`/`thinking_budget`は併送しない。H3の912は実測hidden thinking 487 + visible JSON 400 +
+  既存512-token reserveとの差25から導出したPhase 2限定値である。
+- Phase 2はadapter/SDK retry=0、temperature fallback無効で、logical callあたりクライアント送信を最大1回に固定する。
+  `--retry-failed`は失敗モデルだけを選択し、attempt番号・raw response・usage・model match・parse結果を
+  `phase2_calls.jsonl`へ追記する。
+- 新しい実request構成によるreserveはH1 `$0.026800000`、M3 `$0.014364000`、H3 `$0.023952000`。
+  M3/H3の同時予約はtotal cap `$0.25`を超えるため、実APIはM3の結果と実費を確認してからH3を別承認で判定する。
+
+### 検証
+
+- H1 light schemaの13 action正規化、unused field拒否、JSON-in-string異常系、provider別payloadと非波及をfakeで固定。
+- M3/H3のreasoning設定、Phase 2 token override、canonical schema、reserve計算を回帰テストへ追加。
+- full pytest: 723 passed, 4 warnings。`git diff --check`成功。
+- H1 attempt 7はPASS（`end_turn`、14,606ms、実費`$0.008715`）。M3 minimal/512のdry-runはAPI 0回で
+  reserve・state/JSONL不変を確認済み。実APIの追加送信は実施していない。
+
 ## 2026-08-18: 事前予算ガード `worst_case_cost()` の hidden thinking 予約対応（予算上限は据置）
 
 ### 概要

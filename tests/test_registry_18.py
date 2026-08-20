@@ -207,7 +207,7 @@ def test_tier_order_and_vendor_order_constants():
     assert VENDOR_ORDER == ("Anthropic", "OpenAI", "Google", "xAI", "Moonshot", "DeepSeek")
 
 
-def test_model_info_field_count_unchanged_except_tier():
+def test_model_info_fields_include_phase2_and_temperature_overrides():
     """ModelInfoのフィールド数が既知の値であること（想定外フィールド追加の検知）
 
     2026-08-18: hidden_thinking_reserve_tokens を追加（worst_case_costのhidden thinking
@@ -216,15 +216,14 @@ def test_model_info_field_count_unchanged_except_tier():
     assert names == [
         "model_id", "provider", "name", "adapter_type", "input_price", "output_price",
         "env_key", "base_url", "timeout_seconds", "max_tokens",
-        "max_tokens_param", "supports_temperature", "extra_params",
+        "phase2_max_tokens", "phase2_timeout_seconds", "max_tokens_param", "supports_temperature", "temperature_override", "extra_params",
         "cached_input_price", "reasoning_price", "tier",
         "hidden_thinking_reserve_tokens",
     ]
 
 
-def test_only_h2_overrides_openai_param_policy():
-    """H2 (gpt-5.6-sol) のみが max_tokens_param / supports_temperature を上書きしていること。
-    他の openai_compat / gemini モデルは全て既定値（max_tokens / temperature送信あり）のまま。"""
+def test_model_specific_temperature_and_phase2_overrides():
+    """プロバイダ一括でなく、実測したモデルだけを上書きすること。"""
     from llm.models import MODEL_REGISTRY as REG
     for key, info in REG.items():
         if info.adapter_type not in ("openai_compat", "gemini"):
@@ -235,6 +234,18 @@ def test_only_h2_overrides_openai_param_policy():
         else:
             assert info.max_tokens_param == "max_tokens", key
             assert info.supports_temperature is True, key
+    for key in ("L5", "M5", "H5"):
+        assert REG[key].temperature_override == 0.6
+    for key in ("M1", "H1"):
+        assert REG[key].supports_temperature is False
+    assert REG["L1"].supports_temperature is True
+    assert REG["M3"].phase2_max_tokens == 512
+    assert REG["H3"].phase2_max_tokens == 912
+    assert REG["H1"].phase2_max_tokens == 400
+    assert REG["H1"].phase2_timeout_seconds == 300
+    for key in ("M1", "L1", "M3", "H3"):
+        assert REG[key].phase2_timeout_seconds is None
+    assert REG["L3"].phase2_max_tokens is None
 
 
 def test_log_parser_lookup_matches_get_model():

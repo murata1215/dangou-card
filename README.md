@@ -104,8 +104,8 @@ ps -o rss=,etime= -p $(cat $(ls -t logs/llm/run_*.pid | head -1))   # メモリ(
 コール数上限ガード付きに実行するスクリプト。進行状況は `state.json` で管理し `--resume` で再開できる。
 
 ```bash
-uv run python scripts/model_matrix.py --phase 1 --keys H1,H2,H3 --dry-run   # 見積のみ（$0）
-uv run python scripts/model_matrix.py --phase 1 --keys H1,H2,H3 --max-cost 0.1
+uv run python scripts/model_matrix.py --phase 1 --models H1,H2,H3 --dry-run   # 見積のみ（$0）
+uv run python scripts/model_matrix.py --phase 1 --models H1,H2,H3 --max-cost 0.1
 uv run python scripts/model_matrix.py --phase 2 --resume
 ```
 
@@ -122,6 +122,12 @@ uv run python scripts/model_matrix.py --phase 2 --run-id run_20260818_041810 \
 
 実API前には同じ引数へ `--dry-run` を付け、出力をレビューしてから別途承認する。dry-runはAPI・state・
 `phase2_calls.jsonl` を変更しないが、集計レポートを再生成する副作用がある。
+
+Phase 2で失敗済みモデルだけを単発再試行する場合は、`--models <key> --retry-failed --max-calls 1`を使う。
+H1（Claude Opus 5）はPhase 2だけflat transport schemaと専用promptを使い、受信後にcanonical actionへ正規化する。
+M3（Gemini 3.5 Flash）は`reasoning_effort="minimal"`・512 tokens、H3（Gemini 3.1 Pro Preview）は`low`・
+912 tokensでcanonical schemaを維持する。Geminiの`reasoning_effort`と`thinking_level`/`thinking_budget`は併送しない。
+M3/H3の予約を同時に確保するとこのrunのtotal capを超えるため、M3の結果・実費を確認してからH3を別承認で実行する。
 
 コスト計算は全フェーズで実測usageベースの `_usage_cost()` に統一されており、Geminiのhidden
 thinking・xAI等のキャッシュ割引・Anthropicのusage慣習差を正しく反映する。詳細は `rules/project.md`

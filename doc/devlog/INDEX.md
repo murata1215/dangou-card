@@ -87,6 +87,7 @@
 - 2026-08-18 08:12 JST | H2(gpt-5.6-sol) Phase 1再テスト: max_tokens_param/supports_temperatureをModelInfoに追加しリトライ責務をmodel_matrixへ一本化(HTTP最大1回)、実API1コールでpass・18モデル全通過$0.0090を確認 → 2026-08-18_081245.md
 - 2026-08-18 11:04 JST | サイクルE: Phase 2 コスト計算修正: run_phase2のestimate_cost直呼びを_usage_cost()に統一(Gemini hidden thinking/xAI cache割引/Anthropic正規化を反映)、Phase2未実行のため履歴影響ゼロ、テスト12件追加で全556件PASS → 2026-08-18_110406.md
 - 2026-08-18 12:48 JST | サイクルF: Phase 3 BudgetedAdapterコスト計算修正: complete()内のestimate_cost直呼びを_usage_cost()に統一(予算消費spent_usdへhidden thinking/cache割引/Anthropic正規化を正しく反映)、Phase3未実行のため履歴影響ゼロ、テスト14件追加で全570件PASS → 2026-08-18_124843.md
+- 2026-08-20 07:19 JST | サイクルG: Phase 2 Structured Outputs とthinking制御: H1/M3/H3限定schema・complexity検証・schema reserve・adapter optionを実装し、外部API未実行、全689件PASS → 2026-08-20_071922.md
 
 ### 2026-08-16 10:03 JST | コストログ化 Stage 2: 単価表拡張・estimate_cost内訳対応・確定単価反映
 
@@ -112,4 +113,6 @@ Stage 1 で捕捉したトークン内訳（cached/reasoning/total）を活用�
 **テスト:** 9件追加（TestEstimateCostV2）、全341テスト PASSED
 
 **次段:** Stage 3（試合サマリー・ビューワー内訳パネル）
-
+- 2026-08-20 08:32 JST | サイクルH: H1 Phase 2 timeout延長: H1だけPhase 2で300秒、retry=0とStructured Outputs設定を維持、外部API未実行、全695件PASS → 2026-08-20_083212.md
+- 2026-08-20 10:30 JST | サイクルI: H1 Phase 2 light Structured Output schema: H1だけflat transport schemaと厳格normalizerへ分離、外部API未実行、全722件PASS → 2026-08-20_103022.md
+- 2026-08-20 10:56 JST | サイクルJ: M3/H3 Phase 2 reasoning budget tuning: M3をminimal、H3を912 tokensへ局所調整、外部API未実行、全723件PASS → 2026-08-20_105619.md

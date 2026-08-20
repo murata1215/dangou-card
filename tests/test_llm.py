@@ -1172,7 +1172,7 @@ class TestResponseModelCapture:
 
     def test_anthropic_response_model_propagates(self):
         """AnthropicAdapter.complete() が response.model を usage["response_model"] に伝播すること"""
-        from llm.adapters import AnthropicAdapter
+        from llm.adapters import AnthropicAdapter, AdapterError
 
         class FakeBlock:
             text = "ok"
@@ -1470,6 +1470,29 @@ class TestOpenAICompatParamPolicy:
         assert "max_completion_tokens" not in captured[0]
         assert captured[0]["temperature"] == 0.5
 
+    def test_model_temperature_override_is_sent_without_fallback(self):
+        """Moonshotのような固定temperatureモデルは、呼出側0.7ではなく0.6を1回だけ送る。"""
+        from llm.adapters import OpenAICompatAdapter
+
+        captured = []
+
+        def create_fn(kwargs, resp_cls):
+            captured.append(kwargs)
+            return resp_cls()
+
+        info = ModelInfo(
+            model_id="kimi-k2.6", provider="Moonshot", name="Kimi",
+            adapter_type="openai_compat", input_price=1.0, output_price=4.0,
+            env_key="KIMI_API_KEY", base_url="https://example.invalid",
+            temperature_override=0.6,
+        )
+        adapter = OpenAICompatAdapter(info, max_retries=0, allow_temperature_fallback=False)
+        adapter._client = self._fake_client(create_fn)
+        adapter.complete("sys", [{"role": "user", "content": "hi"}], temperature=0.7)
+
+        assert len(captured) == 1
+        assert captured[0]["temperature"] == 0.6
+
     def test_default_model_still_falls_back_on_temperature_error(self):
         """既定モデルはtemperatureエラーで2回目が飛び、2回目にtemperatureが無いこと（既存挙動維持）"""
         from llm.adapters import OpenAICompatAdapter
@@ -1648,6 +1671,34 @@ class TestSingleHttpRequestGuarantee:
             adapter.complete("sys", [{"role": "user", "content": "hi"}])
 
         assert len(calls) == 1
+
+    def test_anthropic_model_without_temperature_omits_parameter(self):
+        """Sonnet/Opus相当のsupports_temperature=Falseは初回からtemperatureを送らない。"""
+        from llm.adapters import AnthropicAdapter, AdapterError
+
+        captured = []
+
+        class FakeMessages:
+            def create(self, **kwargs):
+                captured.append(kwargs)
+                raise Exception("expected stop")
+
+        class FakeClient:
+            messages = FakeMessages()
+
+        info = ModelInfo(
+            model_id="claude-sonnet-5", provider="Anthropic", name="Sonnet",
+            adapter_type="anthropic", input_price=2.0, output_price=10.0,
+            env_key="ANTHROPIC_API_KEY", base_url=None, supports_temperature=False,
+        )
+        adapter = AnthropicAdapter(info, max_retries=0, allow_temperature_fallback=False)
+        adapter._client = FakeClient()
+
+        with pytest.raises(AdapterError):
+            adapter.complete("sys", [{"role": "user", "content": "hi"}], temperature=0.7)
+
+        assert len(captured) == 1
+        assert "temperature" not in captured[0]
 
     def test_default_adapter_still_retries_on_429(self, monkeypatch):
         """max_retries未指定なら従来どおり3回（API_MAX_RETRIES=2）呼ばれること（回帰）"""

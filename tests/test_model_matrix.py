@@ -25,7 +25,7 @@ class _FakeOkAdapter:
         self.model_info = model_info
         self.calls = 0
 
-    def complete(self, system, messages, max_tokens=1000, temperature=0.7):
+    def complete(self, system, messages, max_tokens=1000, temperature=0.7, **kwargs):
         self.calls += 1
         text = '{"strategy": {"reason": "test", "emotion": "楽"}, "action": {"type": "pass"}}'
         usage = {"input_tokens": 100, "output_tokens": 20}
@@ -38,7 +38,7 @@ class _FakeErrorAdapter:
     def __init__(self, model_info):
         self.model_info = model_info
 
-    def complete(self, system, messages, max_tokens=1000, temperature=0.7):
+    def complete(self, system, messages, max_tokens=1000, temperature=0.7, **kwargs):
         raise AdapterError("OpenAI-compat API error (NotFoundError): fake 404 for test")
 
 
@@ -48,7 +48,7 @@ class _FakeMarkdownAdapter:
     def __init__(self, model_info):
         self.model_info = model_info
 
-    def complete(self, system, messages, max_tokens=1000, temperature=0.7):
+    def complete(self, system, messages, max_tokens=1000, temperature=0.7, **kwargs):
         text = '```json\n{"strategy": {"reason": "test", "emotion": "楽"}, "action": {"type": "pass"}}\n```'
         usage = {"input_tokens": 100, "output_tokens": 20}
         return text, usage
@@ -71,7 +71,7 @@ class _FakeOkAdapterWithResponseModel:
         self.model_info = model_info
         self._response_model = response_model if response_model is not None else model_info.model_id
 
-    def complete(self, system, messages, max_tokens=1000, temperature=0.7):
+    def complete(self, system, messages, max_tokens=1000, temperature=0.7, **kwargs):
         text = '{"ok": true}'
         usage = {
             "input_tokens": 10, "output_tokens": 5,
@@ -88,7 +88,7 @@ class _FakeUsageRichAdapter:
         self.model_info = model_info
         self._usage = usage
 
-    def complete(self, system, messages, max_tokens=1000, temperature=0.7):
+    def complete(self, system, messages, max_tokens=1000, temperature=0.7, **kwargs):
         return '{"ok": true}', dict(self._usage)
 
 
@@ -101,7 +101,7 @@ class _FakeGameJsonUsageAdapter:
         self._usage = usage
         self.calls = 0
 
-    def complete(self, system, messages, max_tokens=1000, temperature=0.7):
+    def complete(self, system, messages, max_tokens=1000, temperature=0.7, **kwargs):
         self.calls += 1
         text = '{"strategy": {"reason": "test", "emotion": "楽"}, "action": {"type": "pass"}}'
         return text, dict(self._usage)
@@ -590,6 +590,75 @@ def test_phase2_adapter_error_records_no_raw_response(monkeypatch):
     result = mm._call_once_phase2(MODEL_REGISTRY["L1"], 400)
     assert result["response_text"] is None
     assert result["response_model"] is None
+
+
+def test_phase2_uses_model_specific_output_cap_only_for_configured_models(tmp_path, monkeypatch):
+    """モデル別Phase 2上限だけがCLI既定400を上書きする。"""
+    captured: list[tuple[str, int]] = []
+
+    class Adapter:
+        def __init__(self, info):
+            self.info = info
+
+        def complete(self, system, messages, max_tokens=1000, temperature=0.7, **kwargs):
+            captured.append((self.info.model_id, max_tokens))
+            return ('{"strategy":{"reason":"ok","emotion":"楽"},"action":{"type":"pass"}}',
+                    {"input_tokens": 1, "output_tokens": 1, "response_model": self.info.model_id})
+
+    monkeypatch.setattr(mm, "create_adapter", lambda info, **kwargs: Adapter(info))
+    run_dir = tmp_path / "run"
+    state = mm._init_state("run", 1.0, ["L2", "M3", "H3", "H1"])
+    state["phases"]["1"] = {"status": "done"}
+    for key in ("L2", "M3", "H3", "H1"):
+        state["models"][key]["phase1"] = {"status": "pass"}
+
+    mm.run_phase2(run_dir, state, ["L2", "M3", "H3", "H1"], 1.0, 1.0, 1.0, 10, 400,
+                  resume=False, force=False, dry_run=False)
+
+    assert captured == [
+        (MODEL_REGISTRY["L2"].model_id, 400),
+        (MODEL_REGISTRY["M3"].model_id, 512),
+        (MODEL_REGISTRY["H3"].model_id, 912),
+        (MODEL_REGISTRY["H1"].model_id, 400),
+    ]
+
+
+def test_phase2_retry_failed_targets_only_current_failures_and_appends_attempts(tmp_path, monkeypatch):
+    """--retry-failed 相当はPASSを再課金せず、FAILだけを新attemptとして追記する。"""
+    called: list[str] = []
+
+    class Adapter:
+        def __init__(self, info):
+            self.info = info
+
+        def complete(self, system, messages, max_tokens=1000, temperature=0.7, **kwargs):
+            called.append(self.info.model_id)
+            return ('{"strategy":{"reason":"ok","emotion":"楽"},"action":{"type":"pass"}}',
+                    {"input_tokens": 1, "output_tokens": 1, "response_model": self.info.model_id})
+
+    monkeypatch.setattr(mm, "create_adapter", lambda info, **kwargs: Adapter(info))
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    state = mm._init_state("run", 1.0, ["L1", "L2", "L3"])
+    state["phases"]["1"] = {"status": "done"}
+    for key, status in {"L1": "pass", "L2": "fail", "L3": "fail"}.items():
+        state["models"][key]["phase1"] = {"status": "pass"}
+        state["models"][key]["phase2"] = {"status": status}
+    (run_dir / "phase2_calls.jsonl").write_text(
+        '\n'.join(json.dumps({"key": key, "attempt": 1}) for key in ("L1", "L2", "L3")) + '\n',
+        encoding="utf-8",
+    )
+
+    mm.run_phase2(run_dir, state, ["L1", "L2", "L3"], 1.0, 1.0, 1.0, 10, 400,
+                  resume=True, force=False, dry_run=False, retry_failed=True)
+
+    assert called == [MODEL_REGISTRY["L2"].model_id, MODEL_REGISTRY["L3"].model_id]
+    rows = [json.loads(line) for line in (run_dir / "phase2_calls.jsonl").read_text().splitlines()]
+    assert len(rows) == 5
+    assert [(row["key"], row["attempt"], row["attempt_kind"]) for row in rows[-2:]] == [
+        ("L2", 2, "retry_failed"), ("L3", 2, "retry_failed"),
+    ]
+    assert state["budget"]["calls_made"] == 2
 
 
 # ============================================================
@@ -1206,23 +1275,35 @@ def test_phase_defaults_phase2_per_model_cap_is_adjusted_only():
     assert mm.DEFAULT_MAX_COST_TOTAL == 1.00
 
 
-def test_phase2_core18_reservations_fit_new_per_model_and_phase_total_caps():
-    """実API・state・ログなしで、Phase 2の実prompt予約がCORE_18全件で通ることを確認する。"""
+def test_phase2_core18_reservations_cover_model_overrides_and_flag_h4_cap_gap():
+    """Phase 2の予約は専用output上限を使い、H4の実測由来reserve不足を隠さない。"""
     defaults = mm.PHASE_DEFAULTS[2]
     system = mm.build_system_prompt("P01", mm.GameConfig.baseline_v1_s2(num_players=18))
     reservations = {
-        key: mm._worst_case_cost(MODEL_REGISTRY[key], system, mm.GAME2_USER, defaults["max_tokens"])
+        key: mm._phase2_worst_case_cost(
+            MODEL_REGISTRY[key], system,
+            mm._phase2_effective_max_tokens(MODEL_REGISTRY[key], defaults["max_tokens"]),
+        )
         for key in mm.CORE_18_KEYS
     }
 
     assert len(reservations) == 18
-    assert sum(reservations.values()) == pytest.approx(0.175933790, abs=1e-12)
     assert sum(reservations.values()) <= defaults["max_cost"]
-    assert max(reservations.values()) == pytest.approx(0.027510000, abs=1e-12)
-    assert all(cost <= defaults["max_cost_per_model"] for cost in reservations.values())
+    assert reservations["H4"] > defaults["max_cost_per_model"]
+    assert all(cost <= defaults["max_cost_per_model"] for key, cost in reservations.items() if key != "H4")
+    # H1/M3/H3はStructured Outputs schemaの入力reserveを含む。
+    assert reservations["H1"] == pytest.approx(0.0268, abs=1e-12)
     for key in ("H1", "H2", "H4"):
         assert reservations[key] > 0.02
-        assert reservations[key] <= defaults["max_cost_per_model"]
+        if key != "H4":
+            assert reservations[key] <= defaults["max_cost_per_model"]
+
+
+def test_xai_reserves_cover_phase2_observed_reasoning_without_claiming_a_hard_cap():
+    """xAI実績(L4=526/M4=811/H4=1355)を超える予約マージンを持つ。"""
+    assert {key: MODEL_REGISTRY[key].hidden_thinking_reserve_tokens for key in ("L4", "M4", "H4")} == {
+        "L4": 768, "M4": 1024, "H4": 1536,
+    }
 
 
 def test_worst_case_cost_reserve_targets_are_core18_members():

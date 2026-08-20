@@ -129,3 +129,16 @@ Phase 3・本戦・model_smokeなどstrict指定のない経路は既定挙動�
 使用する。認証情報やrequest headerをJSONLへ記録してはならない。担保テスト:
 `tests/test_llm.py::TestSingleHttpRequestGuarantee`、
 `tests/test_model_matrix.py::test_phase2_uses_strict_single_request_adapter_and_records_full_response`。
+
+## Phase 2 Structured Outputs はモデル別request specを単一経路で解決する
+
+`scripts/model_matrix.py` の `_phase2_user_content()`、`_phase2_schema_for_model()`、
+`_phase2_request_options()`、`_phase2_worst_case_cost()` は、Phase 2に限るモデル別request specの単一経路である。
+実送信と予約計算は必ず同じprompt、schema、実効max tokensを使うこと。予約専用のprompt/schemaを別定義したり、
+Phase 1/3・本戦へPhase 2用optionを漏らしてはならない。
+
+H1（Claude Opus 5）はcanonical schemaを直接送らず、flat transport schemaと専用promptを使い、raw responseを保存後に
+`normalize_h1_phase2_transport()`でcanonical dictへ戻す。M3/H3（Gemini）はcanonical schemaを維持する。M3だけ
+`reasoning_effort="minimal"`、H3は`"low"`を送り、`thinking_level`/`thinking_budget`と併送しない。H3の912-token
+overrideはPhase 2だけであり、487 hidden-thinking実測 + 400 visible JSON allowance + 25 safety marginから導出したもの。
+M3/H3の両方を再試行する際は、total capを引き上げず、M3の実績コストを確認してからH3の予約ゲートを評価する。

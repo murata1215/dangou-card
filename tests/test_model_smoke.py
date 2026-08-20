@@ -135,14 +135,14 @@ def test_worst_case_cost_includes_gemini_hidden_thinking(key):
 @pytest.mark.parametrize("key", ["M4", "L4", "H4"])
 def test_worst_case_cost_includes_xai_reasoning(key):
     """xAI対象3モデルは、予約分だけ旧式(estimate_cost直呼び)より高くなること。
-    差分は 512 * output_price / 1_000_000 に厳密一致する"""
+    差分は各モデルの実測由来reserve * output_priceに厳密一致する"""
     model = get_model(key)
-    assert model.hidden_thinking_reserve_tokens == 512
+    assert model.hidden_thinking_reserve_tokens == {"L4": 768, "M4": 1024, "H4": 1536}[key]
     system, user = "system prompt text", "user prompt text"
     approx_input_tokens = (len(system) + len(user)) // 2 + 50
     old_style = estimate_cost(model, approx_input_tokens, 64)
     new_style = worst_case_cost(model, system, user, max_tokens=64)
-    expected_delta = 512 * model.output_price / 1_000_000
+    expected_delta = model.hidden_thinking_reserve_tokens * model.output_price / 1_000_000
     assert new_style > old_style
     assert (new_style - old_style) == pytest.approx(expected_delta)
 

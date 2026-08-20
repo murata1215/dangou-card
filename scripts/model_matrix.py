@@ -26,10 +26,9 @@
 state.json のみが正。各モデル処理後に os.replace() で原子的に書き換える
 （kill -9 されても最大1件しか失わない）。
 
-llm/models.py・engine/ は変更しない。MODEL_REGISTRY の ModelInfo インスタンスは
-一切書き換えない（Phase3のmax_tokensクランプは BudgetedAdapter 側でコール単位に
-行う）。llm/adapters.py は usage 辞書へ requested_model/response_model を追加する
-最小変更のみ（complete() の戻り値シグネチャ (text, usage) 自体は変更しない）。
+MODEL_REGISTRYはモデル別の送信パラメータとPhase 2 output上限を持つ。Phase 3の
+max_tokensクランプは BudgetedAdapter 側でコール単位に行う。llm/adapters.pyの
+complete()戻り値シグネチャ (text, usage) は変更しない。
 """
 
 import argparse
@@ -37,6 +36,7 @@ import json
 import os
 import sys
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -66,6 +66,12 @@ from scripts.model_smoke import (
     _looks_like_pure_json,
 )
 from llm.costing import worst_case_cost as _worst_case_cost
+from llm.phase2_schema import (build_phase2_response_schema,
+                               build_h1_phase2_light_schema,
+                               normalize_h1_phase2_transport,
+                               structured_schema_input_reserve_tokens,
+                               validate_h1_phase2_light_schema,
+                               validate_phase2_schema_complexity)
 
 
 # --- 対象キー: H1〜H6 / M1〜M6 / L1〜L6 の18コアキー（L7は負荷試験枠のため対象外） ---
@@ -94,6 +100,16 @@ PING_USER = SMOKE_PING_USER
 
 # --- Phase 2 談合カードJSON互換テスト用プロンプト（model_smoke.py の GAME_USER を共用） ---
 GAME2_USER = GAME_USER
+H1_PHASE2_TRANSPORT_USER = """ラウンド3 / 交渉フェイズ（巡2）
+
+市場: M01=84万円, M02=84万円, M03=84万円
+あなたの状態: 現金300万円。手札: HIGH_CARD, ONE_PAIR, TWO_PAIR, THREE_OF_A_KIND, STRAIGHT, FLUSH
+他プレイヤー: P02「M01は均等分配にしませんか」; P05「私はM03を狙います」
+
+次の19 fieldだけを持つJSON objectを返してください。action_typeは交渉actionを1つ選び、emotionは感情を1つ選びます。
+action_type, emotion, to, message, amount, with_players_json, terms_json, contract_id, bounty_type, condition_type, condition_target_player, round_num, anonymous, beneficiary, bounty_id, give_card, receive_card, cash_amount, trade_id。
+未使用stringは""、integerは0、anonymousはfalse、with_players_jsonとterms_jsonは空配列を表す"[]"にしてください。
+bounty_type/condition_typeの未使用値は""です。with_players_jsonは文字列配列をJSON文字列化し、terms_jsonはcanonical term dict配列をJSON文字列化してください。"""
 
 
 class BudgetError(Exception):
@@ -492,23 +508,69 @@ def _generate_phase1_report(run_dir: Path, state: dict[str, Any]) -> None:
 # Phase 2: 談合カードJSON互換
 # ============================================================
 
+def _is_h1_phase2_model(model: ModelInfo) -> bool:
+    return model.model_id == MODEL_REGISTRY["H1"].model_id
+
+
+def _phase2_user_content(model: ModelInfo) -> str:
+    """Return the exact model-specific Phase 2 user content used for a call."""
+    return H1_PHASE2_TRANSPORT_USER if _is_h1_phase2_model(model) else GAME2_USER
+
+
+def _phase2_schema_for_model(model: ModelInfo) -> dict[str, Any] | None:
+    if _is_h1_phase2_model(model):
+        return build_h1_phase2_light_schema()
+    if model.model_id in {MODEL_REGISTRY["M3"].model_id, MODEL_REGISTRY["H3"].model_id}:
+        return build_phase2_response_schema()
+    return None
+
+
+def _phase2_request_options(model: ModelInfo) -> dict[str, Any]:
+    """Return Phase-2-only options; never used by Phase 1/3 or games."""
+    schema = _phase2_schema_for_model(model)
+    if _is_h1_phase2_model(model):
+        assert schema is not None
+        validate_h1_phase2_light_schema(schema)
+        return {"thinking": {"type": "disabled"}, "output_config": {"format": {"type": "json_schema", "schema": schema}}}
+    if model.model_id in {MODEL_REGISTRY["M3"].model_id, MODEL_REGISTRY["H3"].model_id}:
+        assert schema is not None
+        validate_phase2_schema_complexity(schema)
+        # Gemini 3.5 Flash supports minimal; Gemini 3.1 Pro Preview's lowest
+        # supported setting is low.  Do not combine this OpenAI-compatible
+        # control with Gemini thinking_level/thinking_budget controls.
+        reasoning_effort = "minimal" if model.model_id == MODEL_REGISTRY["M3"].model_id else "low"
+        return {"reasoning_effort": reasoning_effort, "response_format": {"type": "json_schema", "json_schema": {"name": "phase2_negotiation", "strict": True, "schema": schema}}}
+    return {}
+
+
+def _phase2_worst_case_cost(model: ModelInfo, system: str, max_tokens: int) -> float:
+    options = _phase2_request_options(model)
+    schema = _phase2_schema_for_model(model)
+    reserve = structured_schema_input_reserve_tokens(schema) if options and schema else 0
+    return _worst_case_cost(model, system, _phase2_user_content(model), max_tokens, input_reserve_tokens=reserve)
+
+
 def _call_once_phase2(model: ModelInfo, max_tokens: int) -> dict[str, Any]:
     # Phase 2 の比較実験だけは、adapter/SDK retry と temperature fallback
     # による追加送信を抑止する。他Phaseおよび本戦の既定挙動は変更しない。
     adapter = create_adapter(
-        model,
+        _phase2_effective_model(model),
         max_retries=0,
         allow_temperature_fallback=False,
     )
     game_system = build_system_prompt("P01", GameConfig.baseline_v1_s2(num_players=18))
     try:
         start = time.time()
-        text, usage = adapter.complete(
+        complete_kwargs: dict[str, Any] = dict(
             system=game_system,
-            messages=[{"role": "user", "content": GAME2_USER}],
+            messages=[{"role": "user", "content": _phase2_user_content(model)}],
             max_tokens=max_tokens,
             temperature=0.7,
         )
+        options = _phase2_request_options(model)
+        if options:
+            complete_kwargs["request_options"] = options
+        text, usage = adapter.complete(**complete_kwargs)
         latency_ms = round((time.time() - start) * 1000)
     except (AdapterError, Exception) as e:
         return {
@@ -526,11 +588,15 @@ def _call_once_phase2(model: ModelInfo, max_tokens: int) -> dict[str, Any]:
     if ok:
         data = extract_json(text)
         if data:
+            parse_text = text
             try:
-                strategy, action = parse_response(text, "P01", "negotiation")
+                if _is_h1_phase2_model(model):
+                    canonical = normalize_h1_phase2_transport(data)
+                    parse_text = json.dumps(canonical, ensure_ascii=False)
+                strategy, action = parse_response(parse_text, "P01", "negotiation")
                 parse_ok = True
                 emotion = (strategy or {}).get("emotion") if isinstance(strategy, dict) else None
-            except ParseError as e:
+            except (ParseError, ValueError) as e:
                 parse_error = e.correction_hint if hasattr(e, "correction_hint") else str(e)[:200]
         else:
             parse_error = "JSON抽出失敗"
@@ -545,10 +611,22 @@ def _call_once_phase2(model: ModelInfo, max_tokens: int) -> dict[str, Any]:
     }
 
 
+def _phase2_effective_max_tokens(model: ModelInfo, configured_max_tokens: int) -> int:
+    """Phase 2だけで必要なモデル別出力上限を解決する。"""
+    return model.phase2_max_tokens if model.phase2_max_tokens is not None else configured_max_tokens
+
+
+def _phase2_effective_model(model: ModelInfo) -> ModelInfo:
+    """Return a Phase-2-only ModelInfo copy when a timeout override is set."""
+    if model.phase2_timeout_seconds is None:
+        return model
+    return replace(model, timeout_seconds=model.phase2_timeout_seconds)
+
+
 def run_phase2(run_dir: Path, state: dict[str, Any], keys: list[str],
                 max_cost: float, max_cost_total: float, max_cost_per_model: float,
                 max_calls: int, max_tokens: int,
-                resume: bool, force: bool, dry_run: bool) -> str:
+                resume: bool, force: bool, dry_run: bool, retry_failed: bool = False) -> str:
     if state["phases"]["1"]["status"] not in ("done", "aborted_budget"):
         print("Phase 1 が未完了です。先に --phase 1 を実行してください。")
         return "gate_error"
@@ -557,7 +635,10 @@ def run_phase2(run_dir: Path, state: dict[str, Any], keys: list[str],
     targets = []
     for key in passers:
         m = state["models"][key]
-        if resume and not force and m["phase2"].get("status") in ("pass", "fail"):
+        status = m["phase2"].get("status")
+        if retry_failed and status != "fail":
+            continue
+        if not retry_failed and resume and not force and status in ("pass", "fail"):
             continue
         targets.append(key)
 
@@ -567,8 +648,8 @@ def run_phase2(run_dir: Path, state: dict[str, Any], keys: list[str],
     aborted = False
 
     total_worst = sum(
-        _worst_case_cost(MODEL_REGISTRY[k], build_system_prompt("P01", GameConfig.baseline_v1_s2(num_players=18)),
-                          GAME2_USER, max_tokens)
+        _phase2_worst_case_cost(MODEL_REGISTRY[k], build_system_prompt("P01", GameConfig.baseline_v1_s2(num_players=18)),
+                          _phase2_effective_max_tokens(MODEL_REGISTRY[k], max_tokens))
         for k in targets
     )
     print(f"Phase 2 対象: {len(targets)}モデル（Phase1通過分）、最悪見積コスト ${total_worst:.4f}")
@@ -577,10 +658,22 @@ def run_phase2(run_dir: Path, state: dict[str, Any], keys: list[str],
             print(f"  [dry-run] {key} {MODEL_REGISTRY[key].provider} {MODEL_REGISTRY[key].name}")
         return "dry_run"
 
+    existing_attempts: dict[str, int] = {}
+    if calls_path.exists():
+        for line in calls_path.read_text(encoding="utf-8").splitlines():
+            try:
+                prior = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if key := prior.get("key"):
+                existing_attempts[key] = existing_attempts.get(key, 0) + 1
+    attempt_kind = "retry_failed" if retry_failed else ("force" if force else "initial")
+
     for key in targets:
         info = MODEL_REGISTRY[key]
+        effective_max_tokens = _phase2_effective_max_tokens(info, max_tokens)
         game_system = build_system_prompt("P01", GameConfig.baseline_v1_s2(num_players=18))
-        worst = _worst_case_cost(info, game_system, GAME2_USER, max_tokens)
+        worst = _phase2_worst_case_cost(info, game_system, effective_max_tokens)
         try:
             _check_budget_before_call(
                 state, phase_spent, max_cost, max_cost_total, 0.0, max_cost_per_model,
@@ -594,7 +687,7 @@ def run_phase2(run_dir: Path, state: dict[str, Any], keys: list[str],
             continue
 
         print(f"{key} ({info.provider} {info.name})...", end=" ", flush=True)
-        r = _call_once_phase2(info, max_tokens)
+        r = _call_once_phase2(info, effective_max_tokens)
         usage = r["usage"]
         # Phase 1 と同一の実測usageベース計算に統一（hidden thinking / cache割引 / Anthropic正規化）
         cost = _usage_cost(info, usage)
@@ -612,10 +705,14 @@ def run_phase2(run_dir: Path, state: dict[str, Any], keys: list[str],
             "requested_model": info.model_id,
             "model_match": model_match,
             "timestamp": datetime.now(timezone.utc).isoformat(),
+            "attempt": existing_attempts.get(key, 0) + 1,
+            "attempt_kind": attempt_kind,
+            "max_tokens": effective_max_tokens,
             "cost_usd": round(cost, 6),
             **r,
         }
         _append_jsonl(calls_path, record)
+        existing_attempts[key] = record["attempt"]
         state["models"][key]["phase2"] = {
             "status": status, "latency_ms": r["latency_ms"], "cost_usd": round(cost, 6),
             "error": r["error"] or r.get("parse_error"), "pure_json": r["pure_json"], "emotion": r["emotion"],
@@ -942,7 +1039,9 @@ def main() -> None:
         help="Phase 1の再試行回数（スクリプト側のみ。アダプタ内部・OpenAI SDK内部のリトライは常に0＝1試行あたりHTTP1回）",
     )
     parser.add_argument("--resume", action="store_true", help="既済モデルをスキップ")
-    parser.add_argument("--force", action="store_true", help="既済モデルも再実行")
+    retry_group = parser.add_mutually_exclusive_group()
+    retry_group.add_argument("--force", action="store_true", help="既済モデルも再実行")
+    retry_group.add_argument("--retry-failed", action="store_true", help="直近Phase 2でfailのモデルだけを再実行")
     parser.add_argument("--dry-run", action="store_true", help="計画と最悪コストのみ、APIコールゼロ")
     parser.add_argument("--report", action="store_true", help="state.jsonから最終表を再生成、APIコールゼロ")
     parser.add_argument("--out", default=str(DEFAULT_OUT_DIR), help="出力先ディレクトリ")
@@ -997,7 +1096,7 @@ def main() -> None:
                              max_calls, max_tokens, retries, args.resume, args.force, args.dry_run)
     elif args.phase == 2:
         result = run_phase2(run_dir, state, keys, max_cost, args.max_cost_total, max_cost_per_model,
-                             max_calls, max_tokens, args.resume, args.force, args.dry_run)
+                            max_calls, max_tokens, args.resume, args.force, args.dry_run, args.retry_failed)
     else:
         result = run_phase3(run_dir, state, keys, max_cost, args.max_cost_total, max_cost_per_model,
                              max_calls, max_tokens, args.seed, args.resume, args.force, args.dry_run)
