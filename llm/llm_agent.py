@@ -64,6 +64,10 @@ class LLMAgent(PlayerAgent):
         self.auto_commit_count: int = 0
         self.total_calls: int = 0
         self.valid_json_count: int = 0
+        # Phase 3集計で、JSON parse失敗後に実際に送った修正prompt数を監査する。
+        # loan選択には修正retryが無いため、negotiation / commitだけを分離して数える。
+        self.negotiation_correction_count: int = 0
+        self.commit_correction_count: int = 0
         # 修正4: 前回のメッセージ数を追跡（空回り検出用）
         self._last_message_count: int = 0
         # 修正1: 当該ラウンドの交渉メッセージを保持
@@ -261,6 +265,7 @@ class LLMAgent(PlayerAgent):
                 return action
             except ParseError as e:
                 if retry < MAX_RETRIES:
+                    self.negotiation_correction_count += 1
                     correction = make_correction_message(e)
                     # finish_reason=length の場合は切断ヒントを追加
                     if usage.get("finish_reason") == "length":
@@ -328,6 +333,7 @@ class LLMAgent(PlayerAgent):
                 )
             except ParseError as e:
                 if retry < MAX_RETRIES:
+                    self.commit_correction_count += 1
                     correction = make_correction_message(e)
                     if usage.get("finish_reason") == "length":
                         correction = LENGTH_TRUNCATION_HINT + "\n" + correction

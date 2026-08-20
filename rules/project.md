@@ -124,11 +124,16 @@ Phase 2の有料比較は外側retryも持たないため、必ず
 temperature fallbackをともに止める。これによりクライアント実装からのAPI送信は1 logical callにつき最大1回となる。
 送信後のネットワーク断でproviderが受信・課金済みかどうかは確定できないが、クライアントが再送することはない。
 
-Phase 3・本戦・model_smokeなどstrict指定のない経路は既定挙動を維持する。Phase 2の監査では
-`phase2_calls.jsonl` の `response_text`（API本文全文）、`requested_model`、`response_model`、`model_match` を
-使用する。認証情報やrequest headerをJSONLへ記録してはならない。担保テスト:
+Phase 3のmatrixミニゲームも外側retryを持たないため、Phase 3経路に限り同じstrict引数を渡す。loan・
+negotiation・commitの各logical callは最大1 transport sendとし、parse correctionだけはゲーム仕様上の別logical
+callとして許容する（通常3、最大7 call/model）。Phase 1/2/3以外の本戦・model_smokeなどは既定挙動を維持する。
+Phase 2の監査では `phase2_calls.jsonl` の `response_text`（API本文全文）、`requested_model`、`response_model`、
+`model_match` を使用する。Phase 3の集計にはrequested/response model、model match、logical calls、
+negotiation/commit correction数を追加し、全文・usage・finish reason・latency・costは個別LLMログの既存保存を維持する。
+認証情報やrequest headerをJSONLへ記録してはならない。担保テスト:
 `tests/test_llm.py::TestSingleHttpRequestGuarantee`、
-`tests/test_model_matrix.py::test_phase2_uses_strict_single_request_adapter_and_records_full_response`。
+`tests/test_model_matrix.py::test_phase2_uses_strict_single_request_adapter_and_records_full_response`、
+`tests/test_model_matrix.py::test_phase3_uses_strict_adapter_and_records_model_audit_and_corrections`。
 
 ## Phase 2 Structured Outputs はモデル別request specを単一経路で解決する
 

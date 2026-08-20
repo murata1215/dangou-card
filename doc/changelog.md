@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-08-20: Phase 3 matrix strict化と監査集計の拡張
+
+- Phase 3のadapter生成だけを `max_retries=0`・temperature fallback無効に固定し、Anthropic/OpenAI互換SDKを
+  含めて1 logical callあたり最大1 transport sendとした。Phase 1/2、本戦、通常ゲームの既定retry挙動は変更しない。
+- negotiation/commitのparse correctionを別logical callとして数え、モデル単位のPhase 3集計へrequested/response
+  model、model match、logical calls、各correction数と合計を追加した。raw response・usage・finish reason・latency・
+  costの既存LLMログ形式は維持する。
+- APIなしの関連テスト221件と全726件がPASS（警告4件）。隔離コピーのdry-runはCORE_18全18モデル・外部API 0回で
+  完了し、通常3call予約は最大H4 `$0.133300000`、合計`$0.631582840`であることを再確認した。
+- Phase 3実APIと本戦はこのstrict化検証の対象外とし、実行には別承認を要する。
+
 ## 2026-08-20: Phase 2 Structured Outputs のモデル別適応と再試行監査
 
 ### 概要

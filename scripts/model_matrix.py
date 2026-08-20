@@ -812,12 +812,48 @@ def _judge_phase3(events: list[Any], agent: LLMAgent) -> dict[str, Any]:
     }
 
 
+def _phase3_model_audit(info: ModelInfo, agent: LLMAgent, llm_logger: LLMLogger) -> dict[str, Any]:
+    """Summarize per-call model identity and parse-correction audit data for Phase 3."""
+    response_models: list[str] = []
+    call_matches: list[str] = []
+    for entry in llm_logger.entries:
+        returned = entry.get("response_model")
+        if returned and returned not in response_models:
+            response_models.append(returned)
+        call_matches.append(_model_match(info.model_id, returned))
+
+    if not call_matches or "unknown" in call_matches:
+        model_match = "unknown"
+    elif "mismatch" in call_matches:
+        model_match = "mismatch"
+    elif "alias" in call_matches:
+        model_match = "alias"
+    else:
+        model_match = "match"
+
+    negotiation_corrections = agent.negotiation_correction_count
+    commit_corrections = agent.commit_correction_count
+    return {
+        "requested_model": info.model_id,
+        # A scalar is unambiguous only when every returned model name agrees.
+        "response_model": response_models[0] if len(response_models) == 1 else None,
+        "response_models": response_models,
+        "model_match": model_match,
+        "logical_calls": agent.total_calls,
+        "negotiation_corrections": negotiation_corrections,
+        "commit_corrections": commit_corrections,
+        "parse_corrections_total": negotiation_corrections + commit_corrections,
+    }
+
+
 def _run_one_phase3_game(key: str, info: ModelInfo, run_dir: Path, seed: int,
                           max_calls: int, max_cost_per_model: float, max_tokens: int) -> dict[str, Any]:
     model_dir = run_dir / "phase3" / key
     model_dir.mkdir(parents=True, exist_ok=True)
     llm_logger = LLMLogger(model_dir / "llm_logs", game_id=f"{key}_P01")
-    raw_adapter = create_adapter(info)
+    # Phase 3 matrix runs are strict experiments: a logical call is allowed one
+    # transport send only.  Keep this isolated from Phase 1/2 and normal games.
+    raw_adapter = create_adapter(info, max_retries=0, allow_temperature_fallback=False)
     budgeted = BudgetedAdapter(raw_adapter, info, max_calls=max_calls,
                                 max_cost=max_cost_per_model, max_tokens_cap=max_tokens)
     config = build_phase3_config()
@@ -844,7 +880,7 @@ def _run_one_phase3_game(key: str, info: ModelInfo, run_dir: Path, seed: int,
     return {
         "error": error, "elapsed_ms": elapsed_ms,
         "calls_made": budgeted.calls_made, "cost_usd": round(budgeted.spent_usd, 6),
-        **verdict,
+        **verdict, **_phase3_model_audit(info, agent, llm_logger),
     }
 
 
@@ -906,6 +942,12 @@ def run_phase3(run_dir: Path, state: dict[str, Any], keys: list[str],
             "status": status, "elapsed_ms": r["elapsed_ms"], "cost_usd": r["cost_usd"],
             "auto_commit_count": r["auto_commit_count"], "valid_json_count": r["valid_json_count"],
             "error": r["error"],
+            "requested_model": r["requested_model"], "response_model": r["response_model"],
+            "response_models": r["response_models"], "model_match": r["model_match"],
+            "logical_calls": r["logical_calls"],
+            "negotiation_corrections": r["negotiation_corrections"],
+            "commit_corrections": r["commit_corrections"],
+            "parse_corrections_total": r["parse_corrections_total"],
         }
         _save_state(run_dir, state)
         print(f"{status} ({r['elapsed_ms']}ms) ${r['cost_usd']:.4f} | "
@@ -922,15 +964,18 @@ def run_phase3(run_dir: Path, state: dict[str, Any], keys: list[str],
 
 def _generate_phase3_report(run_dir: Path, state: dict[str, Any]) -> None:
     lines = ["# Phase 3 ミニゲーム統合レポート\n"]
-    lines.append("| key | provider | model | 状態 | elapsed | cost | auto_commit | valid_json | 備考 |")
-    lines.append("|---|---|---|---|---|---|---|---|---|")
+    lines.append("| key | provider | model | returned | match | 状態 | elapsed | cost | calls | corrections | auto_commit | valid_json | 備考 |")
+    lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for key, m in sorted(state["models"].items(), key=lambda kv: kv[1]["order"]):
         p3 = m.get("phase3", {})
         status = p3.get("status", "pending")
         elapsed = f"{p3.get('elapsed_ms', 0)}ms" if p3.get("elapsed_ms") else "—"
         cost = f"${p3.get('cost_usd', 0):.4f}" if p3.get("cost_usd") else "—"
         note = (p3.get("error") or "")[:80] if p3.get("error") else ""
-        lines.append(f"| {key} | {m['provider']} | {m['model_id']} | {status} | {elapsed} | {cost} | "
+        returned = p3.get("response_model") or ", ".join(p3.get("response_models", [])) or "—"
+        corrections = p3.get("parse_corrections_total", "")
+        lines.append(f"| {key} | {m['provider']} | {m['model_id']} | {returned} | {p3.get('model_match', '—')} | "
+                     f"{status} | {elapsed} | {cost} | {p3.get('logical_calls', '')} | {corrections} | "
                      f"{p3.get('auto_commit_count', '')} | {p3.get('valid_json_count', '')} | {note} |")
     (run_dir / "phase3_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 

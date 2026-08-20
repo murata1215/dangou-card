@@ -1049,6 +1049,54 @@ def test_phase3_runs_end_to_end_with_fake_adapter_and_saves_logs(tmp_path, monke
     assert result["calls_made"] <= 20
 
 
+def test_phase3_uses_strict_adapter_and_records_model_audit_and_corrections(tmp_path, monkeypatch):
+    """Phase 3だけがstrict transport設定とモデル/parse監査を持つこと。"""
+    captured: dict[str, object] = {}
+
+    class Adapter:
+        def __init__(self, info):
+            self.info = info
+            self.negotiation_calls = 0
+
+        def complete(self, system, messages, max_tokens=1000, temperature=0.7, **kwargs):
+            user = messages[0]["content"]
+            if user.startswith("ゲーム開始前です"):
+                text = '{"action":{"type":"choose_loan","amount":3000000}}'
+            elif user.startswith("=== ラウンド1 / コミットフェイズ"):
+                text = '{"action":{"type":"market_commit","market_id":"M01","card":"HIGH_CARD"}}'
+            else:
+                self.negotiation_calls += 1
+                text = "{}" if self.negotiation_calls == 1 else '{"action":{"type":"pass"}}'
+            return text, {
+                "input_tokens": 10, "output_tokens": 5, "total_tokens": 15,
+                "finish_reason": "stop", "response_model": self.info.model_id,
+            }
+
+    def factory(info, **kwargs):
+        captured.update(kwargs)
+        return Adapter(info)
+
+    monkeypatch.setattr(mm, "create_adapter", factory)
+    result = mm._run_one_phase3_game("L1", MODEL_REGISTRY["L1"], tmp_path, seed=1,
+                                      max_calls=20, max_cost_per_model=1.0, max_tokens=500)
+
+    assert captured == {"max_retries": 0, "allow_temperature_fallback": False}
+    assert result["requested_model"] == MODEL_REGISTRY["L1"].model_id
+    assert result["response_model"] == MODEL_REGISTRY["L1"].model_id
+    assert result["response_models"] == [MODEL_REGISTRY["L1"].model_id]
+    assert result["model_match"] == "match"
+    assert result["logical_calls"] == 4  # loan + invalid negotiation + correction + commit
+    assert result["negotiation_corrections"] == 1
+    assert result["commit_corrections"] == 0
+    assert result["parse_corrections_total"] == 1
+
+    llm_log = next((tmp_path / "phase3" / "L1" / "llm_logs").glob("*.jsonl"))
+    entries = [json.loads(line) for line in llm_log.read_text(encoding="utf-8").splitlines()]
+    assert len(entries) == result["logical_calls"]
+    assert all(entry["response_model"] == MODEL_REGISTRY["L1"].model_id for entry in entries)
+    assert all("finish_reason" in entry and "usage_raw" in entry for entry in entries)
+
+
 def test_phase3_saves_logs_even_when_game_raises(tmp_path, monkeypatch):
     monkeypatch.setattr(mm, "create_adapter", _fake_create_adapter_factory(_FakeOkAdapter))
 
@@ -1116,6 +1164,11 @@ def test_phase3_records_cost_to_state_jsonl_and_report(tmp_path, monkeypatch):
     assert state["budget"]["spent_usd"] == pytest.approx(cost, abs=1e-9)
     line = json.loads((run_dir / "phase3_calls.jsonl").read_text(encoding="utf-8").strip().splitlines()[0])
     assert line["cost_usd"] == pytest.approx(cost, abs=1e-9)
+    for key in ("requested_model", "response_model", "response_models", "model_match",
+                "logical_calls", "negotiation_corrections", "commit_corrections",
+                "parse_corrections_total"):
+        assert key in line
+        assert key in state["models"]["M3"]["phase3"]
     report_text = (run_dir / "phase3_report.md").read_text(encoding="utf-8")
     assert f"${cost:.4f}" in report_text
 

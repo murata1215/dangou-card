@@ -1577,6 +1577,52 @@ class TestSingleHttpRequestGuarantee:
 
         return FakeClient()
 
+    def test_openai_compat_strict_mode_passes_zero_to_sdk(self, monkeypatch):
+        """OpenAI互換SDK（Google/xAI/Moonshot/DeepSeekを含む）もretry=0を受け取る。"""
+        import sys
+        import types
+        from llm.adapters import OpenAICompatAdapter
+
+        captured = {}
+
+        class FakeOpenAI:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=FakeOpenAI))
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "fake-key")
+        adapter = OpenAICompatAdapter(self._default_model_info(), max_retries=0,
+                                      allow_temperature_fallback=False)
+        adapter._get_client()
+
+        assert captured["max_retries"] == 0
+        assert adapter._allow_temperature_fallback is False
+
+    def test_anthropic_strict_mode_passes_zero_to_sdk(self, monkeypatch):
+        """Anthropic SDKにもstrict経路のmax_retries=0が明示される。"""
+        import sys
+        import types
+        from llm.adapters import AnthropicAdapter
+
+        captured = {}
+
+        class FakeAnthropic:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        monkeypatch.setitem(sys.modules, "anthropic", types.SimpleNamespace(Anthropic=FakeAnthropic))
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
+        info = ModelInfo(
+            model_id="claude-haiku-4-5-20251001", provider="Anthropic", name="Haiku",
+            adapter_type="anthropic", input_price=1.0, output_price=5.0,
+            env_key="ANTHROPIC_API_KEY", base_url=None,
+        )
+        adapter = AnthropicAdapter(info, max_retries=0, allow_temperature_fallback=False)
+        adapter._get_client()
+
+        assert captured["max_retries"] == 0
+        assert adapter._allow_temperature_fallback is False
+
     @pytest.mark.parametrize("error_message", [
         "400 Bad Request: Unsupported parameter",
         "429 Too Many Requests",

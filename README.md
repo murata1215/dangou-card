@@ -129,6 +129,12 @@ M3（Gemini 3.5 Flash）は`reasoning_effort="minimal"`・512 tokens、H3（Gemi
 912 tokensでcanonical schemaを維持する。Geminiの`reasoning_effort`と`thinking_level`/`thinking_budget`は併送しない。
 M3/H3の予約を同時に確保するとこのrunのtotal capを超えるため、M3の結果・実費を確認してからH3を別承認で実行する。
 
+Phase 3のミニゲーム統合もstrict実行である。matrix経路に限りadapter/SDK retryとtemperature互換
+フォールバックを無効化するため、loan・negotiation・commitの各logical callは最大1 transport sendとなる。
+JSON parse correctionは意図した別logical callとして最大7 call/modelまで許容する。モデル単位の
+`phase3_calls.jsonl` 集計にはrequested/response model、model match、logical calls、negotiation/commit
+correction数を追加し、raw response・usage・finish reason・latency・costは従来どおり個別LLMログに保存する。
+
 コスト計算は全フェーズで実測usageベースの `_usage_cost()` に統一されており、Geminiのhidden
 thinking・xAI等のキャッシュ割引・Anthropicのusage慣習差を正しく反映する。詳細は `rules/project.md`
 の該当節を参照。
