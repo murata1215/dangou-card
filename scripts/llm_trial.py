@@ -17,6 +17,7 @@ import json
 import os
 import sys
 import time
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -46,6 +47,78 @@ PHASE_C_ROSTER = ["M1", "L1", "M2", "L2", "M3", "M4", "M5", "M6"]
 # Season 2 決勝編成ロスター: 6社18モデル（強6+中6+軽6）。
 # scripts/model_matrix.py の18モデル疎通テスト基盤が対象とするフルロスター。
 SEASON2_ROSTER_18 = [f"{t}{i}" for t in ("H", "M", "L") for i in range(1, 7)]
+
+
+def effective_trial_model(model_key: str, max_output_tokens: int | None) -> ModelInfo:
+    """試験だけに適用する出力上限を持つModelInfoコピーを返す。
+
+    MODEL_REGISTRYは全試験・通常運用で共有されるため、L6 R12の比較条件を
+    registryへ恒久反映してはいけない。この関数で作るcopyだけをadapter、
+    事前予約、LLMLoggerに渡すことで、実送信とコストガードの上限を一致させる。
+
+    Args:
+        model_key: MODEL_REGISTRYのキー。
+        max_output_tokens: 試験限定の出力上限。Noneならregistry既定を維持する。
+
+    Returns:
+        実行時だけ使うModelInfo。registryの元オブジェクトは変更しない。
+    """
+    model = get_model(model_key)
+    if max_output_tokens is None:
+        return model
+    return replace(model, max_tokens=max_output_tokens)
+
+
+def build_trial_manifest(
+    roster_keys: list[str], config: GameConfig, seed: int,
+    max_output_tokens: int | None, abort_on_budget_block: bool,
+    stop_after_round: int | None = None,
+) -> dict[str, Any]:
+    """AFTER比較に必要な、秘密情報を含まない実効設定を固定する。
+
+    Args:
+        roster_keys: CLIで指定されたロスター順。
+        config: S1/S2 presetから構築した実効ゲーム設定。
+        seed: 再現用のベースseed。
+        max_output_tokens: runtime override。Noneならregistry既定。
+        abort_on_budget_block: 予算block時に試合を中断するか。
+
+    Returns:
+        JSONへそのまま保存できる公開設定の辞書。
+    """
+    models = []
+    for key in roster_keys:
+        model = effective_trial_model(key, max_output_tokens)
+        models.append({
+            "key": key,
+            "model_id": model.model_id,
+            "provider": model.provider,
+            "adapter_type": model.adapter_type,
+            "base_url": model.base_url,
+            "timeout_seconds": model.timeout_seconds,
+            "effective_max_output_tokens": model.max_tokens,
+            "thinking": (model.extra_params or {}).get("thinking"),
+            "hidden_thinking_reserve_tokens": model.hidden_thinking_reserve_tokens,
+            "input_price_usd_per_million": model.input_price,
+            "output_price_usd_per_million": model.output_price,
+            "cached_input_price_usd_per_million": model.cached_input_price,
+        })
+    return {
+        "seed": seed,
+        "roster_keys": roster_keys,
+        "num_players": config.num_players,
+        "num_rounds": config.num_rounds,
+        "ruleset": "S2" if config.surge_enabled else "S1",
+        "enable_cot": config.enable_cot,
+        "negotiation_max_turns": config.negotiation_max_turns,
+        "per_player_game_cost_cap_usd": config.per_player_game_cost_cap_usd,
+        "game_cost_cap_usd": config.game_cost_cap_usd,
+        "abort_on_budget_block": abort_on_budget_block,
+        "stop_after_round": stop_after_round,
+        "prize_tiers": config.prize_tiers,
+        "final_market_multiplier": config.final_market_multiplier,
+        "models": models,
+    }
 
 
 def run_trial_game(
@@ -256,6 +329,9 @@ def run_trial_game_c(
     config: GameConfig,
     output_dir: Path,
     seed: int = 42,
+    max_output_tokens: int | None = None,
+    abort_on_budget_block: bool = False,
+    stop_after_round: int | None = None,
 ) -> tuple[GameResult, list[LLMAgent], EventLogger, dict[str, str]]:
     """
     Phase C: 全LLM戦の1試合を実行する
@@ -276,7 +352,9 @@ def run_trial_game_c(
 
     for i, model_key in enumerate(shuffled_keys):
         pid = f"P{i + 1:02d}"
-        model_info = get_model(model_key)
+        # runtime overrideはこの試験用copyだけへ適用する。MODEL_REGISTRYを
+        # 変更せず、adapter送信値とworst_case_costの予約値を揃える。
+        model_info = effective_trial_model(model_key, max_output_tokens)
         adapter = create_adapter(model_info)
         llm_logger = LLMLogger(
             output_dir / "llm_logs",
@@ -293,8 +371,12 @@ def run_trial_game_c(
     event_logger = EventLogger(output_path=event_path)
     budget = GameCostBudget(
         config.per_player_game_cost_cap_usd, config.game_cost_cap_usd, event_logger,
+        abort_on_block=abort_on_budget_block,
     )
-    game = Game(config=config, agents=agents, seed=game_seed, logger=event_logger, cost_budget=budget)
+    game = Game(
+        config=config, agents=agents, seed=game_seed, logger=event_logger,
+        cost_budget=budget, stop_after_round=stop_after_round,
+    )
 
     # 本戦の予算制御はGameCostBudgetがcall前に実施する。
     result = game.run()
@@ -320,6 +402,7 @@ def generate_phase_c_report(
     config: GameConfig,
     elapsed: float,
     output_path: Path,
+    stop_after_round: int | None = None,
 ) -> None:
     """Phase Cレポートを生成する"""
     lines: list[str] = []
@@ -328,6 +411,11 @@ def generate_phase_c_report(
     lines.append(f"- 設定: RULESET_BASELINE_V1 ({config.num_rounds}R, survival={config.survival_cash // 10_000}万)")
     lines.append(f"- 試合数: {len(results)}")
     lines.append(f"- 実行時間: {elapsed:.1f}秒")
+    if stop_after_round is not None:
+        lines.append(
+            f"- 段階停止: R{stop_after_round}のReflection・ROUND_COMPLETE後に停止 "
+            "（R12完走結果ではない）"
+        )
     lines.append("")
 
     total_cost = 0.0
@@ -996,6 +1084,12 @@ def main() -> None:
                         help="本戦1 playerあたりのLLMコスト上限USD（GameConfigを上書き）")
     parser.add_argument("--game-cost-cap", type=float, default=None,
                         help="本戦1試合のLLM合計コスト上限USD（GameConfigを上書き）")
+    parser.add_argument("--max-output-tokens", type=int, default=None,
+                        help="Phase C試験だけの全席出力token上限（registryは変更しない）")
+    parser.add_argument("--abort-on-budget-block", action="store_true", default=False,
+                        help="Phase C試験で最初の予算block時にGAME_ABORTEDを記録して中断する")
+    parser.add_argument("--stop-after-round", type=int, default=None,
+                        help="Phase C試験で通常R完了後に停止（num_roundsは変更しない）")
     args = parser.parse_args()
 
     # 修正8: レポート再生成モード
@@ -1009,6 +1103,10 @@ def main() -> None:
 
     if not args.phase:
         parser.error("--phase A, B or C is required (unless --regenerate-report)")
+    if args.max_output_tokens is not None and args.max_output_tokens <= 0:
+        parser.error("--max-output-tokens は正の整数で指定してください")
+    if args.phase != "C" and (args.max_output_tokens is not None or args.abort_on_budget_block):
+        parser.error("--max-output-tokens と --abort-on-budget-block は Phase C 専用です")
 
     # Phase C ロスター決定（--roster指定 or デフォルト）
     phase_c_roster = args.roster.split(",") if args.roster else PHASE_C_ROSTER
@@ -1019,6 +1117,14 @@ def main() -> None:
         config = GameConfig.baseline_v1_s2(num_players=num_players)
     else:
         config = GameConfig.baseline_v1(num_players=num_players)
+
+    if args.stop_after_round is not None:
+        if args.phase != "C":
+            parser.error("--stop-after-round は Phase C 専用です")
+        if args.rounds is not None or args.preset is not None:
+            parser.error("--stop-after-round は --rounds / --preset と併用できません（S2の12R設定を維持してください）")
+        if args.stop_after_round < 1 or args.stop_after_round >= config.num_rounds:
+            parser.error("--stop-after-round は 1 以上かつ設定ラウンド数未満で指定してください")
 
     # 修正5: presetの適用
     if args.preset == "dev":
@@ -1062,6 +1168,18 @@ def main() -> None:
     output_dir = Path(f"logs/llm/trial_{args.phase}_{timestamp}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # 実行後にregistry既定値とruntime overrideを取り違えないよう、APIキー等を
+    # 含めない公開設定を試合開始前に固定する。異常終了時もpreflight記録として残る。
+    if args.phase == "C":
+        manifest = build_trial_manifest(
+            phase_c_roster, config, args.seed, args.max_output_tokens,
+            args.abort_on_budget_block, args.stop_after_round,
+        )
+        (output_dir / "trial_manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
     if args.phase == "A":
         num_games = games_override or 1
         llm_count = 1
@@ -1079,6 +1197,12 @@ def main() -> None:
 
     print(f"試合数: {num_games}, {config.num_rounds}R, 交渉{config.negotiation_max_turns}巡")
     print(f"コスト上限: player ${config.per_player_game_cost_cap_usd:.2f}, 全体 ${config.game_cost_cap_usd:.2f}")
+    if args.phase == "C" and args.max_output_tokens is not None:
+        print(f"試験runtime output上限: 全席 {args.max_output_tokens} tokens (registry不変)")
+    if args.phase == "C" and args.abort_on_budget_block:
+        print("予算block: 最初のblockで試合中断")
+    if args.phase == "C" and args.stop_after_round is not None:
+        print(f"段階停止: R{args.stop_after_round}のReflection・ROUND_COMPLETE後")
     print(f"出力: {output_dir}")
     print("---")
 
@@ -1092,6 +1216,9 @@ def main() -> None:
             try:
                 result, llm_agents, event_logger, seat_map = run_trial_game_c(
                     phase_c_roster, i, config, output_dir, args.seed,
+                    max_output_tokens=args.max_output_tokens,
+                    abort_on_budget_block=args.abort_on_budget_block,
+                    stop_after_round=args.stop_after_round,
                 )
                 all_results_c.append((result, llm_agents, event_logger, seat_map))
                 # 進捗表示
@@ -1115,7 +1242,10 @@ def main() -> None:
 
         elapsed = time.time() - start
         report_path = output_dir / "trial_C_report.md"
-        generate_phase_c_report(all_results_c, config, elapsed, report_path)
+        generate_phase_c_report(
+            all_results_c, config, elapsed, report_path,
+            stop_after_round=args.stop_after_round,
+        )
     else:
         # Phase A/B
         all_results: list[tuple[GameResult, list[LLMAgent], EventLogger]] = []

@@ -119,3 +119,13 @@ Stage 1 で捕捉したトークン内訳（cached/reasoning/total）を活用�
 - 2026-08-20 10:56 JST | サイクルJ: M3/H3 Phase 2 reasoning budget tuning: M3をminimal、H3を912 tokensへ局所調整、外部API未実行、全723件PASS → 2026-08-20_105619.md
 - 2026-08-20 20:05 JST | サイクルK: Phase 3 runtime overrides: H1 effort/H4 timeoutのPhase 3限定overrideと実効監査値を追加、外部API未実行、全732件PASS → 2026-08-20_200521.md
 - 2026-08-20 21:34 JST | サイクルL: APIコスト検証の固定記録: Phase 3最終値・再試験・Console提供値・R12実績を区分して固定、外部API未実行 → 2026-08-20_213407.md
+- 2026-08-20_221353 | サイクルM | L1〜L6 R12実戦試験の安全実行基盤 | 2,000-token runtime override・budget中断・BEFORE/AFTER集計を追加
+- 2026-08-21_054417 | Viewer | プレイヤー詳細ラウンド表示 | Handover Memory・全文reasoning・Native Thinking・既存生ログ2タブを追加
+- 2026-08-21_071208 | Trial | L1〜L6 R1〜R3段階停止 | S2の12R設定を維持し、R3 Reflection後に安全停止するPhase C試験基盤を追加
+- 2026-08-21_074201 | Trial | L1〜L6 Phase C R1〜R3 実API | 209 calls・$0.8492、R3正常停止。round-detailの実ログparticipants型不整合を記録
+- 2026-08-21_075548 | Viewer | round-detail participants型互換 | 実ログの整数participantsをcommit市場IDで安全に関連付け、R1〜R3実trial回帰を追加
+- 2026-08-21_093829 | Viewer | 運用マニュアル | user systemd再起動・9023疎通・Caddy切り分けを正本化し、旧nohup／9025手順を履歴化
+- 2026-08-21_095602 | Viewer | 公開service再起動 | systemd user serviceを再起動し、R1〜R3 round-detail全18件と既存APIのHTTP 200を確認
+- 2026-08-21_172340 | Viewer | 神視点の運用有効化 | repo外tokenをuser systemdへ注入し、public/god認可・36件詳細・既存APIを確認
+- 2026-08-21_233205 | Docs | Viewer神視点の運用記録とコミット準備 | public/god境界とtoken非記録運用を正本へ反映
+- 2026-08-21_130233 | Viewer | 神視点モード | public秘匿修正、追加トークン認可、公開／秘匿の構造化表示を追加

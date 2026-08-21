@@ -70,6 +70,14 @@ DM（`type == "dm"`）は送信者・宛先以外に対し **`message` キー自
 こと。匿名通信（`anonymous_broadcast`）は本文は全員に公開するが `sender: None` で掲載者のみ秘匿する（§8.2）。
 担保テスト: `tests/test_dm_secrecy.py`（`TestFullScanNoLeak` が全プレイヤー横断の漏洩スキャンを行う）。
 
+## Viewerの公開表示と神視点を分離する
+
+Viewer APIは既定で`view=public`とし、DM本文・宛先、匿名発言の実発信者、契約条項・義務、sensitive action由来のreasoning previewを返してはならない。`get_player_timeline()`、`get_round_states()`、`get_player_round_detail()`のいずれも同じ公開境界を使うこと。公開表示の構造化itemには`visibility: "public"`と表示ラベルを付け、UI側の推測だけで秘匿性を判断しない。
+
+ゲーム内の秘匿情報を確認する必要がある場合だけ`view=god`を使用できる。God viewは`VIEWER_GOD_TOKEN`と`X-Viewer-God-Token`の一致を必須とし、未設定・不一致は403にする。tokenはrepo外の権限制限されたEnvironmentFileからuser systemdへ注入し、URL、ブラウザ永続領域、git、ログ、devlogへ値を残さない。God viewで返せるのは構造化済みのゲーム情報（DM、匿名発言の実発信者、契約と履行記録）だけであり、system prompt、user prompt、`response_text`、APIキー、認証情報、ゲーム外の運用情報は返さない。
+
+神視点UIでは`visibility: "secret"`を受けたカードに、色だけでなく`🔒`等のアイコンと文字ラベルを常に表示する。公開カードも`🌐`等のラベルを持たせる。自由記述のreasoning／Handover Memoryがモデル自身によって秘匿内容を引用する意味論的漏洩は別リスクなので、公開viewでsensitive actionに紐付くpreviewを返さず、新たな可視化経路を追加するときは同じ境界を回帰テストで確認する。
+
 ## LLMコストは常に `_usage_cost(model, usage)` 経由で算出する（`estimate_cost()` を直接input/outputだけで呼ばない）
 
 `llm/models.py` の `estimate_cost(model, input_tokens, output_tokens, cache_read_input_tokens=0,

@@ -98,6 +98,7 @@ class LLMAgent(PlayerAgent):
         round_num: int,
         user_prompt: str,
         turn: int | None = None,
+        retry_count: int = 0,
     ) -> tuple[str, dict[str, int]]:
         """
         LLM APIを呼び出し、レスポンスとusageを返す
@@ -174,6 +175,7 @@ class LLMAgent(PlayerAgent):
             finish_reason=finish_reason,
             unit_price_input=self.model_info.input_price,
             unit_price_output=self.model_info.output_price,
+            retry_count=retry_count,
         )
 
         self.total_calls += 1
@@ -246,6 +248,7 @@ class LLMAgent(PlayerAgent):
             try:
                 text, usage = self._call_llm(
                     "negotiation", round_num, messages_so_far, turn=turn,
+                    retry_count=retry,
                 )
             except BudgetBlockedError:
                 return PassAction(player_id=self.player_id)
@@ -308,7 +311,7 @@ class LLMAgent(PlayerAgent):
         original_prompt = user_prompt
         for retry in range(MAX_RETRIES + 1):
             try:
-                text, usage = self._call_llm("commit", round_num, user_prompt)
+                text, usage = self._call_llm("commit", round_num, user_prompt, retry_count=retry)
             except BudgetBlockedError:
                 self.auto_commit_count += 1
                 raise

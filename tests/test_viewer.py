@@ -13,7 +13,7 @@ import pytest
 from viewer.log_parser import (
     LogCache, list_games, get_game_state, get_player_timeline,
     _extract_strategy, _extract_action, _extract_emotion,
-    get_commentary, get_round_states,
+    get_commentary, get_round_states, get_player_round_detail,
 )
 
 
@@ -164,6 +164,180 @@ class TestGetRoundStates:
             assert len(hand) <= 12
 
 
+class TestPlayerRoundDetail:
+    """ラウンド詳細はMemoryを復元しつつ生応答を公開しない。"""
+
+    def _make_trial(self, tmp_path: Path, participants: list[str] | int = None) -> Path:
+        trial = tmp_path / "trial_memory"
+        logs = trial / "llm_logs"
+        logs.mkdir(parents=True)
+        if participants is None:
+            participants = ["P01"]
+        entries = [
+            {
+                "player_id": "P01", "model_id": "test-model", "phase": "negotiation",
+                "round_num": 1, "turn": 1, "response_text": json.dumps({
+                    "reasoning": "R1の全文reasoning", "strategy": {},
+                    "action": {"type": "broadcast", "message": "公開発言"},
+                }, ensure_ascii=False), "reasoning": "R1の全文reasoning",
+                "reasoning_tokens": 42, "input_tokens": 10, "output_tokens": 20,
+                "cost_usd": 0.01, "elapsed_ms": 12, "retry_count": 0,
+            },
+            {
+                "player_id": "P01", "model_id": "test-model", "phase": "reflection",
+                "round_num": 1, "turn": None,
+                "response_text": '{"memory":"R1終了後の記憶"}', "reasoning_tokens": 0,
+            },
+            {
+                "player_id": "P01", "model_id": "test-model", "phase": "negotiation",
+                "round_num": 2, "turn": 1, "response_text": json.dumps({
+                    "reasoning": "DM本文をここに書かない前提のreasoning",
+                    "action": {"type": "dm", "to": "P02", "message": "秘密のDM本文"},
+                }, ensure_ascii=False), "reasoning": "DM本文をここに書かない前提のreasoning",
+                "reasoning_tokens": 0,
+            },
+            {
+                "player_id": "P01", "model_id": "test-model", "phase": "negotiation",
+                "round_num": 2, "turn": 2, "response_text": json.dumps({
+                    "reasoning": "匿名発言のreasoning", "action": {"type": "anonymous_broadcast", "message": "匿名の公開発言"},
+                }, ensure_ascii=False),
+            },
+            {
+                "player_id": "P01", "model_id": "test-model", "phase": "negotiation",
+                "round_num": 2, "turn": 3, "response_text": json.dumps({
+                    "reasoning": "契約条項のreasoning", "action": {"type": "contract_propose", "terms": [{"ob_type": "type_b_market", "market_id": "M01"}]},
+                }, ensure_ascii=False),
+            },
+        ]
+        (logs / "game01_P01_llm_calls.jsonl").write_text(
+            "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in entries), encoding="utf-8",
+        )
+        events = [
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "data": {"player_id": "P01"}},
+            {"event_type": "MARKET_OPEN", "round_num": 1, "data": {"markets": [{"market_id": "M01", "base_prize": 1, "carryover": 0, "prize_pool": 1}]}},
+            {"event_type": "REVEAL", "round_num": 1, "data": {"commits": [{"player_id": "P01", "market_id": "M01", "card": "HIGH_CARD_1", "rank": 1}]}},
+            {"event_type": "MARKET_RESULT", "round_num": 1, "data": {"market_id": "M01", "participants": participants, "winners": ["P01"], "prize_per_winner": 1, "total_pool": 1}},
+            {"event_type": "NEGOTIATION_ACTION", "round_num": 2, "data": {"action": "contract_propose", "contract_id": "C01", "player_id": "P01", "parties": ["P01", "P02"]}},
+            {"event_type": "NEGOTIATION_ACTION", "round_num": 2, "data": {"action": "contract_sign", "contract_id": "C01", "player_id": "P02"}},
+            {"event_type": "TYPE_B_VIOLATION", "round_num": 2, "data": {"contract_id": "C01", "player_id": "P01", "obligation_id": "C01_OB01"}},
+        ]
+        (trial / "game01_events.jsonl").write_text(
+            "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in events), encoding="utf-8",
+        )
+        (trial / "game01_seat_map.json").write_text('{"P01":"L1"}', encoding="utf-8")
+        return tmp_path
+
+    def test_memory_reasoning_and_safe_actions(self, tmp_path):
+        logs_dir = self._make_trial(tmp_path)
+        r1 = get_player_round_detail(logs_dir, "trial_memory", "game01", "P01", 1)
+        assert r1["memory"]["start"]["status"] == "absent"
+        assert r1["memory"]["end"] == {"text": "R1終了後の記憶", "source_round": 1, "status": "updated"}
+        assert r1["calls"][0]["reasoning"] == "R1の全文reasoning"
+        assert r1["calls"][0]["native_thinking"]["tokens"] == 42
+        assert r1["calls"][0]["action"] == {
+            "type": "broadcast", "content": "公開発言", "visibility": "public",
+            "display": {"icon": "🌐", "label": "公開発言"},
+        }
+
+        r2 = get_player_round_detail(logs_dir, "trial_memory", "game01", "P01", 2)
+        assert r2["memory"]["start"]["text"] == "R1終了後の記憶"
+        assert r2["calls"][0]["action"] == {
+            "type": "dm", "label": "DM送信（本文・宛先は非公開）", "visibility": "secret",
+            "display": {"icon": "🔒", "label": "秘匿DM"},
+        }
+        assert "秘密のDM本文" not in json.dumps(r2, ensure_ascii=False)
+        assert r2["calls"][0]["action"].get("to") is None
+
+    def test_final_round_has_no_end_reflection(self, tmp_path):
+        logs_dir = self._make_trial(tmp_path)
+        r12 = get_player_round_detail(logs_dir, "trial_memory", "game01", "P01", 12)
+        assert r12["memory"]["end"]["status"] == "no_reflection_final_round"
+
+    def test_public_redacts_and_god_returns_structured_game_secrets(self, tmp_path):
+        logs_dir = self._make_trial(tmp_path)
+        public = get_player_round_detail(logs_dir, "trial_memory", "game01", "P01", 2)
+        serialized_public = json.dumps(public, ensure_ascii=False)
+        assert "秘密のDM本文" not in serialized_public
+        assert "匿名の公開発言" not in serialized_public
+        assert "type_b_market" not in serialized_public
+        assert public["calls"][0]["action"]["visibility"] == "secret"
+        assert public["calls"][0]["action"]["display"] == {"icon": "🔒", "label": "秘匿DM"}
+        assert public["calls"][0]["reasoning"] is None
+
+        god = get_player_round_detail(logs_dir, "trial_memory", "game01", "P01", 2, view="god")
+        serialized_god = json.dumps(god, ensure_ascii=False)
+        assert "秘密のDM本文" in serialized_god
+        assert "匿名の公開発言" in serialized_god
+        assert "type_b_market" in serialized_god
+        assert god["calls"][0]["action"]["to"] == "P02"
+        assert god["calls"][0]["action"]["sender"] == "P01"
+        assert god["calls"][1]["action"]["display"]["label"] == "匿名発言"
+        assert god["secret_events"]["contracts"][0]["display"]["label"] == "秘匿契約"
+
+    def test_public_rounds_and_timeline_do_not_leak_dm_or_terms(self, tmp_path):
+        logs_dir = self._make_trial(tmp_path)
+        public = get_round_states(logs_dir, "trial_memory", "game01")
+        timeline = get_player_timeline(logs_dir, "trial_memory", "game01", "P01")
+        public_text = json.dumps({"rounds": public, "timeline": timeline}, ensure_ascii=False)
+        assert "秘密のDM本文" not in public_text
+        assert "type_b_market" not in public_text
+        assert any(m["visibility"] == "secret" for m in public["rounds"]["2"]["messages"])
+
+    def test_integer_market_participants_uses_commit_for_player_membership(self, tmp_path):
+        """実ログ形式の参加人数(int)でもround-detailを再構成できる。"""
+        logs_dir = self._make_trial(tmp_path, participants=1)
+        detail = get_player_round_detail(logs_dir, "trial_memory", "game01", "P01", 1)
+
+        assert detail["result"]["markets"] == [{
+            "market_id": "M01", "participants": 1, "winners": ["P01"],
+            "prize_per_winner": 1, "total_pool": 1, "surged": False,
+        }]
+
+    def test_current_api_trial_round_details_reconstruct(self):
+        """R1〜R3実APIログの人数型でも全席の詳細を再構成できる。"""
+        logs_dir = Path(__file__).resolve().parent.parent / "logs" / "llm"
+        trial_dir = logs_dir / "trial_C_20260821_072321"
+        if not trial_dir.exists():
+            pytest.skip("trial_C_20260821_072321 not found")
+
+        for pid in ("P01", "P02", "P03", "P04", "P05", "P06"):
+            details = [
+                get_player_round_detail(logs_dir, trial_dir.name, "game01", pid, round_num)
+                for round_num in (1, 2, 3)
+            ]
+            assert [detail["round"] for detail in details] == [1, 2, 3]
+            assert all(detail["result"]["available"] for detail in details)
+            assert details[0]["memory"]["end"]["text"] == details[1]["memory"]["start"]["text"]
+            assert details[1]["memory"]["end"]["text"] == details[2]["memory"]["start"]["text"]
+            assert all(isinstance(call["native_thinking"]["tokens"], int) for detail in details for call in detail["calls"])
+
+            god_details = [
+                get_player_round_detail(logs_dir, trial_dir.name, "game01", pid, round_num, view="god")
+                for round_num in (1, 2, 3)
+            ]
+            assert [detail["round"] for detail in god_details] == [1, 2, 3]
+
+    def test_god_view_ui_has_accessible_visibility_markers(self):
+        base = Path(__file__).resolve().parent.parent / "viewer" / "static"
+        html = (base / "index.html").read_text(encoding="utf-8")
+        css = (base / "style.css").read_text(encoding="utf-8")
+        for marker in ("🔒 神視点 ON", "🌐 公開", "🎭 匿名発言", "📜 🔒 秘匿契約", "X-Viewer-God-Token"):
+            assert marker in html
+        for selector in (".visibility-public", ".visibility-secret", ".god-banner"):
+            assert selector in css
+
+    def test_invalid_round_rejected(self, tmp_path):
+        logs_dir = self._make_trial(tmp_path)
+        with pytest.raises(ValueError):
+            get_player_round_detail(logs_dir, "trial_memory", "game01", "P01", 13)
+
+    def test_detail_modal_keeps_raw_timeline_tab(self):
+        html = (Path(__file__).resolve().parent.parent / "viewer" / "static" / "index.html").read_text(encoding="utf-8")
+        assert 'id="detail-tab-round"' in html
+        assert 'id="detail-tab-raw"' in html
+        assert "renderRawTimeline" in html
+
+
 class TestCarryoverDisplay:
     """
     繰越（キャリーオーバー）表示のテスト（2026-08-17）
@@ -291,12 +465,36 @@ class TestTokenAuth:
 
             mock_request = MagicMock()
             mock_request.headers = {}
-            # 例外が発生しないこと（認証なし）
             asyncio.get_event_loop().run_until_complete(
                 check_token(mock_request, token=None)
             )
         finally:
-            import importlib
+            import viewer.server
+            importlib.reload(viewer.server)
+
+    def test_god_view_requires_separate_header_token(self):
+        """神視点はVIEWER_TOKENとは独立した追加トークンを必要とする。"""
+        import asyncio
+        import importlib
+        import os
+        from unittest.mock import MagicMock
+
+        os.environ["VIEWER_GOD_TOKEN"] = "god_test_secret"
+        try:
+            import viewer.server
+            importlib.reload(viewer.server)
+            from viewer.server import check_view
+            request = MagicMock(); request.headers = {}
+            with pytest.raises(Exception) as exc_info:
+                check_view(request, "god")
+            assert exc_info.value.status_code == 403
+            request.headers = {"X-Viewer-God-Token": "god_test_secret"}
+            assert check_view(request, "god") == "god"
+            with pytest.raises(Exception) as invalid:
+                check_view(request, "invalid")
+            assert invalid.value.status_code == 400
+        finally:
+            os.environ.pop("VIEWER_GOD_TOKEN", None)
             import viewer.server
             importlib.reload(viewer.server)
 

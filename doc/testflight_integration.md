@@ -1,5 +1,7 @@
 # TestFlight連携ガイド: 観戦ビューア公開
 
+> **履歴資料**: この文書のnohup／9025設定はsystemd導入前の検討内容を含む。現行公開Viewerの再起動・障害対応には使用せず、[Viewer運用マニュアル](viewer_operations.md)を参照する。
+
 ## アーキテクチャ判定: 案A（uso8m常駐 + Caddy逆プロキシ）を推奨
 
 ### 理由

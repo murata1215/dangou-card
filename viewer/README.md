@@ -2,7 +2,9 @@
 
 進行中/完了済みの試合をブラウザでリアルタイム観戦できるWebビューア。
 
-## 起動
+> **公開Viewerの運用**: `dangou-card-viewer.devrelay.io` は`dangou-viewer.service`（user systemd）で常駐している。再起動・障害対応は[Viewer運用マニュアル](../doc/viewer_operations.md)を正本とし、この文書の手動起動例を公開復旧に使わない。
+
+## 開発用の手動起動
 
 ```bash
 # デフォルト（0.0.0.0:9025）
@@ -15,7 +17,9 @@ VIEWER_PORT=8899 uv run python -m viewer.server
 VIEWER_TOKEN=secret123 uv run python -m viewer.server
 ```
 
-## 常駐起動（公開用）
+## 旧nohup常駐方式（公開運用では使用しない）
+
+以下はsystemd導入前の履歴上の方式である。現行公開Viewerでは`viewer.pid`の作成や`kill $(cat viewer.pid)`を行わず、`systemctl --user`を使う。
 
 ```bash
 # nohup方式
@@ -33,22 +37,7 @@ echo $! > viewer.pid
 
 ## 公開運用（port 9023 — dangou-card-viewer.devrelay.io）
 
-Caddy逆プロキシにより `https://dangou-card-viewer.devrelay.io/` で公開中。
-
-```bash
-# 起動（127.0.0.1限定、Caddy経由で公開）
-cd /home/uso8m/dangou-card
-VIEWER_HOST=127.0.0.1 VIEWER_PORT=9023 uv run python -c "from viewer.server import main; main()" &
-echo $! > viewer.pid
-
-# 停止
-kill $(cat viewer.pid)
-
-# 確認
-curl -s http://127.0.0.1:9023/api/games | python3 -c "import sys,json; print(len(json.loads(sys.stdin.read())), 'games')"
-```
-
-**注意**: サーバー再起動後は手動で再開が必要（systemd/PM2による恒久化は未実装）。
+Caddy逆プロキシにより `https://dangou-card-viewer.devrelay.io/` で公開中。現行の再起動・状態確認・journal・疎通確認は[Viewer運用マニュアル](../doc/viewer_operations.md)を参照。
 
 ## TestFlight設定（参考）
 
@@ -60,8 +49,8 @@ curl -s http://127.0.0.1:9023/api/games | python3 -c "import sys,json; print(len
 ## SSHトンネルでのローカルアクセス
 
 ```bash
-ssh -L 9025:localhost:9025 uso8m@devrelay.io
-# ブラウザで http://localhost:9025 を開く
+ssh -L 9023:localhost:9023 uso8m@devrelay.io
+# ブラウザで http://localhost:9023 を開く
 ```
 
 ## 環境変数

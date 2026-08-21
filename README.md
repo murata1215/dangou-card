@@ -184,7 +184,9 @@ journalctl --user -u dangou-viewer.service -f   # ログ追尾
 
 unit 定義: `~/.config/systemd/user/dangou-viewer.service`（`ExecStart` は `.venv/bin/python -c "from viewer.server import main; main()"`、`VIEWER_HOST=127.0.0.1` / `VIEWER_PORT=9023`）。
 
-詳細は `viewer/README.md` を参照。
+公開Viewerの再起動・障害切り分けは[Viewer運用マニュアル](doc/viewer_operations.md)を参照。開発用の起動方法は`viewer/README.md`を参照。
+
+通常のViewer APIはDM本文・宛先、匿名発言者、契約条項を非公開にする。運用者向けの神視点は、詳細モーダルの「神視点を有効化」で別管理の`VIEWER_GOD_TOKEN`を入力した場合だけ利用できる。tokenの保管・反映・確認手順も[Viewer運用マニュアル](doc/viewer_operations.md)を正とする。
 
 ## プロジェクト構成
 

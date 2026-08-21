@@ -83,6 +83,7 @@ class Game:
         seed: int = 42,
         logger: EventLogger | None = None,
         cost_budget: Any | None = None,
+        stop_after_round: int | None = None,
     ):
         """
         Args:
@@ -96,6 +97,9 @@ class Game:
         self.seed = seed
         self.rng = GameRng(seed)
         self.logger = logger or EventLogger()
+        # Phase C の段階試験だけが指定する、安全な途中停止地点。GameConfigの
+        # num_rounds は変えないため、指定Rは最終Rではなく通常Rとして処理される。
+        self.stop_after_round = stop_after_round
         # 本戦runnerだけが明示注入する。model_matrix等のスモークではNoneのまま。
         self.cost_budget = cost_budget
         if cost_budget is not None:
@@ -142,6 +146,12 @@ class Game:
         """
         self._setup()
 
+        # 通常試合は従来どおりbudget blockを当該agentのfallbackへ委ねる。
+        # 一方、実コストを厳格に止める試験では、setup中の1回目のblock後に
+        # 追加のAPI呼出しを発生させないため、ラウンド開始前に終了する。
+        if self._abort_requested_for_budget():
+            return self._finalize()
+
         for round_num in range(1, self.config.num_rounds + 1):
             self.current_round = round_num
 
@@ -152,12 +162,67 @@ class Game:
 
             self._phase_market_open(round_num)
             self._phase_negotiation(round_num)
+            if self._abort_requested_for_budget():
+                return self._finalize()
             self._phase_commit(round_num)
+            if self._abort_requested_for_budget():
+                return self._finalize()
             self._phase_settlement(round_num)
+            if self._abort_requested_for_budget():
+                return self._finalize()
             self._phase_finance(round_num)
+            if self._abort_requested_for_budget():
+                return self._finalize()
             self._phase_reflection(round_num)
+            if self._abort_requested_for_budget():
+                return self._finalize()
+            # AFTER分析で「各ラウンド終了時の生存者数」を推測せず取得できるよう、
+            # すべての通常ゲームで軽量な集計イベントを残す。
+            self._log_round_complete(round_num)
+            if self._stop_requested_after_round(round_num):
+                return self._finalize()
 
         return self._finalize()
+
+    def _abort_requested_for_budget(self) -> bool:
+        """試験限定の予算中断要求を1回だけイベント化する。
+
+        GameCostBudgetは通常の本戦でfallbackを許すため、ここでは
+        ``abort_on_block=True`` を明示したrunnerだけを対象にする。中断しても
+        GAME_ENDを残し、既に逐次保存されたイベント・LLMログをAFTER集計に使える
+        ようにする。
+        """
+        if self.cost_budget is None or not getattr(self.cost_budget, "abort_requested", False):
+            return False
+        if not getattr(self, "_budget_abort_logged", False):
+            first_block = self.cost_budget.blocks[0] if self.cost_budget.blocks else None
+            self.logger.log("GAME_ABORTED", self.current_round, "budget", data={
+                "reason": "llm_budget_blocked",
+                "first_budget_block": first_block,
+            })
+            self._budget_abort_logged = True
+        return True
+
+    def _stop_requested_after_round(self, round_num: int) -> bool:
+        """段階試験の通常R完了後停止を1回だけイベント化する。"""
+        if self.stop_after_round is None or round_num < self.stop_after_round:
+            return False
+        if not getattr(self, "_trial_stop_logged", False):
+            self.logger.log("GAME_STOPPED", round_num, "end", data={
+                "reason": "trial_stop_after_round",
+                "stop_after_round": self.stop_after_round,
+                "completed_round": round_num,
+            })
+            self._trial_stop_logged = True
+        return True
+
+    def _log_round_complete(self, round_num: int) -> None:
+        """Finance後の生存者数を、分析用に1ラウンド1回だけ記録する。"""
+        alive_ids = sorted(pid for pid, player in self.players.items() if player.is_alive)
+        self.logger.log("ROUND_COMPLETE", round_num, "end", data={
+            "alive_count": len(alive_ids),
+            "alive_players": alive_ids,
+        })
 
     def _setup(self) -> None:
         """
@@ -193,6 +258,9 @@ class Game:
                 "player_id": pid,
                 "loan_amount": loan,
             })
+            # 厳格試験では、借入選択でblockした時点で残り席のAPIを呼ばない。
+            if self.cost_budget is not None and getattr(self.cost_budget, "abort_requested", False):
+                break
 
     def _phase_market_open(self, round_num: int) -> None:
         """
@@ -961,6 +1029,12 @@ class Game:
                  "round": p.elimination_round}
                 for p in result.eliminated
             ],
+            "completed": not (
+                getattr(self, "_budget_abort_logged", False)
+                or getattr(self, "_trial_stop_logged", False)
+            ),
+            "abort_reason": "llm_budget_blocked" if getattr(self, "_budget_abort_logged", False) else None,
+            "stop_reason": "trial_stop_after_round" if getattr(self, "_trial_stop_logged", False) else None,
         }
         if self.cost_budget is not None:
             end_data.update(self.cost_budget.snapshot())

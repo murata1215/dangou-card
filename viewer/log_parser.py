@@ -376,7 +376,7 @@ def get_game_state(logs_dir: Path, trial_dir_name: str, game_id: str) -> dict[st
             if pid in loan_by_pid:
                 p["initial_loan"] = loan_by_pid[pid]
 
-    return {
+    result = {
         "current_round": max_round,
         "total_rounds": 12,
         "players": players,
@@ -386,6 +386,7 @@ def get_game_state(logs_dir: Path, trial_dir_name: str, game_id: str) -> dict[st
         "survivors": len(players) - len(eliminated),
         "config": game_config,
     }
+    return result
 
 
 def _truncate_strategy(s: dict | None) -> dict | None:
@@ -416,10 +417,30 @@ def _extract_emotion(entry: dict[str, Any]) -> str:
     return "平静"
 
 
+def _visibility_display(visibility: str, kind: str) -> dict[str, str]:
+    """表示層が推測せずに使える公開区分ラベルを返す。"""
+    labels = {
+        "broadcast": ("🌐", "公開発言"),
+        "dm": ("🔒", "秘匿DM"),
+        "anonymous_broadcast": ("🎭", "匿名発言"),
+        "contract_propose": ("📜 🔒", "秘匿契約"),
+        "contract_sign": ("📜", "契約署名"),
+    }
+    icon, label = labels.get(kind, ("🌐" if visibility == "public" else "🔒", "公開" if visibility == "public" else "秘匿"))
+    return {"icon": icon, "label": label}
+
+
+def _validate_view(view: str) -> str:
+    if view not in {"public", "god"}:
+        raise ValueError("view must be public or god")
+    return view
+
+
 def get_player_timeline(
-    logs_dir: Path, trial_dir_name: str, game_id: str, pid: str
+    logs_dir: Path, trial_dir_name: str, game_id: str, pid: str, view: str = "public",
 ) -> list[dict[str, Any]]:
     """プレイヤーの時系列を返す"""
+    view = _validate_view(view)
     trial_dir = logs_dir / trial_dir_name
     llm_logs_dir = trial_dir / "llm_logs"
     lf = llm_logs_dir / f"{game_id}_{pid}_llm_calls.jsonl"
@@ -449,12 +470,29 @@ def get_player_timeline(
         if action:
             item["type"] = "action"
             item["action_type"] = action.get("type", "?")
-            if action.get("type") in ("dm", "broadcast"):
+            action_type = action.get("type")
+            secret_action = action_type in {"dm", "anonymous_broadcast", "contract_propose", "contract_sign"}
+            item["visibility"] = "secret" if secret_action else "public"
+            item["display"] = _visibility_display(item["visibility"], str(action_type))
+            if action_type == "broadcast":
                 item["content"] = action.get("message", "")[:200]
+            elif action_type == "dm" and view == "god":
+                item["content"] = action.get("message", "")[:200]
+                item["to"] = action.get("to", "")
+            elif action_type == "anonymous_broadcast" and view == "god":
+                item["content"] = action.get("message", "")[:200]
+                item["anonymous"] = True
+            elif action_type == "dm":
+                item["content"] = "DM送信（本文・宛先は非公開）"
+            elif action_type == "market_commit":
+                item["content"] = f"{action.get('market_id','?')} / {action.get('card','?')}"
+            elif action_type == "contract_sign" and view == "god":
+                item["contract_id"] = action.get("contract_id")
+            elif action_type == "contract_propose" and view == "god":
+                item["terms"] = action.get("terms", [])
+            if action_type == "dm" and view == "god":
                 if action.get("type") == "dm":
                     item["to"] = action.get("to", "")
-            elif action.get("type") == "market_commit":
-                item["content"] = f"{action.get('market_id','?')} / {action.get('card','?')}"
         elif strategy:
             item["type"] = "strategy"
         else:
@@ -464,12 +502,238 @@ def get_player_timeline(
             item["strategy"] = _truncate_strategy(strategy)
 
         # reasoning（折りたたみ用）：response_textの先頭200文字
-        if resp and len(resp) > 50:
+        # 構造化された秘匿actionの応答プレビューはpublicで返さない。
+        if resp and len(resp) > 50 and not (action and action.get("type") in {"dm", "anonymous_broadcast", "contract_propose", "contract_sign"} and view == "public"):
             item["reasoning_preview"] = resp[:200]
 
         timeline.append(item)
 
     return timeline
+
+
+def _response_data(response_text: str) -> dict[str, Any] | None:
+    """LLM応答からJSONオブジェクトを一度だけ安全に取り出す。"""
+    if not response_text:
+        return None
+    try:
+        m = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", response_text, re.DOTALL)
+        if m:
+            data = json.loads(m.group(1).strip())
+            return data if isinstance(data, dict) else None
+        start = response_text.find("{")
+        if start < 0:
+            return None
+        depth = 0
+        for i in range(start, len(response_text)):
+            if response_text[i] == "{":
+                depth += 1
+            elif response_text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    data = json.loads(response_text[start:i + 1])
+                    return data if isinstance(data, dict) else None
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return None
+
+
+def _extract_memory_text(response_text: str, max_chars: int = 1000) -> str:
+    """Reflectionの生応答をゲームと同じ自由記述ルールで復元する。"""
+    if not response_text:
+        return ""
+    data = _response_data(response_text)
+    memory = data.get("memory") if data else None
+    text = memory if isinstance(memory, str) else response_text
+    text = text.strip()
+    return text[:max_chars] if max_chars > 0 else text
+
+
+def _safe_action(action: dict[str, Any] | None, view: str = "public") -> dict[str, Any] | None:
+    """観戦用に公開可能なアクション情報だけを返す。"""
+    if not action:
+        return None
+    action_type = str(action.get("type", "unknown"))
+    view = _validate_view(view)
+    secret = action_type in {"dm", "anonymous_broadcast", "contract_propose", "contract_sign"}
+    result: dict[str, Any] = {
+        "type": action_type,
+        "visibility": "secret" if secret else "public",
+        "display": _visibility_display("secret" if secret else "public", action_type),
+    }
+    if action_type == "broadcast":
+        result["content"] = str(action.get("message", ""))
+    elif action_type == "dm":
+        if view == "god":
+            result.update({"sender": action.get("sender"), "to": action.get("to"), "content": str(action.get("message", ""))})
+        else:
+            result["label"] = "DM送信（本文・宛先は非公開）"
+    elif action_type == "anonymous_broadcast":
+        if view == "god":
+            result.update({"content": str(action.get("message", "")), "anonymous": True})
+        else:
+            result["label"] = "匿名通信を実施（発信内容との紐付けは非公開）"
+    elif action_type == "market_commit":
+        result["market_id"] = action.get("market_id")
+        result["card"] = action.get("card")
+    elif action_type in {"contract_propose", "contract_sign"}:
+        # 契約条項は非公開。IDは契約署名の追跡に必要な公開識別子だけを残す。
+        if action_type == "contract_sign" and action.get("contract_id"):
+            result["contract_id"] = action["contract_id"]
+        if view == "god" and action_type == "contract_propose":
+            result["terms"] = action.get("terms", [])
+        result["label"] = "契約操作" if view == "god" else "契約操作（条項は非公開）"
+    return result
+
+
+def _safe_round_result(
+    logs_dir: Path, trial_dir_name: str, game_id: str, pid: str, round_num: int, view: str = "public",
+) -> dict[str, Any]:
+    """既存のラウンド再構成から、選手詳細向けの公開結果を切り出す。"""
+    round_data = get_round_states(logs_dir, trial_dir_name, game_id, view=view).get("rounds", {}).get(
+        str(round_num), {}
+    )
+    commits = [c for c in round_data.get("commits", []) if c.get("player_id") == pid]
+    markets = []
+    for market in round_data.get("markets", []):
+        # MARKET_RESULT の participants は現行イベントでは参加人数(int)。旧ログの
+        # player_id 配列も読み込めるため、所属判定に使うのは配列の場合だけにする。
+        participants = market.get("participants")
+        participant_ids = participants if isinstance(participants, list) else ()
+        if pid in participant_ids or any(c.get("market_id") == market.get("market_id") for c in commits):
+            markets.append({
+                key: market.get(key)
+                for key in ("market_id", "participants", "winners", "prize_per_winner", "total_pool", "surged")
+            })
+
+    # get_round_states()は内部利用の契約termsを含むため、ここでは公開フィールドだけに縮退する。
+    contract_keys = ("contract_id", "proposer", "parties", "signed_by", "round_created")
+    if view == "god":
+        contract_keys += ("terms", "outcomes")
+    contracts = [
+        {key: contract.get(key) for key in contract_keys}
+        for contract in round_data.get("contracts", [])
+        if pid in (contract.get("parties") or [])
+    ]
+
+    trial_dir = logs_dir / trial_dir_name
+    event_file = trial_dir / f"{game_id}_events.jsonl"
+    double_up = []
+    for event in _cache.get_entries(event_file):
+        if event.get("round_num") != round_num:
+            continue
+        if event.get("event_type") not in {"DOUBLE_UP_CHOSEN", "DOUBLE_UP_RESOLVED"}:
+            continue
+        data = event.get("data", {})
+        if data.get("player_id") == pid:
+            double_up.append({"event_type": event["event_type"], "data": dict(data)})
+
+    return {
+        "available": bool(round_data),
+        "commit": commits[0] if commits else None,
+        "markets": markets,
+        "cash": round_data.get("cash", {}).get(pid),
+        "contracts": contracts,
+        "double_up": double_up,
+        "eliminated": [e for e in round_data.get("eliminated", []) if e.get("player_id") == pid],
+    }
+
+
+def get_player_round_detail(
+    logs_dir: Path, trial_dir_name: str, game_id: str, pid: str, round_num: int, view: str = "public",
+) -> dict[str, Any]:
+    """選手一人・一ラウンドの観戦用詳細を返す（生プロンプト/生応答は返さない）。"""
+    view = _validate_view(view)
+    round_states = get_round_states(logs_dir, trial_dir_name, game_id, view=view)
+    total_rounds = int(round_states.get("total_rounds", 12))
+    if round_num < 1 or round_num > total_rounds:
+        raise ValueError(f"round must be between 1 and {total_rounds}")
+
+    trial_dir = logs_dir / trial_dir_name
+    lf = trial_dir / "llm_logs" / f"{game_id}_{pid}_llm_calls.jsonl"
+    entries = _cache.get_entries(lf)
+    seat_map = _load_seat_map(trial_dir, game_id)
+    model_id = entries[0].get("model_id", "unknown") if entries else "unknown"
+
+    memory = ""
+    saw_reflection = False
+    start_status = "absent" if round_num == 1 else "not_recorded"
+    end_status = "no_reflection_final_round" if round_num == total_rounds else "not_recorded"
+    current_reflections: list[dict[str, Any]] = []
+    for entry in entries:
+        if entry.get("phase") != "reflection":
+            continue
+        saw_reflection = True
+        entry_round = entry.get("round_num", 0)
+        if entry_round < round_num:
+            candidate = _extract_memory_text(entry.get("response_text", ""))
+            if candidate:
+                memory = candidate
+        elif entry_round == round_num:
+            current_reflections.append(entry)
+
+    start_memory = {"text": memory or None, "source_round": round_num - 1 if memory else None,
+                    "status": "available" if memory else start_status}
+    end_memory = {"text": None, "source_round": None, "status": end_status}
+    if round_num < total_rounds and current_reflections:
+        candidate = _extract_memory_text(current_reflections[-1].get("response_text", ""))
+        if candidate:
+            end_memory = {"text": candidate, "source_round": round_num, "status": "updated"}
+        else:
+            end_memory = {"text": memory or None, "source_round": round_num - 1 if memory else None,
+                          "status": "retained"}
+    elif round_num < total_rounds and saw_reflection:
+        end_memory["status"] = "retained"
+
+    calls = []
+    for entry in entries:
+        if entry.get("round_num") != round_num or entry.get("phase") == "reflection":
+            continue
+        response = entry.get("response_text", "")
+        data = _response_data(response)
+        action_data = data.get("action") if data else None
+        action = action_data if isinstance(action_data, dict) else None
+        reasoning = entry.get("reasoning")
+        if not isinstance(reasoning, str) and data and isinstance(data.get("reasoning"), str):
+            reasoning = data["reasoning"]
+        thinking_tokens = entry.get("reasoning_tokens", 0) or 0
+        sensitive_action = action and action.get("type") in {"dm", "anonymous_broadcast", "contract_propose", "contract_sign"}
+        safe_action = _safe_action(action, view=view)
+        if view == "god" and safe_action and safe_action.get("type") in {"dm", "anonymous_broadcast"}:
+            # player別ログのファイル名が送信者を確定する。生応答には混ぜない。
+            safe_action["sender"] = pid
+        calls.append({
+            "phase": entry.get("phase", ""),
+            "turn": entry.get("turn"),
+            "timestamp": entry.get("timestamp", ""),
+            "action": safe_action,
+            "reasoning": reasoning if isinstance(reasoning, str) and not (view == "public" and sensitive_action) else None,
+            "native_thinking": {"tokens": thinking_tokens, "source": "usage" if thinking_tokens else "unavailable"},
+            "usage": {"input_tokens": entry.get("input_tokens", 0) or 0,
+                      "output_tokens": entry.get("output_tokens", 0) or 0},
+            "cost": entry.get("cost_usd", 0) or 0,
+            "latency_ms": entry.get("elapsed_ms", 0) or 0,
+            "retry_count": entry.get("retry_count", 0) or 0,
+            "error": entry.get("error"),
+            "error_type": entry.get("error_type"),
+        })
+
+    result = {
+        "player_id": pid,
+        "model_id": model_id,
+        "model_name": seat_map.get(pid, model_id),
+        "round": round_num,
+        "total_rounds": total_rounds,
+        "memory": {"start": start_memory, "end": end_memory},
+        "calls": calls,
+        "result": _safe_round_result(logs_dir, trial_dir_name, game_id, pid, round_num, view=view),
+    }
+    if view == "god":
+        round_data = round_states.get("rounds", {}).get(str(round_num), {})
+        result["secret_events"] = {
+            "messages": [m for m in round_data.get("messages", []) if m.get("visibility") == "secret"],
+            "contracts": [c for c in round_data.get("contracts", []) if c.get("terms") is not None],
+        }
+    return result
 
 
 def get_commentary(
@@ -525,7 +789,7 @@ def _collect_round_messages(
     trial_dir: Path, game_id: str,
 ) -> dict[str, list[dict[str, Any]]]:
     """
-    LLMログから dm/broadcast をラウンド別に収集する。
+    LLMログから交渉メッセージをラウンド別に収集する。
     eventsのNEGOTIATION_ACTIONは本文/宛先を持たないため、LLMログを使う。
 
     Returns:
@@ -543,16 +807,21 @@ def _collect_round_messages(
             if not a or not isinstance(a, dict):
                 continue
             at = a.get("type", "")
-            if at not in ("dm", "broadcast"):
+            if at not in ("dm", "broadcast", "anonymous_broadcast"):
                 continue
             rn = str(e.get("round_num", 0))
             rec: dict[str, Any] = {
-                "sender": pid,
                 "type": at,
-                "message": str(a.get("message", ""))[:200],
+                "message": str(a.get("message", "")),
                 "turn": e.get("turn"),
                 "round": e.get("round_num", 0),
             }
+            if at != "anonymous_broadcast":
+                rec["sender"] = pid
+            else:
+                # 公開表示では発信者を空にする。god変換時だけログ由来の値を復元する。
+                rec["actual_sender"] = pid
+                rec["anonymous"] = True
             if at == "dm":
                 rec["to"] = a.get("to", "")
             by_round.setdefault(rn, []).append(rec)
@@ -585,7 +854,7 @@ def _collect_contract_terms(
 
 
 def get_round_states(
-    logs_dir: Path, trial_dir_name: str, game_id: str,
+    logs_dir: Path, trial_dir_name: str, game_id: str, view: str = "public",
 ) -> dict[str, Any]:
     """
     ラウンド別の盤面状況を再構成して返す。
@@ -597,6 +866,7 @@ def get_round_states(
                           messages, eliminated} }
         }
     """
+    view = _validate_view(view)
     trial_dir = logs_dir / trial_dir_name
     seat_map = _load_seat_map(trial_dir, game_id)
     events_file = trial_dir / f"{game_id}_events.jsonl"
@@ -613,9 +883,32 @@ def get_round_states(
     if not events_file.exists():
         # eventsが無くてもメッセージだけは見せられる
         for rn, msgs in messages_by_round.items():
+            visible_messages = []
+            for message in msgs:
+                msg_type = message.get("type")
+                if msg_type == "broadcast":
+                    visible_messages.append({"sender": message.get("sender"), "type": msg_type,
+                        "message": message.get("message", ""), "turn": message.get("turn"),
+                        "round": message.get("round"), "visibility": "public",
+                        "display": _visibility_display("public", msg_type)})
+                elif msg_type == "anonymous_broadcast":
+                    item = {"sender": None, "type": msg_type, "message": message.get("message", ""),
+                        "turn": message.get("turn"), "round": message.get("round"), "anonymous": True,
+                        "visibility": "public", "display": _visibility_display("public", msg_type)}
+                    if view == "god": item["actual_sender"] = message.get("actual_sender")
+                    visible_messages.append(item)
+                elif view == "god":
+                    visible_messages.append({"sender": message.get("sender"), "to": message.get("to"),
+                        "type": "dm", "message": message.get("message", ""), "turn": message.get("turn"),
+                        "round": message.get("round"), "visibility": "secret",
+                        "display": _visibility_display("secret", "dm")})
+                else:
+                    visible_messages.append({"type": "dm", "turn": message.get("turn"), "round": message.get("round"),
+                        "visibility": "secret", "display": _visibility_display("secret", "dm"),
+                        "label": "DM送信（本文・宛先は非公開）"})
             result["rounds"][rn] = {
                 "markets": [], "commits": [], "cash": {}, "holdings": {},
-                "contracts": [], "messages": msgs, "eliminated": [],
+                "contracts": [], "messages": visible_messages, "eliminated": [],
             }
         return result
 
@@ -728,6 +1021,7 @@ def get_round_states(
                 entry["debt"] = data["old_debt"]
 
         elif et == "NEGOTIATION_ACTION":
+            rnd(r)  # 交渉だけのラウンドにもmessage/contractを紐付ける。
             act = data.get("action")
             if act == "contract_propose":
                 cid = data.get("contract_id")
@@ -752,6 +1046,15 @@ def get_round_states(
                 c = contracts.get(cid)
                 if c and signer and signer not in c["signed_by"]:
                     c["signed_by"].append(signer)
+
+        elif et in {"TYPE_A_EXECUTION", "TYPE_A_FAILURE", "TYPE_B_VIOLATION", "AUTO_COMMIT", "AUTO_COMMIT_FAILURE"}:
+            rnd(r)
+            # すべての履行イベントにcontract_idがあるとは限らない。ある場合だけ契約に紐付ける。
+            cid = data.get("contract_id")
+            if cid in contracts:
+                contracts[cid].setdefault("outcomes", []).append({
+                    "event_type": et, "round": r, "data": dict(data),
+                })
 
         elif et in ("BANKRUPTCY", "FORCED_LIQUIDATION"):
             rd = rnd(r)
@@ -794,7 +1097,39 @@ def get_round_states(
             for pid in players
         }
         # メッセージ
-        rd["messages"] = messages_by_round.get(rn, [])
+        raw_messages = messages_by_round.get(rn, [])
+        rd["messages"] = []
+        for message in raw_messages:
+            msg_type = message.get("type", "")
+            if msg_type == "broadcast":
+                rd["messages"].append({
+                    "sender": message.get("sender"), "type": msg_type,
+                    "message": message.get("message", ""), "turn": message.get("turn"),
+                    "round": message.get("round"), "visibility": "public",
+                    "display": _visibility_display("public", msg_type),
+                })
+            elif msg_type == "anonymous_broadcast":
+                public_message = {
+                    "sender": None, "type": msg_type, "message": message.get("message", ""),
+                    "turn": message.get("turn"), "round": message.get("round"), "anonymous": True,
+                    "visibility": "public", "display": _visibility_display("public", msg_type),
+                }
+                if view == "god":
+                    public_message["actual_sender"] = message.get("actual_sender")
+                rd["messages"].append(public_message)
+            elif view == "god":
+                rd["messages"].append({
+                    "sender": message.get("sender"), "to": message.get("to"), "type": "dm",
+                    "message": message.get("message", ""), "turn": message.get("turn"),
+                    "round": message.get("round"), "visibility": "secret",
+                    "display": _visibility_display("secret", "dm"),
+                })
+            else:
+                rd["messages"].append({
+                    "type": "dm", "turn": message.get("turn"), "round": message.get("round"),
+                    "visibility": "secret", "display": _visibility_display("secret", "dm"),
+                    "label": "DM送信（本文・宛先は非公開）",
+                })
         # 契約の「このラウンド時点」スナップショット（round_created ≤ R）
         rd["contracts"] = [
             {
@@ -803,7 +1138,10 @@ def get_round_states(
                 "parties": c["parties"],
                 "signed_by": list(c["signed_by"]),
                 "round_created": c["round_created"],
-                "terms": c["terms"],
+                "terms": c["terms"] if view == "god" else None,
+                "outcomes": c.get("outcomes", []) if view == "god" else [],
+                "visibility": "secret" if view == "god" and c["terms"] is not None else "public",
+                "display": _visibility_display("secret", "contract_propose") if c["terms"] is not None else _visibility_display("public", "contract_sign"),
             }
             for c in contracts.values()
             if c["round_created"] <= r_int
@@ -815,7 +1153,7 @@ def get_round_states(
             result["rounds"][rn] = {
                 "markets": [], "commits": [], "cash": {},
                 "holdings": {pid: list(FULL_DECK) for pid in players},
-                "contracts": [], "messages": msgs, "eliminated": [],
+                "contracts": [], "messages": [], "eliminated": [],
             }
 
     return result

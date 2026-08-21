@@ -1,5 +1,27 @@
 # Changelog
 
+## 2026-08-21: Viewer詳細表示・神視点・運用の整備
+
+- プレイヤー詳細にR1〜R12のラウンド表示と既存生ログタブを追加し、Handover Memory、全文reasoning、Native Thinking token、行動とラウンド結果を再構成できるようにした。実ログの`MARKET_RESULT.participants`が整数となる形式にも互換対応した。
+- 通常Viewerを`view=public`として統一し、timeline・rounds・round-detailからDM本文／宛先、匿名発言の実発信者、契約条項をredactする。運用者向けの`view=god`は追加token認可でだけ許可し、構造化されたゲーム内秘匿情報を公開／秘匿ラベル付きで表示する。prompt、LLM生応答、認証値などゲーム外の情報は返さない。
+- Viewer公開運用をuser systemdの`dangou-viewer.service`へ正本化し、再起動・疎通・障害切り分けと神視点tokenのrepo外保管・反映方法を`doc/viewer_operations.md`に記録した。Caddy設定は変更していない。
+- Phase CのL1〜L6小規模試験用に、S2の12ラウンド設定を保った`--stop-after-round`、予算block中断、manifest／AFTER集計を追加した。R1〜R3実API試験はR3 Reflection後に正常停止し、Viewerの実ログ回帰にも利用している。
+
+## 2026-08-20: L1〜L6 R12実戦試験の安全ランナーとAFTER集計
+
+- `scripts/llm_trial.py` にPhase C限定の `--max-output-tokens` と
+  `--abort-on-budget-block` を追加。`ModelInfo`の試験用copyへ出力上限を適用し、
+  registryを変更せずL1〜L6全席を2,000 tokensに統一できるようにした。
+- 実行前に `trial_manifest.json` を保存し、モデルID・単価・timeout・thinking設定・実効token上限・
+  CoT・S2・cap・賞金設定を監査可能にした。APIキーその他の秘密情報は保存しない。
+- `GameCostBudget(abort_on_block=True)` とGameのフェイズ境界を連携し、最初の予算block後は
+  `GAME_ABORTED` と `GAME_END(completed=false)` を残して試合を中断する。既定Falseの通常試合は従来の
+  fallback挙動を維持する。
+- `ROUND_COMPLETE` を追加し、各ラウンド終了時の生存者数をイベントから直接集計可能にした。
+  `scripts/l6_r12_report.py` は逐次保存済みログだけからAFTER比較用Markdownを再構成する（API送信なし）。
+- Console BEFORE基準値を `doc/cost/api_console_baseline_2026-08-20_before_l6_r12.md` に独立保存した。
+  対象テストはAPI送信なしで実行する。
+
 ## 2026-08-20: Phase 3 matrix strict化と監査集計の拡張
 
 - Phase 3のadapter生成だけを `max_retries=0`・temperature fallback無効に固定し、Anthropic/OpenAI互換SDKを

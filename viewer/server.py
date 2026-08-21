@@ -10,6 +10,7 @@
 """
 
 import os
+import secrets
 from pathlib import Path
 from typing import Optional
 
@@ -19,7 +20,7 @@ from fastapi.responses import FileResponse
 
 from viewer.log_parser import (
     list_games, get_game_state, get_player_timeline, get_commentary,
-    get_round_states, get_cost_breakdown,
+    get_round_states, get_cost_breakdown, get_player_round_detail,
 )
 
 # --- 環境変数による設定 ---
@@ -32,6 +33,7 @@ PORT = int(os.environ.get("VIEWER_PORT", "9025"))
 ROOT_PATH = os.environ.get("VIEWER_ROOT_PATH", "")
 LOGS_DIR = Path(os.environ.get("VIEWER_LOG_ROOT", str(DEFAULT_LOGS_DIR)))
 TOKEN = os.environ.get("VIEWER_TOKEN", "")
+GOD_TOKEN = os.environ.get("VIEWER_GOD_TOKEN", "")
 
 # --- FastAPIアプリ ---
 app = FastAPI(
@@ -59,6 +61,17 @@ async def check_token(
     provided = token or request.headers.get("X-Viewer-Token", "")
     if provided != TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def check_view(request: Request, view: str) -> str:
+    """神視点は通常Viewer認証とは別の明示的トークンで保護する。"""
+    if view not in {"public", "god"}:
+        raise HTTPException(status_code=400, detail="view must be public or god")
+    if view == "god":
+        provided = request.headers.get("X-Viewer-God-Token", "")
+        if not GOD_TOKEN or not secrets.compare_digest(provided, GOD_TOKEN):
+            raise HTTPException(status_code=403, detail="God view is unavailable or unauthorized")
+    return view
 
 
 @app.get("/")
@@ -95,9 +108,9 @@ async def api_commentary(trial_dir: str, game_id: str, _=Depends(check_token)):
 
 
 @app.get("/api/games/{trial_dir}/{game_id}/rounds")
-async def api_rounds(trial_dir: str, game_id: str, _=Depends(check_token)):
+async def api_rounds(trial_dir: str, game_id: str, request: Request, view: str = Query("public"), _=Depends(check_token)):
     """ラウンド別の盤面状況を返す"""
-    return get_round_states(LOGS_DIR, trial_dir, game_id)
+    return get_round_states(LOGS_DIR, trial_dir, game_id, view=check_view(request, view))
 
 
 @app.get("/api/games/{trial_dir}/{game_id}/cost")
@@ -108,10 +121,22 @@ async def api_cost_breakdown(trial_dir: str, game_id: str, _=Depends(check_token
 
 @app.get("/api/games/{trial_dir}/{game_id}/players/{pid}/timeline")
 async def api_player_timeline(
-    trial_dir: str, game_id: str, pid: str, _=Depends(check_token),
+    trial_dir: str, game_id: str, pid: str, request: Request, view: str = Query("public"), _=Depends(check_token),
 ):
     """プレイヤーの時系列を返す"""
-    return get_player_timeline(LOGS_DIR, trial_dir, game_id, pid)
+    return get_player_timeline(LOGS_DIR, trial_dir, game_id, pid, view=check_view(request, view))
+
+
+@app.get("/api/games/{trial_dir}/{game_id}/players/{pid}/round-detail")
+async def api_player_round_detail(
+    trial_dir: str, game_id: str, pid: str, round: int = Query(..., ge=1),
+    request: Request = None, view: str = Query("public"), _=Depends(check_token),
+):
+    """選手の指定ラウンド詳細（memory・全文reasoning・公開結果）を返す。"""
+    try:
+        return get_player_round_detail(LOGS_DIR, trial_dir, game_id, pid, round, view=check_view(request, view))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def main():
@@ -125,6 +150,7 @@ def main():
         print(f"認証: 有効（VIEWER_TOKEN設定済み）")
     else:
         print(f"認証: なし（公開アクセス可）")
+    print("神視点: 有効" if GOD_TOKEN else "神視点: 無効（VIEWER_GOD_TOKEN未設定）")
     print(f"ログ: {LOGS_DIR}")
     print("---")
     uvicorn.run(app, host=HOST, port=PORT)
