@@ -46,9 +46,19 @@ LLMコールは1-shotで会話履歴を持たず、チャット・戦略メモ�
 前ラウンドの裏切り等を一切覚えていない。`config.memory_enabled=True`（S2プリセットのみ既定True）
 にすると、各ラウンド終了後（Settlement/Finance完了後）に専用のReflectionフェイズが走り、各AIへ
 「前ラウンドのmemory＋当ラウンドの会話・契約・結果」を材料に、次ラウンドへ持ち越す自由記述メモ
-（既定1000字、`memory_max_chars`で調整）を1枚だけ書かせる。渡すのは常に最新の1枚のみ（累積しない）。
+（既定3000字、`memory_max_chars`で調整。上限超過分は意味境界を優先して切り詰める）を1枚だけ書かせる。渡すのは常に最新の1枚のみ（累積しない）。
 フォーマットは強制しないため、何を残し何を捨てるかはモデルの判断に委ねられる。詳細は
 `doc/uso8000000_dangou_card_spec_v0_8_season2.md` §9.6を参照。
+
+### 脱落者の最終振り返り（FINAL_REFLECTION）
+
+`config.final_reflection_enabled=True`（`baseline_v1_s2`/`default_8_s2`プリセットのみ既定True）
+にすると、LLMエージェントが脱落した瞬間に1回だけ追加コールが発生し、`emotion`（感情）・
+`defeat_cause`（本人が考える敗因）・`comment`（最期のコメント）を自由記述で書かせる
+（`final_reflection_max_tokens`で上限調整、既定3000tokens）。1脱落=1回発火を保証しており、
+`FINAL_REFLECTION`イベントとしてログに記録される。Viewerでは脱落ラウンドの詳細に表示できるが、
+`comment`/`defeat_cause`は一人称の自由記述でも§8.2秘匿情報を含み得るため、公開viewでは
+`emotion`のみを見せ、本文は神視点限定にしている（詳細は`rules/project.md`該当節）。
 
 ### DM（ダイレクトメッセージ）の秘匿性
 
@@ -162,7 +172,7 @@ thinking・xAI等のキャッシュ割引・Anthropicのusage慣習差を正し�
 {"event_type": "MARKET_RESULT", "timestamp": "...", "round_num": 1, "phase": "settlement", "step": 2, "data": {...}}
 ```
 
-主要イベント種別: `GAME_START`, `LOAN_CHOSEN`, `MARKET_OPEN`, `NEGOTIATION_ACTION`, `COMMIT`, `AUTO_COMMIT`, `BANKRUPTCY`, `REVEAL`, `MARKET_RESULT`, `TYPE_B_VIOLATION`, `SNAPSHOT`, `TYPE_A_EXECUTION`, `TYPE_A_FAILURE`, `BOUNTY_TRIGGERED`, `ELIMINATION`, `FORCED_LIQUIDATION`, `INTEREST`, `REPAYMENT`, `AUTO_REPAYMENT`, `SURVIVAL_CHECK`, `GAME_END`
+主要イベント種別: `GAME_START`, `LOAN_CHOSEN`, `MARKET_OPEN`, `NEGOTIATION_ACTION`, `COMMIT`, `AUTO_COMMIT`, `BANKRUPTCY`, `REVEAL`, `MARKET_RESULT`, `TYPE_B_VIOLATION`, `SNAPSHOT`, `TYPE_A_EXECUTION`, `TYPE_A_FAILURE`, `BOUNTY_TRIGGERED`, `ELIMINATION`, `FORCED_LIQUIDATION`, `INTEREST`, `REPAYMENT`, `AUTO_REPAYMENT`, `SURVIVAL_CHECK`, `FINAL_REFLECTION`, `GAME_END`
 
 ## 観戦ビューア / LP
 
@@ -192,6 +202,9 @@ unit 定義: `~/.config/systemd/user/dangou-viewer.service`（`ExecStart` は `.
 公開Viewerの再起動・障害切り分けは[Viewer運用マニュアル](doc/viewer_operations.md)を参照。開発用の起動方法は`viewer/README.md`を参照。
 
 通常のViewer APIはDM本文・宛先、匿名発言者、契約条項を非公開にする。運用者向けの神視点は、詳細モーダルの「神視点を有効化」で別管理の`VIEWER_GOD_TOKEN`を入力した場合だけ利用できる。tokenの保管・反映・確認手順も[Viewer運用マニュアル](doc/viewer_operations.md)を正とする。
+
+脱落者のラウンド詳細には「脱落時コメント」セクション（FINAL_REFLECTION）を表示する。通常表示では感情のみ、
+神視点では敗因・最後の言葉の本文まで見られる（自由記述が§8.2秘匿情報を含み得るため）。
 
 ## プロジェクト構成
 

@@ -14,6 +14,9 @@ import time
 from pathlib import Path
 from typing import Any
 
+from engine.config import HANDOVER_MEMORY_MAX_CHARS
+from llm.response_parser import VALID_EMOTIONS
+
 # Engine が脱落を確定させたことを示すイベント種別。
 # AUTO_COMMIT_FAILURE は engine/game.py の commit フェーズが唯一の発火箇所で、
 # 直前に必ず forced_liquidation() を実行し is_alive=False にしているため、
@@ -546,8 +549,19 @@ def _response_data(response_text: str) -> dict[str, Any] | None:
     return None
 
 
-def _extract_memory_text(response_text: str, max_chars: int = 1000) -> str:
-    """Reflectionの生応答をゲームと同じ自由記述ルールで復元する。"""
+def _extract_memory_text(response_text: str, max_chars: int = HANDOVER_MEMORY_MAX_CHARS) -> str:
+    """
+    Reflectionの生応答をゲームと同じ自由記述ルールで復元する。
+
+    上限値は engine.config.HANDOVER_MEMORY_MAX_CHARS を単一ソースとして参照する
+    （game本体のmemory_max_charsと常に一致させる）。
+
+    注意: memoryキーが無い/文字列でない場合に応答全体をfallback表示する挙動は、
+    過去に実際にゲームが保存していた値（当時のバグを含む）をそのまま再現するために
+    意図的に維持している。llm/response_parser.py の extract_memory は既に
+    このfallbackを廃止済み（WRONG_PAYLOAD対策）だが、本関数はビューア用の
+    「実際に何が保存されたか」の忠実な再現が目的のため、ここでは変更しない。
+    """
     if not response_text:
         return ""
     data = _response_data(response_text)
@@ -636,6 +650,31 @@ def _safe_round_result(
         if data.get("player_id") == pid:
             double_up.append({"event_type": event["event_type"], "data": dict(data)})
 
+    final_reflection = None
+    for fr in round_data.get("final_reflections", []):
+        if fr.get("player_id") != pid:
+            continue
+        # 本文が実質空（emotion/defeat_cause/commentすべて空）なら「記録なし」と同じ扱いにする
+        # （status=empty/rejected_no_comment/error等のdegradedケース）。
+        if not (fr.get("emotion") or fr.get("defeat_cause") or fr.get("comment")):
+            break
+        final_reflection = {
+            "round": round_num,
+            "emotion": fr.get("emotion"),
+            "has_comment": bool(fr.get("comment")),
+            "truncated": bool(fr.get("truncated")),
+            "availability": "god_only",
+        }
+        if view == "god":
+            final_reflection.update({
+                "comment": fr.get("comment") or "",
+                "defeat_cause": fr.get("defeat_cause"),
+                "status": fr.get("status"),
+                "salvaged": fr.get("salvaged", []) or [],
+                "comment_chars": fr.get("comment_chars", 0),
+            })
+        break
+
     return {
         "available": bool(round_data),
         "commit": commits[0] if commits else None,
@@ -644,6 +683,7 @@ def _safe_round_result(
         "contracts": contracts,
         "double_up": double_up,
         "eliminated": [e for e in round_data.get("eliminated", []) if e.get("player_id") == pid],
+        "final_reflection": final_reflection,
     }
 
 
@@ -726,6 +766,12 @@ def get_player_round_detail(
             "error_type": entry.get("error_type"),
         })
 
+    final_reflection_round = None
+    for rn_str, rd in round_states.get("rounds", {}).items():
+        if any(fr.get("player_id") == pid for fr in rd.get("final_reflections", [])):
+            final_reflection_round = int(rn_str)
+            break
+
     result = {
         "player_id": pid,
         "model_id": model_id,
@@ -735,6 +781,7 @@ def get_player_round_detail(
         "memory": {"start": start_memory, "end": end_memory},
         "calls": calls,
         "result": _safe_round_result(logs_dir, trial_dir_name, game_id, pid, round_num, view=view),
+        "final_reflection_round": final_reflection_round,
     }
     if view == "god":
         round_data = round_states.get("rounds", {}).get(str(round_num), {})
@@ -918,6 +965,7 @@ def get_round_states(
             result["rounds"][rn] = {
                 "markets": [], "commits": [], "cash": {}, "holdings": {},
                 "contracts": [], "messages": visible_messages, "eliminated": [],
+                "final_reflections": [],
             }
         return result
 
@@ -929,6 +977,7 @@ def get_round_states(
             result["rounds"][rn] = {
                 "markets": [], "commits": [], "cash": {}, "holdings": {},
                 "contracts": [], "messages": [], "eliminated": [],
+                "final_reflections": [],
             }
         return result["rounds"][rn]
 
@@ -947,6 +996,40 @@ def get_round_states(
         if any(x.get("player_id") == player_id for x in rd["eliminated"]):
             return
         rd["eliminated"].append({"player_id": player_id, "reason": reason})
+
+    def add_final_reflection(rd: dict[str, Any], data: dict[str, Any]) -> None:
+        """同一ラウンド・同一プレイヤーのFINAL_REFLECTIONは1件だけ記録する（先勝ち）。
+
+        engine側は`_final_reflection_done`で1脱落=1回発火を保証しているが
+        （`engine/game.py`）、破損・結合ログ等に対する防御としてadd_elimination()
+        と同じ先勝ちdedupパターンをここでも踏襲する。
+
+        emotionは書き込み時に既に`VALID_EMOTIONS`で正規化済みだが、読み取り時にも
+        再検証する。理由: index.html側の`emotionDisplay()`はHTML属性へ未エスケープで
+        値を埋めており（現状安全なのは書き込み側のenum正規化に依存しているため）、
+        読み取り側の防御をここで独立して持つことで、ログの手動編集や将来の
+        書き込み側変更に対しても安全側に倒す。
+        """
+        player_id = data.get("player_id")
+        if not player_id:
+            return
+        if any(x.get("player_id") == player_id for x in rd["final_reflections"]):
+            return
+        emotion = data.get("emotion")
+        if emotion not in VALID_EMOTIONS:
+            emotion = None
+        comment = data.get("comment") or ""
+        defeat_cause = data.get("defeat_cause") or None
+        rd["final_reflections"].append({
+            "player_id": player_id,
+            "emotion": emotion,
+            "defeat_cause": defeat_cause,
+            "comment": comment,
+            "comment_chars": data.get("comment_chars", 0),
+            "truncated": bool(data.get("truncated", False)),
+            "status": data.get("status"),
+            "salvaged": data.get("salvaged", []) or [],
+        })
 
     players: list[str] = []
     # 契約の累積状態 {contract_id: {...}}
@@ -1093,6 +1176,13 @@ def get_round_states(
         elif et == "SURVIVAL_CHECK" and data.get("result") == "eliminated":
             rd = rnd(r)
             add_elimination(rd, data.get("player_id"), "condition_not_met")
+
+        elif et == "FINAL_REFLECTION":
+            # top-level round_num で振り分ける（data["round"]は同一値が渡るが、
+            # 既存のラウンド振り分け基準（本ループの他分岐と`add_elimination`）に
+            # 合わせて一貫させるため、必ずtop-levelを使う）。
+            rd = rnd(r)
+            add_final_reflection(rd, data)
 
     # プレイヤー順が取れなければ cash から補完
     if not players:

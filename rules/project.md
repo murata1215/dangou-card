@@ -204,3 +204,20 @@ parse correction仕様を変更してはならない。担保テスト: `tests/t
 代表1件を残す規則は「先勝ち」（最初に検出したイベントのreason/detailsを採用）で統一する。
 `get_game_state()`は元々 `if pid not in eliminated:` ガードで先勝ちだったため、
 `get_round_states()`側も同じ規則の `add_elimination()` ヘルパに揃える。
+
+## FINAL_REFLECTION（脱落者の一人称振り返り）は自由記述部分をgod限定にする
+
+「本人の一人称コメントだから公開して良い」という直感は、FINAL_REFLECTIONには適用できない。
+CoT reasoningやHandover Memoryが公開経路から締め出されているのは主に**構造的隔離**
+（`_build_visible_state()`を一切経由しない）によるものだが、FINAL_REFLECTIONの`comment`/
+`defeat_cause`はプロンプト上「敗因・信頼・裏切りを振り返って語ってほしい」と明示的に
+一人称の物語として求めており、実測（`doc/trials/final_reflection_smoke2_2026-08-22.md`の
+C1/C6、2/2件）で§8.2秘匿情報（契約条項の逐語的復唱、交渉相手の特定）を実際に含んでいた。
+よってViewer側は`emotion`/`round`/`has_comment`/`truncated`/`availability`のみpublicに返し、
+自由記述本体（`comment`/`defeat_cause`）と`status`/`salvaged`/`comment_chars`は`view=god`
+限定とする二層設計を採用した（`viewer/log_parser.py`の`_safe_round_result()`）。
+将来モデル自身に「公開してよい一言」を別フィールド（例: `last_word`）として書かせる案は
+安全だが、これはEngine/promptスキーマの変更でありViewer側だけでは実現できない。
+新しい自由記述系の可視化経路を追加する際は、「一人称だから安全」と決めつけず、実データで
+§8.2該当語（契約ID、相手プレイヤーID、市場ID等）の混入有無を確認してから公開範囲を決めること。
+担保テスト: `tests/test_viewer.py::TestFinalReflectionViewer::test_public_view_hides_secret_content`。

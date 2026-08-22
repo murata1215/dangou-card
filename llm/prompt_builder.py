@@ -696,7 +696,98 @@ def build_reflection_prompt(
         f"\n次のラウンド以降の自分に残したいことを{config.memory_max_chars}字以内で自由に書いてください。\n"
         "形式は自由（箇条書き・散文・表、何でも構いません）。何を書き、何を書かないかもあなたの判断です。\n"
         "例えば: 誰と何を約束したか、誰が守り誰が破ったか、次に何をするつもりか、など。\n"
+        "上限を超えた分は末尾から切り詰められます。重要なものから順に書いてください\n"
+        "（例: 次ラウンドの方針 → 有効な契約・未履行の約束 → 誰が守り誰が破ったか → "
+        "資産/借金/手札の認識 → 重要なDMのやり取り）。\n"
+        "古い情報を現在の事実として書かないでください（例: 「R3時点ではP04と同盟していた」"
+        "のように、いつの情報かを明記する）。\n"
         '出力: {"memory": "（ここにメモを書く）"}'
+    )
+
+    return "\n".join(lines)
+
+
+def build_final_reflection_prompt(
+    player_state: PlayerState,
+    round_num: int,
+    visible_state: dict[str, Any],
+    config: GameConfig,
+    elimination_context: dict[str, Any],
+    memory: str | None = None,
+) -> str:
+    """
+    FINAL_REFLECTION（脱落者の最終コメント）用のユーザープロンプト
+
+    脱落確定後、ラウンド末に1回だけ呼ばれる。ゲームは既に終わっており、
+    本人の行動でゲーム状態が変わることはないことを明示した上で、
+    敗因・他プレイヤー評価・重要だった交渉・最後に一言を語らせる。
+
+    Args:
+        round_num: 脱落が確定したラウンド番号
+        elimination_context: Game._build_elimination_context() の出力
+        memory: これまでの引き継ぎメモリ（あれば）
+    """
+    lines: list[str] = []
+    lines.append(
+        f"=== ラウンド{round_num} / あなたは脱落しました（最終コメント） ===\n"
+    )
+    lines.append(
+        f"あなたはラウンド{round_num}（全{config.num_rounds}ラウンド中）で脱落が確定しました。"
+    )
+    lines.append(f"脱落理由: {elimination_context.get('reason_label', '不明')}")
+
+    liq = elimination_context.get("liquidation") or {}
+    if liq:
+        parts = []
+        repaid = liq.get("debt_repaid")
+        if repaid:
+            parts.append(f"借金返済{repaid // 10_000}万円")
+        bad_debt = liq.get("bad_debt")
+        if bad_debt:
+            parts.append(f"貸倒れ{bad_debt // 10_000}万円")
+        confiscated = liq.get("cash_confiscated")
+        if confiscated:
+            parts.append(f"残金没収{confiscated // 10_000}万円")
+        cards_destroyed = liq.get("cards_destroyed")
+        if cards_destroyed:
+            parts.append(f"未使用カード{cards_destroyed}枚消滅")
+        if parts:
+            lines.append(f"清算結果: {', '.join(parts)}")
+
+    if elimination_context.get("is_final_round"):
+        lines.append(
+            f"（最終ラウンド終了時点で借金0かつ現金{config.survival_cash // 10_000}万円以上"
+            "の生還条件を満たせませんでした）"
+        )
+
+    # 引き継いできたこれまでの記憶（あれば）
+    lines.extend(_render_memory_block(memory))
+
+    # このラウンドで何が起きたか（市場結果・会話全件）
+    lines.extend(_render_last_round_results(
+        visible_state, title=f"ラウンド{round_num}の結果",
+    ))
+    lines.extend(_render_message_list(
+        visible_state.get("messages", []), "このラウンドの会話（全件）",
+    ))
+
+    lines.append(f"\n## あなたの最終状態（{player_state.player_id}）")
+    lines.append(f"  ゲーム内アクションはもうできません。以下は記録用の最後の発言です。")
+
+    lines.append(
+        "\nゲームは終わりました。この結果は変わりません。"
+        "あなたの発言はViewer上の記録として残ります。\n"
+        f"{config.num_rounds}ラウンドを振り返り、以下を自然文で自由に語ってください"
+        f"（800〜1500字程度で簡潔に。{config.final_reflection_max_chars}字以内、"
+        "上限超は末尾から切り詰められます）:\n"
+        "- 自分の敗因は何だったか\n"
+        "- 誰を信用していたか、誰を警戒していたか（他プレイヤー評価）\n"
+        "- 重要だった交渉・契約・裏切りがあれば\n"
+        "- もし続けられたなら次に何をしたかったか\n"
+        "- 最後に一言\n\n"
+        '出力: {"emotion": "感情（喜/怒/哀/楽/焦/疑/奸のいずれか）", '
+        '"defeat_cause": "一言で表す敗因", "comment": "（ここに自然文の最終コメント。'
+        '改行を含める場合は必ず\\nとしてエスケープすること）"}'
     )
 
     return "\n".join(lines)

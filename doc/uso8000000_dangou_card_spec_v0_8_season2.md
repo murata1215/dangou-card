@@ -553,10 +553,10 @@ R12 は Settlement 後の Finance フェイズが「強制返済 → **自動返
 - **`config.memory_enabled`**（既定`False`、S2プリセットのみ`True`）でON/OFFを切り替える。`False`の間は本節の挙動は一切発生せず、旧挙動と完全に同一
 - **Reflectionフェイズ**: `run()`のフェイズ順は`market_open → negotiation → commit → settlement → finance → reflection`。各ラウンドのSettlement/Finance完了後、生存プレイヤー全員に対して`agent.reflect(player_state, round_num, visible_state)`を呼ぶ。**最終ラウンドはスキップ**（次ラウンドが存在せず使われないため）。1体の例外はゲーム進行を止めず握りつぶす
 - **材料**: 前ラウンドから引き継いだmemory（あれば）＋当ラウンドの会話全件（`_round_messages`、DM/broadcast問わず件数制限なし）＋当ラウンドの契約義務・正式契約の状況＋当ラウンドの市場決着結果（§9.1の`commits`形式）＋自分の資金状況（決着・利息計上後）
-- **出力**: `{"memory": "..."}`形式の自由記述。フォーマットは強制しない（箇条書き・散文・表いずれも可。何を書き何を書かないかはモデルの判断に委ねられ、ここでモデル間の性能差が現れる）。`memory_max_chars`（既定1000字）を超える分は切り詰める
-- **抽出**: `extract_memory()`はJSON `{"memory": "..."}`が取れなければ応答テキストそのものを採用し、`ParseError`を投げない（自由記述専用の緩い抽出経路。通常のaction系レスポンスとは別系統）
+- **出力**: `{"memory": "..."}`形式の自由記述。フォーマットは強制しない（箇条書き・散文・表いずれも可。何を書き何を書かないかはモデルの判断に委ねられ、ここでモデル間の性能差が現れる）。`memory_max_chars`（既定`3000`字＝`engine.config.HANDOVER_MEMORY_MAX_CHARS`、2026-08-22改定。旧既定1000字）を超える分は**意味境界（段落・文・かぎ括弧閉じ等）を優先して**切り詰める（境界が見つからない場合のみハードカット）
+- **抽出**: `extract_memory_with_status()`（`extract_memory()`は互換ラッパー）はJSONが取れて`memory`キーが文字列で存在すれば採用（`ok`）、JSON文字列値中の生改行等でparseに失敗してもラッパーの痕跡（コードフェンス/`{`始まり/`"memory":"`）があれば手動で本文をサルベージ（`ok_recovered`）、JSONは取れたが`memory`キーが無い/文字列でない場合（例: `{"strategy": {...}}`のみの応答）は**採用せず空文字を返し**（`rejected_no_memory_key`、2026-08-22是正。旧実装はJSON全体を丸ごとmemoryとして採用しておりバグだった）、ラッパーの痕跡があるのに復旧不能な場合も同様に空文字（`rejected_unparsable_wrapper`）。ラッパーの痕跡が無い素の散文のみ、旧来どおり応答テキストそのものを採用（`ok_plaintext`）。空文字を返すケースはいずれも`ParseError`を投げない
 - **保持**: `LLMAgent._memory`は常に最新の1枚のみ（累積しない）。ラウンドを重ねてもプロンプトへの注入コストは一定
-- **失敗時の安全側動作**: API失敗・空応答・memoryキーが空文字のいずれの場合も、`self._memory`は**変更されない**（前ラウンドのメモをそのまま維持。空文字での上書きは絶対にしない）
+- **失敗時の安全側動作**: API失敗・空応答・`extract_memory_with_status()`が空文字を返した（`rejected_*`含む）いずれの場合も、`self._memory`は**変更されない**（前ラウンドのメモをそのまま維持。空文字での上書きは絶対にしない）。連続fallback回数は`LLMAgent.memory_fallback_streak`で追跡し、`llm_logs`の`memory_parse_status`/`memory_chars_raw`/`memory_chars_saved`/`memory_truncated`/`fallback_reason`/`memory_fallback_streak`フィールドで可観測
 - **注入先**: `negotiation`・`commit`プロンプトの「## あなたの記憶（前ラウンドから引き継いだメモ / これが唯一の記憶です）」セクションに注入される。`double_up`（TAKE/DOUBLEの純粋なリスク判断）には注入されない
 - **秘匿性**: `memory`は`LLMAgent`インスタンス内（`self._memory`）に閉じ、`visible_state`を経由しないため、他プレイヤーのプロンプトに構造的に混入しえない
 - **観戦ログ**: `reflection`フェイズの呼び出しは既存の`LLMLogger.log_call()`を通るため`phase="reflection"`としてログに残る。応答に`action`キーが無いため、viewerの`_collect_round_messages()`（dm/broadcast収集ロジック）には拾われず、viewer側の変更は不要

@@ -1094,7 +1094,10 @@ def test_phase3_uses_strict_adapter_and_records_model_audit_and_corrections(tmp_
     assert result["response_model"] == MODEL_REGISTRY["L1"].model_id
     assert result["response_models"] == [MODEL_REGISTRY["L1"].model_id]
     assert result["model_match"] == "match"
-    assert result["logical_calls"] == 4  # loan + invalid negotiation + correction + commit
+    # loan + invalid negotiation + correction + commit + final_reflection
+    # (P01はこのシナリオでラウンド1中に脱落するため、baseline_v1_s2で有効な
+    # FINAL_REFLECTIONが末尾に1回追加で発火する)
+    assert result["logical_calls"] == 5
     assert result["negotiation_corrections"] == 1
     assert result["commit_corrections"] == 0
     assert result["parse_corrections_total"] == 1
@@ -1113,7 +1116,11 @@ def test_phase3_h1_effort_reaches_anthropic_request_and_is_audited(tmp_path, mon
     class Adapter(_FakeOkAdapter):
         def complete(self, *args, **kwargs):
             captured["request_options"] = kwargs.get("request_options")
-            captured["max_tokens"] = kwargs.get("max_tokens")
+            # 最初のcall（ゲーム本編）のmax_tokensのみ記録する。P01がこのシナリオで
+            # ラウンド途中に脱落した場合、baseline_v1_s2で有効なFINAL_REFLECTIONが
+            # 末尾にfinal_reflection_max_tokens(既定3000)で追加発火するため、
+            # 最後のcallを見ると本編のeffort設定を正しく検証できない。
+            captured.setdefault("max_tokens", kwargs.get("max_tokens"))
             return super().complete(*args, **kwargs)
 
     def factory(info, **kwargs):

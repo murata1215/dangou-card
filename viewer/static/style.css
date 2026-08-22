@@ -191,6 +191,9 @@ body {
 .visibility-secret .visibility-label { background: #8b2f3d; color: #fff; }
 .detail-call.visibility-public, .detail-call.visibility-secret { padding: 8px; margin: 6px 0; border-top: 0; }
 .secret-section { border-color: #dd6675; background: color-mix(in srgb, #852d3a 12%, transparent); }
+.final-reflection { border-left: 3px solid #c98a3e; }
+.final-reflection-emotion { margin-bottom: 6px; }
+.final-reflection-emotion .emotion-img { width: 36px; height: 36px; vertical-align: middle; }
 
 @media (max-width: 540px) {
   .modal { width: 96%; padding: 12px; }

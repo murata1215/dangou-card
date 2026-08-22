@@ -9,6 +9,7 @@ LLM APIを使ってゲームに参加するエージェント。
 修正4: 交渉空回り削減（新規メッセージなしで自動pass）
 """
 
+import logging
 import time
 from typing import Any
 
@@ -29,12 +30,16 @@ from llm.prompt_builder import (
     build_system_prompt, build_loan_prompt,
     build_negotiation_prompt, build_commit_prompt,
     build_double_up_prompt, build_reflection_prompt,
+    build_final_reflection_prompt,
 )
 from llm.response_parser import (
     parse_response, extract_json, ParseError, make_correction_message,
-    LENGTH_TRUNCATION_HINT, extract_memory, normalize_memory,
+    LENGTH_TRUNCATION_HINT, extract_memory_with_status, normalize_memory_with_truncation,
+    parse_final_reflection,
 )
 from llm.llm_logger import LLMLogger
+
+logger = logging.getLogger(__name__)
 
 
 class LLMAgent(PlayerAgent):
@@ -78,6 +83,14 @@ class LLMAgent(PlayerAgent):
         self._memory: str = ""
         # memoryの全履歴（観戦・分析用。エージェントインスタンス内に閉じる）
         self.memory_history: list[dict[str, Any]] = []
+        # Reflection抽出のfallback（旧Memory保持）が連続何回起きたか。
+        # 2回以上の連続fallbackは、そのモデルがreflection形式を守れていない
+        # シグナルとして可観測にする（memory_fix 2026-08-22）
+        self.memory_fallback_streak: int = 0
+        self.memory_fallback_count: int = 0
+        # 脱落時の最終コメント（FINAL_REFLECTION）。観戦/分析用に保持するのみで、
+        # 次ラウンドのプロンプトには一切注入されない（脱落者なので次ラウンドが無い）。
+        self.final_reflection: dict[str, Any] | None = None
 
     def _update_last_log_emotion(self, strategy: dict[str, Any]) -> None:
         """strategyからemotion・reasoningを抽出し、llm_loggerの最新エントリに後付けする"""
@@ -87,6 +100,49 @@ class LLMAgent(PlayerAgent):
             self.llm_logger._entries[-1]["emotion"] = emotion
             if reasoning is not None:
                 self.llm_logger._entries[-1]["reasoning"] = reasoning
+
+    def _update_last_log_memory(
+        self,
+        *,
+        chars_raw: int,
+        chars_saved: int,
+        parse_status: str,
+        truncated: bool,
+        fallback_reason: str | None,
+    ) -> None:
+        """
+        reflect()の抽出/正規化結果をllm_loggerの最新エントリに後付けする
+        （_update_last_log_emotionと同じ post-hoc mutation パターン。
+        llm_logger.save()が試合終了時にファイルへ全書き直しするため、
+        逐次書き込み行が古くても最終的にはこの値が反映される）
+
+        秘密情報・APIキーはここに含めない。プロンプト/Memory本文は
+        response_text に既に全文があるため重複させない。
+        """
+        if self.llm_logger._entries:
+            entry = self.llm_logger._entries[-1]
+            entry["memory_chars_raw"] = chars_raw
+            entry["memory_chars_saved"] = chars_saved
+            entry["memory_parse_status"] = parse_status
+            entry["memory_truncated"] = truncated
+            entry["fallback_reason"] = fallback_reason
+            entry["memory_fallback_streak"] = self.memory_fallback_streak
+
+    def _update_last_log_final_reflection(self, result: dict[str, Any]) -> None:
+        """
+        final_reflect()の抽出結果をllm_loggerの最新エントリに後付けする
+        （_update_last_log_memoryと同じ post-hoc mutation パターン）。
+
+        秘密情報・APIキーはここに含めない。comment本文は response_text に
+        既に全文があるため重複させない。
+        """
+        if self.llm_logger._entries:
+            entry = self.llm_logger._entries[-1]
+            entry["final_reflection_status"] = result.get("status")
+            entry["final_reflection_chars"] = result.get("chars", 0)
+            entry["final_reflection_truncated"] = result.get("truncated", False)
+            entry["emotion"] = result.get("emotion")
+            entry["final_reflection_salvaged"] = result.get("salvaged", [])
 
     def set_game_cost_budget(self, budget: GameCostBudget) -> None:
         """Gameから明示注入される本戦専用の共有budget。"""
@@ -99,6 +155,7 @@ class LLMAgent(PlayerAgent):
         user_prompt: str,
         turn: int | None = None,
         retry_count: int = 0,
+        max_tokens_override: int | None = None,
     ) -> tuple[str, dict[str, int]]:
         """
         LLM APIを呼び出し、レスポンスとusageを返す
@@ -106,8 +163,12 @@ class LLMAgent(PlayerAgent):
         本戦budgetの事前予約がcapを超える場合はBudgetBlockedErrorを送出する。
         呼出元はこれを通常のAPI/JSON失敗と区別して即fallbackへ移行する。
         修正7: AdapterError発生時にerror_typeを分類してログに記録
+
+        Args:
+            max_tokens_override: このcallだけmodel_info.max_tokensより優先する
+                出力トークン上限（例: final_reflection）。既定Noneで既存挙動は不変。
         """
-        effective_max_tokens = self.model_info.max_tokens or DEFAULT_MAX_TOKENS
+        effective_max_tokens = max_tokens_override or self.model_info.max_tokens or DEFAULT_MAX_TOKENS
         reservation: Reservation | None = None
         if self._game_cost_budget is not None:
             reserved = worst_case_cost(self.model_info, self._system_prompt, user_prompt, effective_max_tokens)
@@ -438,11 +499,86 @@ class LLMAgent(PlayerAgent):
             # API失敗・空応答 — 前ラウンドのメモを維持
             return
 
-        memory = extract_memory(text)
+        memory, parse_status = extract_memory_with_status(text)
+
         if not memory:
-            # 何も書かれなかった場合も前ラウンドのメモを維持
+            # 抽出失敗（strategyのみのJSON等でmemoryキーが無い/文字列でない、
+            # または壊れたJSONラッパーを復旧できなかった）、あるいは本当に
+            # 空だった場合 — 前ラウンドのメモを維持する（空文字での上書きは
+            # 絶対にしない）。fallback発生を可観測にする。
+            self.memory_fallback_streak += 1
+            self.memory_fallback_count += 1
+            if self.memory_fallback_streak >= 2:
+                logger.warning(
+                    "%s: memory extraction fallback %d rounds in a row "
+                    "(status=%s, R%d)",
+                    self.player_id, self.memory_fallback_streak, parse_status, round_num,
+                )
+            self._update_last_log_memory(
+                chars_raw=0, chars_saved=len(self._memory), parse_status=parse_status,
+                truncated=False, fallback_reason=parse_status,
+            )
             return
 
+        self.memory_fallback_streak = 0
         self.valid_json_count += 1
-        self._memory = normalize_memory(memory, self._config.memory_max_chars)
+        chars_raw = len(memory)
+        saved, truncated = normalize_memory_with_truncation(memory, self._config.memory_max_chars)
+        self._memory = saved
         self.memory_history.append({"round": round_num, "memory": self._memory})
+        self._update_last_log_memory(
+            chars_raw=chars_raw, chars_saved=len(saved), parse_status=parse_status,
+            truncated=truncated, fallback_reason=None,
+        )
+
+    def final_reflect(
+        self,
+        player_state: PlayerState,
+        round_num: int,
+        visible_state: dict,
+        elimination_context: dict,
+    ) -> dict[str, Any]:
+        """
+        脱落確定後の最終コメント（FINAL_REFLECTION）
+
+        脱落したプレイヤー本人に、脱落の事実と原因を伝えて1回だけ最後の
+        コメントを書かせる。演出/記録専用: ゲーム状態・戻り値シグネチャ・
+        生存判定には一切影響しない。呼出はGame側で「1player 1回」が保証される
+        （このメソッド自体は何度呼ばれても副作用のない読み取り専用処理）。
+
+        self._memory / memory_history には**絶対に触れない**
+        （脱落者なので次ラウンドが無く、通常Handover Memoryを上書きしてはならない）。
+
+        retryは0（reflect()と同じ方針）。1回きりの演出callで失敗しても
+        失うものが無く、retryを入れるとコストとbudget blockリスクだけが増える。
+        失敗は全てstatus付きdictで返し、例外はGame側で握られる。
+        """
+        if self._config is None:
+            return {"status": "skipped", "reason": "no_config", "comment": "",
+                     "emotion": None, "defeat_cause": None, "chars": 0, "truncated": False,
+                     "salvaged": []}
+        if self._cost_exceeded:
+            return {"status": "skipped", "reason": "cost_exceeded", "comment": "",
+                     "emotion": None, "defeat_cause": None, "chars": 0, "truncated": False,
+                     "salvaged": []}
+
+        user_prompt = build_final_reflection_prompt(
+            player_state, round_num, visible_state, self._config,
+            elimination_context, memory=self._memory or None,
+        )
+        try:
+            text, _ = self._call_llm(
+                "final_reflection", round_num, user_prompt,
+                max_tokens_override=self._config.final_reflection_max_tokens,
+            )
+        except BudgetBlockedError:
+            return {"status": "budget_blocked", "comment": "", "emotion": None,
+                     "defeat_cause": None, "chars": 0, "truncated": False, "salvaged": []}
+        if not text:
+            return {"status": "empty", "comment": "", "emotion": None,
+                     "defeat_cause": None, "chars": 0, "truncated": False, "salvaged": []}
+
+        result = parse_final_reflection(text, max_chars=self._config.final_reflection_max_chars)
+        self.final_reflection = result  # 観戦/分析用に保持（次ラウンドへは渡さない）
+        self._update_last_log_final_reflection(result)
+        return result

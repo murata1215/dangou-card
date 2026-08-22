@@ -16,6 +16,8 @@ from viewer.log_parser import (
     get_commentary, get_round_states, get_player_round_detail,
 )
 
+INDEX_HTML_PATH = Path(__file__).resolve().parent.parent / "viewer" / "static" / "index.html"
+
 
 class TestLogCache:
     """差分キャッシュのテスト"""
@@ -990,3 +992,281 @@ class TestEliminationDeduplication:
         outcomes = contract.get("outcomes", [])
         # 生の履行イベント（TYPE_B_VIOLATION）は間引かれず残っている
         assert any(o["event_type"] == "TYPE_B_VIOLATION" for o in outcomes)
+
+
+class TestFinalReflectionViewer:
+    """Viewerが FINAL_REFLECTION イベント（脱落者の最終振り返り）を
+    public/god境界を守りつつ表示できることを確認する回帰テスト。
+
+    `TestPlayerRoundDetail._make_trial` は既存の秘匿情報リーク検知assertに
+    使われているため拡張せず、`TestEliminationDeduplication._write_llm_logs`
+    と同じ「独立fixture・手書きevents」パターンで新設する。
+    """
+
+    def _write_llm_logs(self, trial: Path, game_id: str, players: list[str]) -> None:
+        logs = trial / "llm_logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        for pid in players:
+            entry = {
+                "player_id": pid, "model_id": "test-model", "phase": "negotiation",
+                "round_num": 1, "turn": 1, "response_text": "{}", "cost_usd": 0.001,
+            }
+            (logs / f"{game_id}_{pid}_llm_calls.jsonl").write_text(
+                json.dumps(entry, ensure_ascii=False) + "\n", encoding="utf-8",
+            )
+
+    def _write_events(self, trial: Path, game_id: str, events: list[dict]) -> None:
+        (trial / f"{game_id}_events.jsonl").write_text(
+            "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in events), encoding="utf-8",
+        )
+
+    def _fr_event(self, round_num: int, **overrides) -> dict:
+        data = {
+            "player_id": "P02", "round": round_num, "elimination_reason": "bankruptcy",
+            "elimination_phase": "commit", "elimination_event": "BANKRUPTCY",
+            "model_id": "test-model", "status": "ok", "emotion": "哀",
+            "defeat_cause": "借入額が過大だった", "comment": "私は数字を読み間違えた。",
+            "comment_chars": 13, "truncated": False, "salvaged": [],
+        }
+        data.update(overrides)
+        return {
+            "event_type": "FINAL_REFLECTION", "round_num": round_num, "phase": "final_reflection",
+            "step": None, "data": data,
+        }
+
+    def test_complete_data_god_view_has_three_fields(self, tmp_path):
+        """完全データ: god viewでemotion/defeat_cause/commentの3項目が揃うこと"""
+        trial = tmp_path / "trial_fr_complete"
+        self._write_llm_logs(trial, "game01", ["P01", "P02"])
+        events = [
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P01"}},
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P02"}},
+            {"event_type": "BANKRUPTCY", "round_num": 5, "phase": "commit",
+             "data": {"player_id": "P02", "reason": "Cannot pay entry fee"}},
+            self._fr_event(5),
+        ]
+        self._write_events(trial, "game01", events)
+
+        detail = get_player_round_detail(tmp_path, "trial_fr_complete", "game01", "P02", 5, view="god")
+        fr = detail["result"]["final_reflection"]
+        assert fr is not None
+        assert fr["round"] == 5
+        assert fr["emotion"] == "哀"
+        assert fr["defeat_cause"] == "借入額が過大だった"
+        assert fr["comment"] == "私は数字を読み間違えた。"
+        assert fr["has_comment"] is True
+        assert fr["availability"] == "god_only"
+        assert fr["status"] == "ok"
+        assert fr["salvaged"] == []
+        assert detail["final_reflection_round"] == 5
+
+    def test_public_view_hides_secret_content(self, tmp_path):
+        """public viewの境界回帰テスト（最重要）: commentに仕込んだ秘匿情報
+        （DM本文・市場ID）がJSON全体に一切現れないこと"""
+        trial = tmp_path / "trial_fr_public_gate"
+        self._write_llm_logs(trial, "game01", ["P01", "P02"])
+        events = [
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P01"}},
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P02"}},
+            {"event_type": "BANKRUPTCY", "round_num": 5, "phase": "commit",
+             "data": {"player_id": "P02", "reason": "Cannot pay entry fee"}},
+            self._fr_event(
+                5,
+                defeat_cause="秘密のDM本文をP01に送って type_b_market を裏切った",
+                comment="P01との秘密のDM本文で type_b_market を独占する約束をしたが破られた",
+            ),
+        ]
+        self._write_events(trial, "game01", events)
+
+        public_detail = get_player_round_detail(tmp_path, "trial_fr_public_gate", "game01", "P02", 5, view="public")
+        blob = json.dumps(public_detail, ensure_ascii=False)
+        assert "秘密のDM本文" not in blob
+        assert "type_b_market" not in blob
+
+        fr = public_detail["result"]["final_reflection"]
+        assert fr is not None
+        assert fr["emotion"] == "哀"
+        assert fr["has_comment"] is True
+        assert fr["availability"] == "god_only"
+        assert "comment" not in fr
+        assert "defeat_cause" not in fr
+        assert "status" not in fr
+        assert "salvaged" not in fr
+        assert "comment_chars" not in fr
+
+        god_detail = get_player_round_detail(tmp_path, "trial_fr_public_gate", "game01", "P02", 5, view="god")
+        god_blob = json.dumps(god_detail, ensure_ascii=False)
+        assert "秘密のDM本文" in god_blob
+        assert "type_b_market" in god_blob
+
+    def test_partial_missing_defeat_cause(self, tmp_path):
+        """defeat_causeが欠損していても例外を出さず、取得できる項目だけ返ること"""
+        trial = tmp_path / "trial_fr_partial"
+        self._write_llm_logs(trial, "game01", ["P01", "P02"])
+        events = [
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P01"}},
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P02"}},
+            {"event_type": "BANKRUPTCY", "round_num": 5, "phase": "commit",
+             "data": {"player_id": "P02", "reason": "Cannot pay entry fee"}},
+            self._fr_event(5, defeat_cause=None, status="ok_recovered", salvaged=["defeat_cause"]),
+        ]
+        self._write_events(trial, "game01", events)
+
+        detail = get_player_round_detail(tmp_path, "trial_fr_partial", "game01", "P02", 5, view="god")
+        fr = detail["result"]["final_reflection"]
+        assert fr is not None
+        assert fr["defeat_cause"] is None
+        assert fr["comment"] == "私は数字を読み間違えた。"
+        assert fr["salvaged"] == ["defeat_cause"]
+
+    def test_invalid_emotion_normalizes_to_none(self, tmp_path):
+        """VALID_EMOTIONSに無い値は読み取り時にNoneへ正規化されること
+        （書き込み側の不具合・手動編集への防御）。奸を含む正規ケースも確認する"""
+        trial = tmp_path / "trial_fr_bad_emotion"
+        self._write_llm_logs(trial, "game01", ["P01", "P02", "P03"])
+        events = [
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P01"}},
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P02"}},
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P03"}},
+            {"event_type": "BANKRUPTCY", "round_num": 5, "phase": "commit",
+             "data": {"player_id": "P02", "reason": "Cannot pay entry fee"}},
+            self._fr_event(5, emotion="excited"),
+        ]
+        self._write_events(trial, "game01", events)
+        detail = get_player_round_detail(tmp_path, "trial_fr_bad_emotion", "game01", "P02", 5, view="god")
+        assert detail["result"]["final_reflection"]["emotion"] is None
+
+        trial2 = tmp_path / "trial_fr_kan_emotion"
+        self._write_llm_logs(trial2, "game02", ["P01", "P02"])
+        events2 = [
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P01"}},
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P02"}},
+            {"event_type": "BANKRUPTCY", "round_num": 5, "phase": "commit",
+             "data": {"player_id": "P02", "reason": "Cannot pay entry fee"}},
+            self._fr_event(5, emotion="奸"),
+        ]
+        self._write_events(trial2, "game02", events2)
+        detail2 = get_player_round_detail(tmp_path, "trial_fr_kan_emotion", "game02", "P02", 5, view="god")
+        assert detail2["result"]["final_reflection"]["emotion"] == "奸"
+
+    def test_no_final_reflection_old_run_unchanged(self, tmp_path):
+        """FINAL_REFLECTIONが1件も無い旧runでは、final_reflection/
+        final_reflection_roundともにNoneで、既存キーの表示は従来どおりのまま"""
+        trial = tmp_path / "trial_fr_absent"
+        self._write_llm_logs(trial, "game01", ["P01", "P02"])
+        events = [
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P01"}},
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P02"}},
+            {"event_type": "BANKRUPTCY", "round_num": 5, "phase": "commit",
+             "data": {"player_id": "P02", "reason": "Cannot pay entry fee"}},
+        ]
+        self._write_events(trial, "game01", events)
+
+        detail = get_player_round_detail(tmp_path, "trial_fr_absent", "game01", "P02", 5, view="god")
+        assert detail["result"]["final_reflection"] is None
+        assert detail["final_reflection_round"] is None
+        assert detail["result"]["eliminated"][0]["player_id"] == "P02"
+        assert "memory" in detail and "calls" in detail
+
+    def test_duplicate_events_dedup_to_one(self, tmp_path):
+        """同一(round, pid)に2件のFINAL_REFLECTIONがあっても先勝ちで1件だけ扱われること"""
+        trial = tmp_path / "trial_fr_dup"
+        self._write_llm_logs(trial, "game01", ["P01", "P02"])
+        events = [
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P01"}},
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P02"}},
+            {"event_type": "BANKRUPTCY", "round_num": 5, "phase": "commit",
+             "data": {"player_id": "P02", "reason": "Cannot pay entry fee"}},
+            self._fr_event(5, comment="1件目のコメント"),
+            self._fr_event(5, comment="2件目のコメント（重複ログ）"),
+        ]
+        self._write_events(trial, "game01", events)
+
+        data = get_round_states(tmp_path, "trial_fr_dup", "game01")
+        frs = [fr for fr in data["rounds"]["5"]["final_reflections"] if fr["player_id"] == "P02"]
+        assert len(frs) == 1
+        assert frs[0]["comment"] == "1件目のコメント"
+
+    def test_final_reflection_round_pointer_and_wrong_round_hidden(self, tmp_path):
+        """脱落round以外の詳細ではfinal_reflectionはNoneのままだが、
+        final_reflection_roundで実際に記録されているroundが分かること"""
+        trial = tmp_path / "trial_fr_pointer"
+        self._write_llm_logs(trial, "game01", ["P01", "P02"])
+        events = [
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P01"}},
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P02"}},
+            {"event_type": "BANKRUPTCY", "round_num": 7, "phase": "commit",
+             "data": {"player_id": "P02", "reason": "Cannot pay entry fee"}},
+            self._fr_event(7),
+        ]
+        self._write_events(trial, "game01", events)
+
+        detail_r3 = get_player_round_detail(tmp_path, "trial_fr_pointer", "game01", "P02", 3, view="god")
+        assert detail_r3["result"]["final_reflection"] is None
+        assert detail_r3["final_reflection_round"] == 7
+
+        detail_r7 = get_player_round_detail(tmp_path, "trial_fr_pointer", "game01", "P02", 7, view="god")
+        assert detail_r7["result"]["final_reflection"] is not None
+        assert detail_r7["final_reflection_round"] == 7
+
+    def test_coexists_with_existing_elimination_reason_shapes(self, tmp_path):
+        """P09型 AUTO_COMMIT_FAILURE(contract_violation) / P12型
+        SURVIVAL_CHECK+FORCED_LIQUIDATION(condition_not_met) の両形状で、
+        result.eliminatedが従来どおり1件のままFINAL_REFLECTIONと併存すること"""
+        trial = tmp_path / "trial_fr_coexist"
+        self._write_llm_logs(trial, "game01", ["P01", "P09", "P12"])
+        events = [
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P01"}},
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P09"}},
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P12"}},
+            {"event_type": "AUTO_COMMIT_FAILURE", "round_num": 6, "phase": "commit",
+             "data": {"player_id": "P09", "reason": "contract_violation"}},
+            self._fr_event(6, player_id="P09", elimination_event="AUTO_COMMIT_FAILURE",
+                            elimination_reason="contract_violation"),
+            {"event_type": "SURVIVAL_CHECK", "round_num": 12, "phase": "finance",
+             "data": {"player_id": "P12", "result": "eliminated", "reason": "condition_not_met"}},
+            {"event_type": "FORCED_LIQUIDATION", "round_num": 12, "phase": "finance",
+             "data": {"player_id": "P12", "reason": "condition_not_met"}},
+            self._fr_event(12, player_id="P12", elimination_event="FORCED_LIQUIDATION",
+                            elimination_reason="condition_not_met"),
+        ]
+        self._write_events(trial, "game01", events)
+
+        detail_p09 = get_player_round_detail(tmp_path, "trial_fr_coexist", "game01", "P09", 6, view="god")
+        assert len(detail_p09["result"]["eliminated"]) == 1
+        assert detail_p09["result"]["eliminated"][0]["reason"] == "contract_violation"
+        assert detail_p09["result"]["final_reflection"] is not None
+
+        detail_p12 = get_player_round_detail(tmp_path, "trial_fr_coexist", "game01", "P12", 12, view="god")
+        assert len(detail_p12["result"]["eliminated"]) == 1
+        assert detail_p12["result"]["eliminated"][0]["reason"] == "condition_not_met"
+        assert detail_p12["result"]["final_reflection"] is not None
+
+    def test_empty_or_rejected_content_degrades_to_none(self, tmp_path):
+        """emotion/defeat_cause/commentすべて空（status=empty等）なら、
+        イベント自体はあっても final_reflection は None として扱われること
+        （degradedケース。「イベントが無い」場合と描画を区別するため
+        final_reflection_roundは値を持ち続ける想定だが、本テストでは
+        final_reflectionのNone化のみを確認する）"""
+        trial = tmp_path / "trial_fr_empty"
+        self._write_llm_logs(trial, "game01", ["P01", "P02"])
+        events = [
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P01"}},
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P02"}},
+            {"event_type": "BANKRUPTCY", "round_num": 5, "phase": "commit",
+             "data": {"player_id": "P02", "reason": "Cannot pay entry fee"}},
+            self._fr_event(5, emotion=None, defeat_cause=None, comment="", status="empty"),
+        ]
+        self._write_events(trial, "game01", events)
+
+        detail = get_player_round_detail(tmp_path, "trial_fr_empty", "game01", "P02", 5, view="god")
+        assert detail["result"]["final_reflection"] is None
+
+    def test_frontend_has_god_gated_final_reflection_section(self):
+        """index.htmlにgod限定セクションの🔒ラベルとescapeHtml経由の描画が
+        存在すること（frontend側にテスト基盤が無いため文字列検査で担保する）"""
+        html = INDEX_HTML_PATH.read_text(encoding="utf-8")
+        assert "final_reflection" in html
+        assert "🔒 脱落時コメント（神視点）" in html
+        assert "escapeHtml(fr.comment" in html or "escapeHtml(fr.comment || '')" in html
+        assert "escapeHtml(fr.defeat_cause)" in html

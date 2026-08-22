@@ -135,6 +135,11 @@ class Game:
         self.trade_proposals: list[CardTradeProposal] = []
         self._trade_counts: dict[str, int] = {}  # ラウンド内トレード回数
 
+        # FINAL_REFLECTION: 脱落者の最終コメントを呼んだplayer_idの集合。
+        # state派生（is_alive/elimination_round）で対象を決めるため、
+        # 同一脱落に対しengineが複数eventを出しても二重発火しない。
+        self._final_reflection_done: set[str] = set()
+
     def run(self) -> GameResult:
         """
         ゲームを実行する
@@ -176,6 +181,9 @@ class Game:
             self._phase_reflection(round_num)
             if self._abort_requested_for_budget():
                 return self._finalize()
+            # 脱落者の最終コメント（演出/記録専用。ゲーム結果には影響しない）。
+            # budget中断チェックは入れない — この後はログ集計のみで追加APIが発生しないため。
+            self._phase_final_reflection(round_num)
             # AFTER分析で「各ラウンド終了時の生存者数」を推測せず取得できるよう、
             # すべての通常ゲームで軽量な集計イベントを残す。
             self._log_round_complete(round_num)
@@ -1010,6 +1018,132 @@ class Game:
             except Exception:
                 # メモ更新の失敗はゲーム進行に影響させない（前ラウンドのmemoryを維持）
                 continue
+
+    _ELIMINATION_EVENT_TYPES = {
+        "BANKRUPTCY", "AUTO_COMMIT_FAILURE", "FORCED_LIQUIDATION",
+        "ELIMINATION", "SURVIVAL_CHECK",
+    }
+
+    def _build_elimination_context(self, pid: str, round_num: int) -> dict:
+        """
+        FINAL_REFLECTION prompt用に、脱落原因・清算結果を確定済みstateと
+        event logから読み取り専用で組み立てる（Game state・エンジン判定には
+        一切書き戻さない、表示用データの取得のみ）。
+
+        reason は PlayerState.elimination_reason（確定state）をそのまま使う。
+        phase/event_type/liquidation は当該ラウンド・当該playerのevent logを
+        走査して補足する（無くてもreasonだけで最低限のprompt文言は組める）。
+        """
+        p = self.players[pid]
+        reason = p.elimination_reason or "unknown"
+
+        liquidation: dict[str, Any] | None = None
+        event_type: str | None = None
+        phase: str | None = None
+        has_auto_commit_failure = False
+
+        for event in self.logger.events:
+            if event.round_num != round_num or event.event_type not in self._ELIMINATION_EVENT_TYPES:
+                continue
+            data = event.data or {}
+            if data.get("player_id") != pid:
+                continue
+            if event.event_type == "AUTO_COMMIT_FAILURE":
+                has_auto_commit_failure = True
+            if liquidation is None and "cash_before" in data:
+                # 強制清算recordを持つevent（BANKRUPTCY/AUTO_COMMIT_FAILUREは
+                # elim_ops.forced_liquidation()のrecordを直接マージ、
+                # settlement/financeのFORCED_LIQUIDATIONはrecordそのもの）
+                liquidation = {
+                    "cash_before": data.get("cash_before"),
+                    "debt_before": data.get("debt_before"),
+                    "debt_repaid": data.get("debt_repaid"),
+                    "bad_debt": data.get("bad_debt"),
+                    "cash_confiscated": data.get("cash_confiscated"),
+                    "cards_destroyed": data.get("cards_destroyed"),
+                }
+                event_type = event.event_type
+                phase = event.phase
+            elif event_type is None:
+                event_type = event.event_type
+                phase = event.phase
+
+        reason_labels = {
+            "contract_violation": "契約違反による脱落（署名した義務を履行できなかった／違反した）",
+            "bankruptcy": "破産による脱落（Entry Feeまたは必須返済を支払えなかった）",
+            "condition_not_met": (
+                f"最終ラウンド生存条件未達（借金完済かつ現金"
+                f"{self.config.survival_cash // 10_000}万円以上を満たせなかった）"
+            ),
+        }
+        reason_label = reason_labels.get(reason, f"脱落（理由: {reason}）")
+        if reason == "contract_violation" and has_auto_commit_failure:
+            reason_label += "。契約義務が互いに矛盾し、合法なコミットが1つも存在しなかった"
+
+        return {
+            "player_id": pid,
+            "round": round_num,
+            "reason": reason,
+            "reason_label": reason_label,
+            "phase": phase,
+            "event_type": event_type,
+            "liquidation": liquidation,
+            "is_final_round": round_num >= self.config.num_rounds,
+            "survival_cash": self.config.survival_cash,
+        }
+
+    def _phase_final_reflection(self, round_num: int) -> None:
+        """
+        Phase 7: Final Reflection（脱落者の最終コメント。演出/記録専用）
+
+        当ラウンドで新たに脱落したプレイヤー本人に、脱落の事実と原因を伝えて
+        1回だけ最終コメントを書かせる。ゲーム状態・戻り値・生存判定には一切触れない。
+        通常Reflectionと違いR12もスキップせず、生存者は対象外。
+
+        対象は `self.players` の確定state（is_alive/elimination_round）から派生する
+        （各脱落サイトへのqueue push不要）。同一脱落に対しengineが複数eventを
+        出しても、call前に `_final_reflection_done` へ追加するため二重発火しない。
+        """
+        if not self.config.final_reflection_enabled:
+            return
+        newly = [
+            pid for pid, p in sorted(self.players.items())
+            if not p.is_alive
+            and p.elimination_round == round_num
+            and pid not in self._final_reflection_done
+        ]
+        for pid in newly:
+            # 例外が起きても再試行しないよう、call前に必ずマークする（1player 1回保証）
+            self._final_reflection_done.add(pid)
+            agent = self.agents.get(pid)
+            method = getattr(agent, "final_reflect", None)
+            if not callable(method):
+                continue  # Bot/StubAgent等はfinal_reflectを持たないので対象外
+            ctx = self._build_elimination_context(pid, round_num)
+            try:
+                result = method(
+                    self.players[pid], round_num,
+                    self._build_visible_state(round_num, for_player_id=pid), ctx,
+                )
+            except Exception as e:
+                result = {"status": "error", "error": str(e)[:200]}
+            if not isinstance(result, dict):
+                result = {}
+            self.logger.log("FINAL_REFLECTION", round_num, "final_reflection", data={
+                "player_id": pid,
+                "round": round_num,
+                "elimination_reason": ctx["reason"],
+                "elimination_phase": ctx["phase"],
+                "elimination_event": ctx["event_type"],
+                "model_id": getattr(getattr(agent, "model_info", None), "model_id", None),
+                "status": result.get("status"),
+                "emotion": result.get("emotion"),
+                "defeat_cause": result.get("defeat_cause"),
+                "comment": result.get("comment", ""),
+                "comment_chars": result.get("chars", 0),
+                "truncated": result.get("truncated", False),
+                "salvaged": result.get("salvaged", []),
+            })
 
     def _finalize(self) -> GameResult:
         """ゲーム終了処理"""

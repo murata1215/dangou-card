@@ -151,43 +151,276 @@ def parse_response(
     return strategy, action
 
 
-def extract_memory(text: str) -> str:
+_FENCE_CLOSED_RE = re.compile(r'^\s*```(?:json)?\s*\n?(.*?)\n?```\s*$', re.DOTALL)
+_FENCE_OPEN_RE = re.compile(r'^\s*```(?:json)?\s*\n?(.*)$', re.DOTALL)
+_MEMORY_KEY_RE = re.compile(r'"memory"\s*:\s*"')
+_COMMENT_KEY_RE = re.compile(r'"comment"\s*:\s*"')
+
+
+def _strip_code_fence(text: str) -> str:
     """
-    Reflection応答から引き継ぎメモリ（memory）を抽出する
+    コードフェンス（```json ... ``` / ``` ... ```、閉じフェンス欠落含む）を剥がす
+
+    閉じフェンスが無い場合（Gemini等でtruncatedになったレスポンス）も
+    開始フェンスだけ剥がして中身を返す。フェンスが無ければそのまま返す。
+    """
+    m = _FENCE_CLOSED_RE.match(text)
+    if m:
+        return m.group(1).strip()
+    m = _FENCE_OPEN_RE.match(text)
+    if m:
+        return m.group(1).strip()
+    return text.strip()
+
+
+_FIELD_KEY_RES: dict[str, re.Pattern[str]] = {
+    "memory": _MEMORY_KEY_RE,
+    "comment": _COMMENT_KEY_RE,
+}
+
+
+def _recover_string_field(stripped: str, key: str) -> str | None:
+    """
+    JSON文字列値中の生改行等でjson.loadsが失敗する {"<key>": "..."} 形の
+    応答から、当該フィールドの本文を手動でサルベージする（WRAPPER_LEAK対策）。
+
+    "<key>": の直後から本文を切り出し、末尾のコードフェンス残骸・閉じクオート・
+    閉じ波括弧を除去したうえで、JSONエスケープ（\\n, \\t, \\", \\\\）を復元する。
+    復旧できなければNoneを返す（呼出側は空文字列＝安全側フォールバックへ）。
+
+    Args:
+        stripped: フェンス剥がし済みのテキスト
+        key: サルベージ対象のJSONキー名（"memory" / "comment"）
+    """
+    key_re = _FIELD_KEY_RES.get(key)
+    if key_re is None:
+        key_re = re.compile(re.escape(f'"{key}"') + r'\s*:\s*"')
+    m = key_re.search(stripped)
+    if not m:
+        return None
+    body = stripped[m.end():]
+    # 末尾に残ったコードフェンスを除去
+    body = re.sub(r'```\s*$', '', body).rstrip()
+    # 末尾の閉じクオート＋任意の波括弧/空白を除去（"<key>": "...本文..." } の "} 部分）
+    body = re.sub(r'"\s*\}?\s*$', '', body)
+    if not body:
+        return None
+    # JSONエスケープの復元
+    body = (
+        body.replace("\\\\", "\x00")  # 一時退避（多重置換を避ける）
+        .replace("\\n", "\n")
+        .replace("\\t", "\t")
+        .replace('\\"', '"')
+        .replace("\x00", "\\")
+    )
+    body = body.strip()
+    return body or None
+
+
+def _unescape_json_string(body: str) -> str:
+    """JSON文字列本文（クオート除去済み）のエスケープを復元する
+    （\\\\, \\n, \\t, \\" の4種。_recover_string_field系で共有する）。"""
+    return (
+        body.replace("\\\\", "\x00")  # 一時退避（多重置換を避ける）
+        .replace("\\n", "\n")
+        .replace("\\t", "\t")
+        .replace('\\"', '"')
+        .replace("\x00", "\\")
+    )
+
+
+def _recover_string_field_bounded(stripped: str, key: str) -> str | None:
+    """
+    "<key>": " の直後から、JSONエスケープを尊重して最初の未エスケープ `"` までを
+    切り出す（境界を守るサルベージ）。
+
+    _recover_string_field() は末尾までの貪欲マッチのため「最後のキー」専用
+    （それより前のキーに使うと後続キーごと飲み込んでしまう）。こちらは先頭〜
+    中間に出現する emotion / defeat_cause のような短いキーを、後続キーを
+    壊さずに救済するために使う。
+
+    閉じクオートが見つからない場合（＝そのキーの途中で応答が物理的に
+    打ち切られた場合）は None を返す（呼出側は他の手段にフォールバックする）。
+
+    Args:
+        stripped: フェンス剥がし済みのテキスト
+        key: サルベージ対象のJSONキー名
+    """
+    key_re = _FIELD_KEY_RES.get(key)
+    if key_re is None:
+        key_re = re.compile(re.escape(f'"{key}"') + r'\s*:\s*"')
+    m = key_re.search(stripped)
+    if not m:
+        return None
+
+    i = m.end()
+    n = len(stripped)
+    chars: list[str] = []
+    while i < n:
+        c = stripped[i]
+        if c == "\\" and i + 1 < n:
+            # エスケープシーケンス（\" \\ \n \t 等）はペアで取り込み、
+            # \" の " をフィールド終端と誤認しないようにする
+            chars.append(c)
+            chars.append(stripped[i + 1])
+            i += 2
+            continue
+        if c == '"':
+            # 未エスケープの閉じクオート＝正常終端
+            body = _unescape_json_string("".join(chars)).strip()
+            return body or None
+        chars.append(c)
+        i += 1
+
+    # ループ終了まで閉じクオートに到達しなかった＝途中で打ち切られている
+    return None
+
+
+def _degrade_wrapper_to_text(stripped: str) -> str:
+    """
+    サルベージが尽きて完全に復旧不能なJSONラッパー文字列から、既知キー名や
+    構造記号を取り除いた「読める断片」だけを残す（wrapper leak対策の最終防衛線）。
+
+    既存の ok_plaintext 経路は「JSON/ラッパーの痕跡が無い素の散文」専用のため、
+    ここは looks_like_wrapper だが救済不能だった場合にのみ使う別経路
+    （呼出側で status="ok_plaintext_wrapper" として区別する）。
+    """
+    text = stripped
+    text = re.sub(r'```(?:json)?', '', text)
+    text = re.sub(
+        r'"(?:emotion|defeat_cause|comment|final_word|message)"\s*:\s*"?',
+        '', text,
+    )
+    text = text.strip().lstrip("{").rstrip("}").strip()
+    text = re.sub(r'"\s*$', '', text).strip()
+    # ここまでの除去で残る文字は、この経路（完全復旧不能）に限っては
+    # ほぼJSON構文の残骸（引用符・カンマ・コロン）であり、本文として
+    # 読める断片だけを残すため、残存する引用符も除去する
+    # （wrapper leak対策の最終防衛線であり、体裁の美しさより安全側を優先する）
+    text = text.replace('"', '').strip()
+    return text
+
+
+def _recover_memory_field(stripped: str) -> str | None:
+    """extract_memory_with_status()専用の互換ラッパー（既存テスト完全互換）"""
+    return _recover_string_field(stripped, "memory")
+
+
+def extract_memory_with_status(text: str) -> tuple[str, str]:
+    """
+    Reflection応答から引き継ぎメモリ（memory）を抽出し、(本文, 判定ステータス)を返す
 
     形式を強制しない自由記述フィールドのため、通常のparse_response()とは
-    別経路で処理する。JSONで {"memory": "..."} を返せなくても、
-    応答テキストそのものをメモとして採用する（ParseErrorを投げない）。
+    別経路で処理する（ParseErrorを投げない）。
+
+    ステータス値:
+      "empty"                        — 空応答
+      "ok"                           — 正規JSONに文字列memoryキーがあった
+      "ok_recovered"                 — JSONとしては壊れていたが手動サルベージできた
+                                        （生改行入りJSON等。WRAPPER_LEAK対策）
+      "ok_plaintext"                 — JSON/ラッパーの痕跡が無い素の散文（従来どおり採用）
+      "rejected_no_memory_key"       — JSONは取れたがmemoryキーが無い/文字列でない
+                                        （WRONG_PAYLOAD対策。strategy JSON丸ごと採用を防ぐ）
+      "rejected_unparsable_wrapper"  — ラッパーの痕跡はあるが復旧不能
+
+    "rejected_*" は空文字列を返す。呼出側（LLMAgent.reflect）は既存の
+    「空文字なら前ラウンドのメモリを維持する」ロジックによりそのまま安全側に倒れる
+    （空文字での上書きは絶対にしない、という既存の安全設計に相乗りする）。
 
     Args:
         text: LLMのレスポンステキスト（空文字列の場合は空文字を返す）
-
-    Returns:
-        抽出したメモ文字列（前後の空白を除去）。何も取れなければ空文字列。
     """
     if not text:
-        return ""
+        return "", "empty"
 
     data = extract_json(text)
     if isinstance(data, dict):
         memory = data.get("memory")
         if isinstance(memory, str):
-            return memory.strip()
-        # memoryキーが無い/文字列でない場合でも、JSON自体は取れているので
-        # 応答全体を自由記述として採用する（自由記述ゆえに構造化を強制しない）
+            return memory.strip(), "ok"
+        logger.warning(
+            "memory extraction rejected: JSON parsed but no valid 'memory' string key "
+            "(keys=%s)", sorted(data.keys()),
+        )
+        return "", "rejected_no_memory_key"
 
-    # JSON抽出に失敗、またはmemoryキーが無い場合は生テキストを採用
-    return text.strip()
+    stripped = _strip_code_fence(text)
+    looks_like_wrapper = stripped.startswith("{") or bool(_MEMORY_KEY_RE.search(stripped))
+    if looks_like_wrapper:
+        recovered = _recover_memory_field(stripped)
+        if recovered:
+            return recovered, "ok_recovered"
+        logger.warning("memory extraction rejected: unparsable JSON wrapper could not be recovered")
+        return "", "rejected_unparsable_wrapper"
+
+    # JSON/ラッパーの痕跡が無い素の散文は、自由記述ゆえにそのまま採用する
+    return text.strip(), "ok_plaintext"
+
+
+def extract_memory(text: str) -> str:
+    """
+    extract_memory_with_status() の本文のみを返す互換ラッパー
+
+    ステータス情報（parse_status）が必要な呼出側は
+    extract_memory_with_status() を直接使うこと。
+    """
+    memory, _status = extract_memory_with_status(text)
+    return memory
+
+
+_MEMORY_BOUNDARIES = ["\n\n", "\n", "。", "」", "）", "！", "？", ".", "!", "?"]
+
+
+def _shrink_to_boundary(memory: str, max_chars: int, keep_ratio: float = 0.85) -> tuple[str, bool]:
+    """
+    max_charsを超える場合、意味の切れ目（段落/文/かぎ括弧閉じ等）で縮める
+
+    max_chars * keep_ratio 以降に境界が見つからなければハードカットに
+    フォールバックする（境界を探して15%以上失うくらいならハードカットの方が
+    マシ、という安全弁）。境界が無いテキスト（例: 記号を含まない長文）でも
+    必ず max_chars 以下に収まる。
+
+    Returns:
+        (縮めた本文, 縮約が発生したか)
+    """
+    if max_chars <= 0 or len(memory) <= max_chars:
+        return memory, False
+    head = memory[:max_chars]
+    floor = int(max_chars * keep_ratio)
+    best = -1
+    for boundary in _MEMORY_BOUNDARIES:
+        idx = head.rfind(boundary)
+        if idx >= floor:
+            best = max(best, idx + len(boundary))
+    if best > 0:
+        return head[:best].rstrip(), True
+    return head, True
+
+
+def normalize_memory_with_truncation(memory: str, max_chars: int) -> tuple[str, bool]:
+    """引き継ぎメモリを最大文字数で切り詰め、(本文, 切り詰めが発生したか)を返す"""
+    if not memory:
+        return "", False
+    memory = memory.strip()
+    shrunk, truncated = _shrink_to_boundary(memory, max_chars)
+    if truncated:
+        logger.warning(
+            "memory truncated at boundary: %d chars -> %d chars (max_chars=%d)",
+            len(memory), len(shrunk), max_chars,
+        )
+    return shrunk, truncated
 
 
 def normalize_memory(memory: str, max_chars: int) -> str:
-    """引き継ぎメモリを最大文字数で切り詰める"""
-    if not memory:
-        return ""
-    memory = memory.strip()
-    if max_chars > 0 and len(memory) > max_chars:
-        memory = memory[:max_chars]
-    return memory
+    """
+    引き継ぎメモリを最大文字数で切り詰める（互換ラッパー）
+
+    文中で唐突に切れないよう、段落・文・かぎ括弧などの意味境界を優先して
+    縮める（境界が見つからない場合は従来どおりハードカット）。
+    切り詰め発生の有無が必要な呼出側は normalize_memory_with_truncation() を使うこと。
+    """
+    text, _truncated = normalize_memory_with_truncation(memory, max_chars)
+    return text
 
 
 # 有効な感情値の集合
@@ -201,6 +434,153 @@ def normalize_emotion(strategy: dict[str, Any]) -> dict[str, Any]:
         strategy = dict(strategy)  # コピーして変更
         strategy["emotion"] = "平静"
     return strategy
+
+
+def parse_final_reflection(text: str, max_chars: int = 2000) -> dict[str, Any]:
+    """
+    脱落者の最終コメント（FINAL_REFLECTION）応答を解析する
+
+    extract_memory_with_status() と設計を意図的に変えている点:
+    Memoryは「壊れた抽出結果で前ラウンドの正しいMemoryを上書きする」ことが
+    最大の害だったため、疑わしきは空文字→旧値保持にした。
+    こちらは守るべき前回値が存在せず、空にすると本人の最後の言葉が永久に
+    失われる。そのためサルベージを尽くした上で、最後は自然文フォールバック
+    を許容する。ただしフェンス剥がし＋キーサルベージを先に通すので、
+    ```json{"comment": " のようなラッパー文字列がそのまま残ることはない。
+
+    判定順:
+    1. dict かつ comment/final_comment が文字列 → status="ok"
+    2. dict だが comment が無い/文字列でない → 残りフィールドから組み立て
+       （それも無ければ status="rejected_no_comment", comment=""）
+    3. dict でない → フェンス剥がし + emotion/defeat_cause/comment を個別に
+       サルベージ（境界サルベージ優先。comment のみ末尾切断に備えた貪欲
+       フォールバックあり）→ "ok_recovered"（3キー全てが揃わなくてもよい）。
+       comment が復旧できず defeat_cause だけ得られた場合は defeat_cause を
+       comment 代わりに採用し "ok_assembled" とする。
+    4. それも失敗 → 既知キー名やコードフェンス等の構造記号を除去した残骸を
+       comment とする → "ok_plaintext_wrapper"（生JSONラッパー文字列を
+       そのままcommentへ流出させないための最終防衛線）
+    5. そもそもJSON/ラッパーの痕跡が無い素の散文 → そのまま採用 → "ok_plaintext"
+
+    2026-08-22実測（doc/trials/final_reflection_smoke_2026-08-22.md）の2パターンを
+    踏まえた設計:
+    - C1(L1): finish_reason=max_tokensでcommentの途中がそのまま物理的に途切れる
+      （閉じクオート/波括弧が無い）。emotion/defeat_causeは先頭側で完結しており
+      本来救済可能。
+    - C6(L6): finish_reason=stopだがcomment内の生改行でjson.loadsが失敗する。
+      emotion/defeat_causeはcommentより前にあり、いずれも閉じクオートまで完結。
+    どちらも「emotion/defeat_causeはcommentより先に出現し、大抵は閉じている」
+    という共通点があるため、境界を守るサルベージ（_recover_string_field_bounded）
+    をemotion/defeat_cause/commentすべてにまず試し、commentだけ末尾切断用に
+    貪欲フォールバック（_recover_string_field）を残す。
+
+    Args:
+        text: LLMのレスポンステキスト（空文字列なら status="empty"）
+        max_chars: comment の保存上限文字数
+
+    Returns:
+        {"status", "comment", "emotion", "defeat_cause", "chars", "truncated", "salvaged"}
+        salvaged: このレスポンスから個別サルベージで復旧できたキー名のリスト
+                  （strict JSON成功時やgenuineな素の散文では常に空リスト）
+    """
+    if not text:
+        return {
+            "status": "empty", "comment": "", "emotion": None,
+            "defeat_cause": None, "chars": 0, "truncated": False, "salvaged": [],
+        }
+
+    def _finalize(
+        comment: str, emotion: Any, defeat_cause: Any, status: str,
+        salvaged: list[str] | None = None,
+    ) -> dict[str, Any]:
+        comment = (comment or "").strip()
+        saved, truncated = normalize_memory_with_truncation(comment, max_chars)
+        norm_emotion = emotion if emotion in VALID_EMOTIONS else None
+        norm_cause = str(defeat_cause).strip() if isinstance(defeat_cause, str) and defeat_cause.strip() else None
+        return {
+            "status": status, "comment": saved, "emotion": norm_emotion,
+            "defeat_cause": norm_cause, "chars": len(saved), "truncated": truncated,
+            "salvaged": salvaged or [],
+        }
+
+    data = extract_json(text)
+    if isinstance(data, dict):
+        comment = data.get("comment")
+        if not isinstance(comment, str):
+            comment = data.get("final_comment")
+        if isinstance(comment, str) and comment.strip():
+            return _finalize(comment, data.get("emotion"), data.get("defeat_cause"), "ok")
+
+        # comment キーが無い/空 → 残りフィールドから最低限組み立てる
+        fallback_parts = []
+        for key in ("defeat_cause", "final_word", "message"):
+            v = data.get(key)
+            if isinstance(v, str) and v.strip():
+                fallback_parts.append(v.strip())
+        if fallback_parts:
+            return _finalize(
+                " / ".join(fallback_parts), data.get("emotion"), data.get("defeat_cause"),
+                "ok_assembled",
+            )
+        logger.warning(
+            "final_reflection parse rejected: JSON parsed but no usable 'comment' "
+            "(keys=%s)", sorted(data.keys()),
+        )
+        return _finalize("", data.get("emotion"), data.get("defeat_cause"), "rejected_no_comment")
+
+    stripped = _strip_code_fence(text)
+    looks_like_wrapper = stripped.startswith("{") or bool(_COMMENT_KEY_RE.search(stripped))
+    if looks_like_wrapper:
+        salvaged: list[str] = []
+
+        emotion_raw = _recover_string_field_bounded(stripped, "emotion")
+        if emotion_raw:
+            salvaged.append("emotion")
+
+        cause_raw = _recover_string_field_bounded(stripped, "defeat_cause")
+        if cause_raw:
+            salvaged.append("defeat_cause")
+
+        # comment: 境界サルベージを優先（C6=raw改行で閉じクオートは残っている）。
+        # 見つからなければ末尾切断（C1=finish_reason=max_tokens）に備えて
+        # 既存の貪欲マッチへフォールバックする。
+        comment_raw = _recover_string_field_bounded(stripped, "comment")
+        if comment_raw:
+            salvaged.append("comment")
+        else:
+            comment_raw = _recover_string_field(stripped, "comment")
+            if comment_raw:
+                salvaged.append("comment")
+
+        if comment_raw:
+            logger.warning(
+                "final_reflection parse: strict JSON failed, salvaged fields=%s "
+                "(status=ok_recovered)", salvaged,
+            )
+            return _finalize(comment_raw, emotion_raw, cause_raw, "ok_recovered", salvaged)
+
+        if cause_raw:
+            # commentが完全に失われた（キー自体が途中で切断された等）場合でも、
+            # defeat_causeが取れていれば「本人の最後の言葉」を完全な空にはしない
+            logger.warning(
+                "final_reflection parse: comment unrecoverable, using defeat_cause "
+                "as comment fallback (salvaged=%s, status=ok_assembled)", salvaged,
+            )
+            return _finalize(cause_raw, emotion_raw, cause_raw, "ok_assembled", salvaged)
+
+        # 個別サルベージも尽きた＝ラッパーの痕跡はあるが復旧不能。
+        # 生のJSONラッパー文字列をそのままcommentへ流出させない
+        # （wrapper leak対策）。既知キー名・構造記号を除去した残骸のみ採用する。
+        logger.warning(
+            "final_reflection parse: unparsable JSON wrapper, degrading to "
+            "stripped text (status=ok_plaintext_wrapper)",
+        )
+        degraded = _degrade_wrapper_to_text(stripped)
+        return _finalize(degraded, emotion_raw, cause_raw, "ok_plaintext_wrapper", salvaged)
+
+    # JSON/ラッパーの痕跡が無い、素の散文はそのまま採用する
+    # （自由記述の最終コメントとして、疑わしきは棄却より採用を優先）
+    return _finalize(stripped, None, None, "ok_plaintext")
 
 
 def _convert_action(

@@ -472,7 +472,12 @@ function renderRoundDetail(detail) {
   const container = document.getElementById('modal-round-detail');
   const r = detail.round;
   const total = detail.total_rounds;
-  const jump = Array.from({length: total}, (_, i) => `<button type="button" class="round-jump ${r === i + 1 ? 'active' : ''}" data-round="${i + 1}">R${i + 1}</button>`).join('');
+  const frRound = detail.final_reflection_round;
+  const jump = Array.from({length: total}, (_, i) => {
+    const rn = i + 1;
+    const mark = frRound === rn ? '💀' : '';
+    return `<button type="button" class="round-jump ${r === rn ? 'active' : ''}" data-round="${rn}" title="${mark ? '最後の言葉あり' : ''}">${mark}R${rn}</button>`;
+  }).join('');
   const startFallback = r === 1 ? 'R1開始時は引き継ぎMemoryなし' : 'このtrialには開始時Memoryの記録がありません';
   const endFallback = r === total ? '最終RのためReflectionなし（次Rなし）' : 'このRの終了後Memoryは記録されていません';
   let calls = '';
@@ -505,6 +510,39 @@ function renderRoundDetail(detail) {
     return `<article class="detail-call visibility-secret"><span class="visibility-label">🎭 匿名発言</span><br>公開上の発信者: 匿名<br><span class="visibility-label">🔒 神視点: 実発信者 ${escapeHtml(m.actual_sender || '?')}</span><pre class="detail-full-text">${escapeHtml(m.message || '')}</pre></article>`;
   }).join('');
   const secretContracts = (secretEvents.contracts || []).map(c => `<article class="detail-call visibility-secret"><span class="visibility-label">📜 🔒 秘匿契約</span><br><b>${escapeHtml(c.contract_id || '?')}</b> / ${(c.parties || []).map(escapeHtml).join(', ')}<pre class="detail-full-text">${escapeHtml(JSON.stringify({terms: c.terms, outcomes: c.outcomes || []}, null, 2))}</pre></article>`).join('');
+  const fr = detail.final_reflection;
+  let frSection = '';
+  if (fr) {
+    const frVendor = guessVendor(detailPlayer.modelName || '');
+    const frEmotion = emotionDisplay(fr.emotion || '平静', frVendor);
+    const truncatedNote = fr.truncated ? '<div class="detail-muted">⚠ 上限により末尾を切り詰め</div>' : '';
+    if (godMode) {
+      const defeatCause = fr.defeat_cause
+        ? `<div><b>敗因:</b> ${escapeHtml(fr.defeat_cause)}</div>`
+        : '<div class="detail-muted">敗因: 記録なし</div>';
+      const comment = fr.has_comment
+        ? `<pre class="detail-full-text">${escapeHtml(fr.comment || '')}</pre>`
+        : '<div class="detail-empty">最後の言葉: 記録なし</div>';
+      const salvagedNote = (fr.salvaged && fr.salvaged.length) ? ` / salvaged: ${escapeHtml(fr.salvaged.join(', '))}` : '';
+      const metaNote = `<div class="detail-meta">status: ${escapeHtml(fr.status || '?')}${salvagedNote} / ${fr.comment_chars || 0}字</div>`;
+      frSection = `<section class="detail-section final-reflection secret-section">
+        <h3>🔒 脱落時コメント（神視点）</h3>
+        <div class="final-reflection-emotion">${frEmotion}</div>
+        ${defeatCause}
+        <div><b>最後の言葉:</b></div>
+        ${comment}
+        ${truncatedNote}
+        ${metaNote}
+      </section>`;
+    } else {
+      frSection = `<section class="detail-section final-reflection">
+        <h3>脱落時コメント</h3>
+        <div class="final-reflection-emotion">${frEmotion}</div>
+        <span class="visibility-label">🔒 最後の言葉が記録されています（本文は神視点のみ）</span>
+        ${truncatedNote}
+      </section>`;
+    }
+  }
   container.innerHTML = `
     <div class="round-nav">
       <button type="button" class="round-nav-btn" data-round="${r - 1}" ${r <= 1 ? 'disabled' : ''}>◀ 前R</button>
@@ -518,7 +556,8 @@ function renderRoundDetail(detail) {
       <div class="detail-result"><b>Commit:</b> ${escapeHtml(commit)}<br><b>市場:</b><br>${markets}<br><b>公開契約:</b><br>${contracts}<br><b>脱落:</b> ${escapeHtml(eliminated)}</div>
     </section>
     ${godMode ? `<section class="detail-section secret-section"><h3>🔒 神視点の秘匿情報</h3>${secretMessages || secretContracts ? secretMessages + secretContracts : '<div class="detail-empty">このRの秘匿イベント記録なし</div>'}</section>` : ''}
-    <section class="detail-section memory-end"><h3>R終了後のHandover Memory</h3>${memoryText(detail.memory.end, endFallback)}</section>`;
+    <section class="detail-section memory-end"><h3>R終了後のHandover Memory</h3>${memoryText(detail.memory.end, endFallback)}</section>
+    ${frSection}`;
   container.querySelectorAll('[data-round]').forEach(button => button.addEventListener('click', () => {
     const next = Number(button.dataset.round);
     if (next >= 1 && next <= total) { detailPlayer.round = next; loadRoundDetail(); }

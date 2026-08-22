@@ -1,5 +1,50 @@
 # Changelog
 
+## 2026-08-22: Viewer FINAL_REFLECTION表示（public/god二層設計）
+
+Engine側で実装・実API試験済み（GO判定、`doc/trials/final_reflection_smoke2_2026-08-22.md`）の
+FINAL_REFLECTION（脱落者の最終振り返り: `emotion`/`defeat_cause`/`comment`）をViewerで
+閲覧可能にした。`comment`は実測2/2で§8.2秘匿情報（契約条項の復唱、交渉相手の特定）を
+含んでいたため、本文（`comment`/`defeat_cause`）はgod限定、公開viewには非秘匿の骨組み
+（`emotion`/`round`/`has_comment`/`truncated`/`availability`）のみを返す二層設計を採用した。
+
+- **収集**: `viewer/log_parser.py`の`get_round_states()`イベントループに`FINAL_REFLECTION`
+  分岐を追加。`add_elimination()`と同じ先勝ちdedupパターンの新設ヘルパ`add_final_reflection()`で
+  top-level `round_num`により振り分け、emotionは`VALID_EMOTIONS`で読み取り時にも再検証する
+  （`viewer/log_parser.py`内の`_extract_emotion()`は`奸`欠落のため意図的に不使用）。
+- **API**: `_safe_round_result()`の返り値に`final_reflection`キーを追加しview別に出し分け
+  （本文が実質空、またはイベント自体が無い場合は`None`）。`get_player_round_detail()`に
+  発見性のための`final_reflection_round`ポインタを追加（追加I/Oなし）。既存キーは型・意味とも
+  無変更の後方互換。
+- **表示**: `viewer/static/index.html`の`renderRoundDetail()`にmemory-endセクションの後へ
+  「脱落時コメント」セクションを追加（public: 感情+「本文は神視点のみ」ラベル、god: `🔒`付きで
+  敗因・最後の言葉を表示）。ラウンドジャンプ列に💀マークを追加。`EMOTION_EMOJI`/`EMOTION_EN`への
+  キー追加は既存テストとの乖離を避けるため行っていない。
+- **スコープ外**: `engine/`/`llm/`/`bots/`は無変更（`VALID_EMOTIONS`の読み取り専用importのみ）、
+  `viewer/server.py`も無変更。
+- **テスト**: `tests/test_viewer.py`に独立fixtureの`TestFinalReflectionViewer`を新設し10ケース
+  （完全データ、public境界回帰、部分欠損、emotion不正値のNone正規化、FRなし旧run互換、
+  重複イベント1件化、ポインタと非該当round非表示、既存脱落reason表示との共存、empty時の
+  `None`縮退、frontend文字列検査）。全体回帰は869/869 PASS（既存859+新規10）。
+  smoke2実データ（読み取り専用）で公開viewに本文が一切出現しないことを機械的に再確認した。
+- 詳細は `doc/devlog/2026-08-22_162917.md` を参照。Viewer再起動は本サイクルでは実施していない
+  （次回反映には`systemctl --user restart dangou-viewer`が必要）。
+
+## 2026-08-22: Handover Memory 3000文字化 + 3バグ修正
+
+R12実戦ログ（`logs/llm/trial_C_l12_r12_20260822/game01`、reflection応答105件）を読み取り専用で分析し、ラウンド間の唯一の文脈継承路であるHandover Memory文字列が3つの実装バグで実質破壊されていたことが判明したため、`llm/response_parser.py`を中心に修正した。ゲームルール・勝敗ロジックは無変更。
+
+- **WRAPPER_LEAK修正**: `extract_memory_with_status()`を新設し、`json.loads`が生改行入りJSON文字列値で失敗した場合に`return text.strip()`へ落ちて` ```json{"memory": " `等のラッパーがそのまま本文として保存される問題を修正した。フェンス剥がし（閉じフェンス有無両対応）→`"memory":"`探索→エスケープ復元、の手動サルベージ経路（`_strip_code_fence`/`_recover_memory_field`）を追加し、復旧不能な場合のみ空文字を返す。実測: 39件中36件を`ok_recovered`で救済、残りはWRONG_PAYLOAD側で別集計（後述）。
+- **WRONG_PAYLOAD修正**: `{"memory"}`キーが無く`{"strategy": {...}}`等を丸ごと採用していたfall-through（意図的だった旧設計）を廃止し、`memory`キーが無い/文字列でない場合は`rejected_no_memory_key`として空文字を返すよう反転した。空文字は`LLMAgent.reflect()`の既存セーフティ（「空文字での上書きは絶対にしない」）にそのまま乗るため、`llm_agent.py`の判定ロジック自体は変更していない。実測3件（P05 R5/R7, P12 R3、いずれもgemini-3.5-flash-lite）は前ラウンドのMemoryを維持するfallbackとなった。
+- **TRUNCATED修正**: `normalize_memory_with_truncation()`で`memory[:max_chars]`のハードカットを、`\n\n`/`\n`/`。`/`」`/`）`等の意味境界を優先する縮約（`_shrink_to_boundary`、keep_ratio=0.85のフロア付き、境界が見つからなければハードカットへフォールバック）に置換した。境界なしテキストで`len == max_chars`となる既存テスト互換は維持。実測は102件中1件のみ縮約発生（P04 R8: 3470字→2992字、文末`。`で終端）。
+- **上限3000字化**: `engine/config.py`に単一ソース定数`HANDOVER_MEMORY_MAX_CHARS = 3000`を新設し、`GameConfig.memory_max_chars`の既定値および`viewer/log_parser.py`の表示上限をそこから参照するよう統一した（マジックナンバー`1000`の残存箇所ゼロを確認）。実測分布（上限なし）で3000字は102件中101件(99.0%)を無切断でカバーする。`viewer/log_parser.py`の`_extract_memory_text`は過去ログ再現のため旧fallback挙動自体は意図的に現状維持（コメント明記）。
+- **プロンプト最小追記**: `build_reflection_prompt()`末尾に「末尾から切り詰められる」旨と優先順位ヒント2〜3行、および「古い情報を現在の事実として書かない」旨を追加。テンプレート強制・大規模redesignは行っていない。
+- **Observability追加**: `_update_last_log_memory()`を新設し、`_update_last_log_emotion`と同じ`llm_logger._entries[-1]`後付け更新パターンで`memory_chars_raw`/`memory_chars_saved`/`memory_parse_status`/`memory_truncated`/`fallback_reason`/`memory_fallback_streak`をログへ記録する。連続fallback2回以上で`logger.warning`。
+- **Before/After再評価**（`scripts/reeval_memory_fix.py`新設、読み取り専用・LLM API不使用、`logs/`無改変を確認済み）: WRAPPER_LEAK 39→0、WRONG_PAYLOAD 3→0、1000字上限ヒット52→3000字上限ヒット1、fallback 0→3件（いずれも旧Memory保持で文脈継続を確認）、保存文字数 mean 704→995 / median 985→1037 / p95 1000→2103。parse_status内訳: `ok`=66 / `ok_recovered`=36 / `rejected_no_memory_key`=3。
+- **テスト**: `tests/test_memory.py`に新規ケースを追加し既存ケースは全て維持（64/64 PASS）。全体回帰は808/808 PASS（警告4件はいずれも既存・無関係のFastAPI/pytest/asyncio非推奨警告）。
+- **コスト影響**: 実測tokens/char・実測モデル別饒舌さに基づく試算で、現実的ケース+2.4%（$5.99→$6.14）、最悪ケース（全モデルが3000字上限まで書く）+19.0%（$5.99→$7.13）。いずれも`game_cost_cap_usd=15.0`・`per_player_game_cost_cap_usd=3.0`の範囲内。
+- 詳細は `doc/devlog/2026-08-22_123701.md` および `.devrelay-output/memory_fix_reeval_2026-08-22.md` を参照。
+
 ## 2026-08-21: Viewer詳細表示・神視点・運用の整備
 
 - プレイヤー詳細にR1〜R12のラウンド表示と既存生ログタブを追加し、Handover Memory、全文reasoning、Native Thinking token、行動とラウンド結果を再構成できるようにした。実ログの`MARKET_RESULT.participants`が整数となる形式にも互換対応した。
@@ -966,3 +1011,126 @@ LLMなしルールベースBot 8種（Random/Conservative/StrongCardSave/HighPri
   `tests/test_model_matrix.py` / `tests/test_model_smoke.py` / `tests/test_registry_18.py` /
   `tests/test_l6_r12_trial.py` / `tests/test_gemini_37_eval.py`（新設）も本作業範囲で更新・追加。
   全テストスイート **780 passed**。
+
+## 2026-08-22: FINAL_REFLECTION（脱落者の最終コメント）実装
+
+- 脱落確定ラウンドの末尾（通常のReflectionフェイズ直後）で、脱落者本人に一度だけ最終コメント
+  （敗因・他プレイヤー評価・最後の一言、3キーJSON: `emotion`/`defeat_cause`/`comment`）を
+  書かせる演出/記録専用機能を追加した。ゲーム結果・生存判定・払い戻しロジックには一切影響しない。
+- `GameConfig.final_reflection_enabled`（既定False）で制御し、`default_8_s2()` /
+  `baseline_v1_s2()` のS2プリセットでのみ有効化した。既定挙動・非S2プリセットは無変更。
+- `Game._phase_final_reflection()` は「`is_alive=False` かつ `elimination_round==round_num`」
+  でstateから対象を導出し、`_final_reflection_done` 集合で1脱落=1回を保証する。engineが
+  同一脱落に対し `ELIMINATION`+`FORCED_LIQUIDATION` 等の複数eventを出しても二重発火しない。
+  `_build_elimination_context()` で契約違反/破産/R12生存条件未達の3種のreason_labelと
+  清算内訳を合成し、`build_final_reflection_prompt()`（`llm/prompt_builder.py`）に渡す。
+- `llm/response_parser.py` に `parse_final_reflection()` を新設。4段フォールバック
+  （JSON正常→他キー組立→salvage復旧→プレーンテキスト受理）で、Handover Memoryとは逆に
+  「失敗時は空にせずプレーンテキストで残す」安全側設計とした。`_recover_memory_field` を
+  `_recover_string_field(stripped, key)` へ一般化し、`comment` キーにも対応させた。
+- `LLMAgent.final_reflect()` は `self._memory` / `memory_history` を一切変更せず、
+  結果を `self.final_reflection` にのみ保持する。API失敗・budget block・空応答は
+  ステータス付きの安全な既定値を返しGameResultへ影響しない。`_call_llm()` に
+  `max_tokens_override`（既定None、後方互換）を追加し、`final_reflection_max_tokens`
+  （既定1000、通常の2000より低くしてbudget block発生率を抑制）を適用する。
+  `final_reflect` は `PlayerAgent` 基底クラスに追加せず、`Game` 側の `getattr`+`callable`
+  判定でduck-typing的にスキップするため、Bot/StubAgentは無変更。
+- `tests/test_final_reflection.py` を新規41件で追加（発火条件・elimination_context導出・
+  prompt描画・parser edge case・LLMAgent単体・実ログクロスチェック）。既存
+  `tests/test_memory.py` 64件は無回帰。全体回帰 `uv run pytest tests/ -q` は
+  **849 passed**（808既存＋41新規）。
+- 過程で `tests/test_model_matrix.py` の4件が、Phase3統合テストの実ゲーム経路
+  （`build_phase3_config()` が `baseline_v1_s2` を使用）でプレイヤーが意図通り脱落し
+  FINAL_REFLECTIONが末尾に追加発火したことで、`logical_calls` 期待値と
+  「最後のcallのmax_tokens」を検証する箇所が陳腐化して失敗した。これは仕様どおりの
+  正しい挙動と判断し、テスト側（`logical_calls` を+1、`max_tokens` 捕捉を本編最初の
+  callのみに変更）を修正して整合を取った。`scripts/model_matrix.py`・Engine本体は無変更。
+- `uv run python scripts/dry_run.py`（12人版Bot専用）は例外なく完走。`git status --short logs/`
+  は空で実trialログへの書き込みは無し。読み取り専用で `logs/llm/trial_C_l12_r12_20260822/`
+  のGAME_END確定値に対し導出ロジックを手動再現し、既知の7脱落・5生存者が期待どおり
+  1回/0回として導出できることを確認した（`.devrelay-output/final_reflection_targets_2026-08-22.md`）。
+- Viewer側の表示対応は本サイクルのスコープ外（実データが無いため次サイクルへ）。
+
+## 2026-08-22: FINAL_REFLECTION 実API小規模疎通試験
+
+次のL12×R12本番トライアル前に、FINAL_REFLECTIONが実プロバイダ境界を越えて全モデルで
+動くかを、フルゲームを回さず最小コストで確認する疎通試験を実施した。新規スクリプト
+`scripts/final_reflection_smoke.py`を追加し、現行L12ロスターのユニーク6モデル
+（`get_model("L1")`〜`get_model("L6")`、ハードコードなし）に各1回だけ実API呼び出しを行った。
+
+- Bot 12体（`bots.BOT_REGISTRY`）だけの実`Game`インスタンスを対象ラウンドまで進めて
+  本物の会話・市場結果をAPI課金ゼロで作った上で、`engine.elimination.forced_liquidation()`
+  （本物の清算関数）で対象seatを合成脱落させ、実際に存在する5種のevent形状
+  （`BANKRUPTCY`単独/`AUTO_COMMIT_FAILURE`単独/`ELIMINATION`+`FORCED_LIQUIDATION`/
+  `FORCED_LIQUIDATION`単独/`SURVIVAL_CHECK`+`FORCED_LIQUIDATION`）をengine本体と同一の
+  `data`構造で記録した。対象seatのみ`LLMAgent`へ差し替え、実際に
+  `Game._phase_final_reflection()`を1回呼び出す（`_build_elimination_context()`→
+  `build_final_reflection_prompt()`→`final_reflect()`→`parse_final_reflection()`→
+  ログ後付けを全て実経路で通す）。`engine/`・`llm/`・`bots/`本体は無変更。
+- API-freeゲート（`--parser-selftest`/`--dry-run`/`--mock`）を実装し、実API実行前に
+  内部で強制的に自動実行して1つでも失敗したら実APIには一切進まない設計にした。実装中に
+  2件の設計バグを発見・修正した:「`--dry-run`が実際に`_phase_final_reflection()`を呼んでおり
+  0-call証明になっていなかった」問題と、「`sent_max_tokens`が常に`None`で検証項目
+  `max_tokens=1000`override確認が未検証だった」問題（`RecordingAdapter`を新設して解消）。
+- 安全策として`GameCostBudget`（本番の予約/精算経路）と`scripts.model_matrix.BudgetedAdapter`
+  （インポートのみ、無変更で再利用）の二重ガード、`--run-id`ディレクトリの
+  `mkdir(exist_ok=False)`による二重送信防止を実装した。
+- `uv run pytest tests/test_final_reflection.py -q`は**41 passed**、
+  `uv run pytest tests/ -q`は**849 passed**（無回帰）。API-freeゲート全PASS後、
+  `--run-id fr_smoke_20260822 --max-calls 6 --max-cost 0.08`で実API実行し、
+  6/6 API成功、実測コスト合計**$0.030300**（計画worst_case $0.03368、上限$0.05以内）。
+  model_id/provider/base_urlは全件`get_model(key)`と一致、`sent_max_tokens=1000`を
+  6/6実測確認（L6のレジストリ既定2000からのoverrideも確認）。Memory非破壊・state非破壊
+  6/6、二重発火なし6/6、二重送信防止（同一`--run-id`再実行はAPI呼び出し0件で即中断）を
+  確認した。`git status --short logs/llm/`は空（既存trialログへの書き込みなし）。
+- 発見: C1（L1: Claude Haiku 4.5）は`finish_reason=max_tokens`でJSON応答が途中で
+  物理的に打ち切られ、C6（L6: DeepSeek V4 Flash）は`comment`文字列内の未エスケープ
+  改行でstrict JSON解析が失敗し、いずれも`ok_recovered`へフォールバックして
+  `emotion`/`defeat_cause`を喪失した（生ログでは両方とも本来含まれていたことを確認済み）。
+  ゲーム状態・Memory・生存判定への影響はゼロ（安全項目は全PASS）だが、Planに定めたGO基準
+  「`parse_status ∈ {ok, ok_assembled}`が全件」を満たさないため、**判定はNO-GO（条件付き）**
+  とした。具体的な修正案（`final_reflection_max_tokens`引き上げ、`ok_recovered`ティアでの
+  `emotion`/`defeat_cause`正規表現救済追加）を`doc/trials/final_reflection_smoke_2026-08-22.md`
+  へ記録した。いずれも`llm/response_parser.py`/`engine/config.py`側の改善であり、本サイクルの
+  スコープ外（次サイクル候補）。
+- 出力: `logs/smoke/final_reflection_fr_smoke_20260822/`（`calls.jsonl`, `manifest.json`,
+  `real_llm_calls.jsonl`, `report.md`）、`doc/trials/final_reflection_smoke_2026-08-22.md`、
+  `.devrelay-output/final_reflection_smoke_2026-08-22.md`。
+
+## 2026-08-22: FINAL_REFLECTION 3000-token化 + parser救済強化 + L1/L6再試験（NO-GO解消・GO判定）
+
+直前の疎通試験（上記）が出したNO-GO（条件付き）の原因2件を修正し、対象2モデルのみで
+実API再試験しGOを得た。原因はC1（L1: `finish_reason=max_tokens`によるJSON物理切断）と
+C6（L6: `comment`内未エスケープ改行によるstrict JSON失敗）が`ok_recovered`へフォールバックし
+`emotion`/`defeat_cause`を喪失していたこと。
+
+- **出力上限引き上げ**: `engine/config.py`の`final_reflection_max_tokens`を`1000→3000`
+  （プロバイダ側物理切断を避けるハード上限であり狙う長さではない、と明記）。適用箇所は
+  `llm/llm_agent.py:final_reflect()`の`max_tokens_override`経由のみで他フェイズは無影響
+  （grep 2箇所のみで確認）。`llm/prompt_builder.py:build_final_reflection_prompt()`に
+  「800〜1500字程度で簡潔に」誘導と`comment`内改行の`\n`エスケープ指示を追加し、
+  `3000`という数値自体はプロンプトに一切出さない（`dry_run_prompts.md`目視で確認）。
+- **parser救済ティア強化**: `llm/response_parser.py`に境界を尊重したスキャン
+  `_recover_string_field_bounded()`（後続キーを飲み込まない、`emotion`/`defeat_cause`向け）と
+  共有ヘルパ`_unescape_json_string()`、全損時も生JSONを漏らさずプレーンテキスト化する
+  `_degrade_wrapper_to_text()`（新ステータス`ok_plaintext_wrapper`）を新設し、
+  `parse_final_reflection()`の救済ティアを`emotion`/`defeat_cause`/`comment`独立救済へ
+  全面書き換えた。全フェイズ共有の`extract_json()`とHandover Memory側が使う
+  `_recover_string_field()`は無変更のまま温存。新規`salvaged`フィールドをFINAL_REFLECTION
+  イベント（`engine/game.py`）とログ後付け（`llm/llm_agent.py`）へ追加伝播（既存キー無変更）。
+- **テスト**: `tests/test_final_reflection.py`に実際のcycle 1生ログ形状を元にした新規9件
+  （C1/C6形状の3キー救済、境界スキャンの後続キー非侵食、ラッパー漏洩ゼロ等）と
+  config既定値確認1件を追加。`uv run pytest tests/test_final_reflection.py -q`は
+  **51 passed**（既存41+新規10）、`tests/test_memory.py`は**64 passed**（無回帰）、
+  `uv run pytest tests/ -q`は**859 passed**（既存849+新規10、失敗0）。
+- **L1/L6再試験**: API-freeゲート（`--parser-selftest`拡張・`--dry-run --cases C1,C6`・
+  `--mock --cases C1,C6`）全PASS後、`--run-id fr_smoke2_20260822 --cases C1,C6 --max-calls 2
+  --max-cost 0.05 --max-cost-per-call 0.03`で実API実行。2/2 API成功、実測コスト合計
+  **$0.009883**（計画worst_case $0.02025、上限$0.05以内）。C1は`finish_reason=end_turn`
+  （旧`max_tokens`から改善）、C6は`comment`内改行が正しく`\n`エスケープされており、
+  両方とも`parse_status="ok"`（`salvaged=[]`、救済不要）で3キーとも一発正常取得。
+  `state_unchanged`/`memory_unchanged`は前後完全一致、`second_call_fired=False`、
+  両commentの全文を人手確認し脱落理由と清算内訳の整合を確認。Planの「Change 5」11項目の
+  GO基準をすべて満たし、**判定はGO**。二重送信防止・`git status --short logs/llm/`空も再確認。
+- 詳細は `doc/devlog/2026-08-22_153938.md` および
+  `doc/trials/final_reflection_smoke2_2026-08-22.md` を参照。

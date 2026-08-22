@@ -35,7 +35,10 @@ from engine.models import MarketCommit
 from llm.prompt_builder import (
     build_negotiation_prompt, build_commit_prompt, build_reflection_prompt,
 )
-from llm.response_parser import extract_memory, normalize_memory
+from llm.response_parser import (
+    extract_memory, normalize_memory,
+    extract_memory_with_status, normalize_memory_with_truncation,
+)
 
 from tests.conftest import make_player, make_market
 
@@ -281,6 +284,24 @@ class TestReflectionPrompt:
         prompt = build_reflection_prompt(player, 2, visible_state, config, memory=None)
         assert "500字" in prompt
 
+    def test_reflection_prompt_states_3000_by_default(self):
+        """既定configでは上限指示が3000字になる（HANDOVER_MEMORY_MAX_CHARS化）"""
+        player = make_player("P01", cash=1_000_000)
+        visible_state = {"messages": [], "last_round_results": None, "my_obligations": []}
+        config = GameConfig.baseline_v1_s2(8)
+        assert config.memory_max_chars == 3000
+        prompt = build_reflection_prompt(player, 2, visible_state, config, memory=None)
+        assert "3000字以内" in prompt
+
+    def test_reflection_prompt_mentions_tail_truncation_and_ordering(self):
+        """末尾切り詰めと優先順位ヒントが指示文に含まれる（品質向上の最小プロンプト変更）"""
+        player = make_player("P01", cash=1_000_000)
+        visible_state = {"messages": [], "last_round_results": None, "my_obligations": []}
+        config = GameConfig.baseline_v1_s2(8)
+        prompt = build_reflection_prompt(player, 2, visible_state, config, memory=None)
+        assert "末尾から切り詰められます" in prompt
+        assert "古い情報を現在の事実として書かないでください" in prompt
+
 
 class TestMemoryInjection:
     """negotiation/commitプロンプトへのmemory注入"""
@@ -333,6 +354,26 @@ class TestMemoryInjection:
         )
         assert "あなたの記憶" not in prompt
 
+    def test_long_memory_injected_into_negotiation_prompt(self):
+        """3000字上限化により長いmemoryもnegotiationプロンプトに全長入る（切り詰めない）"""
+        player = make_player("P01", cash=1_000_000, debt=500_000)
+        config = GameConfig.baseline_v1_s2(8)
+        long_memory = "あ" * 2500
+        prompt = build_negotiation_prompt(
+            player, 2, 1, self._base_state(), config, memory=long_memory,
+        )
+        assert long_memory in prompt
+
+    def test_long_memory_injected_into_commit_prompt(self):
+        player = make_player("P01", cash=1_000_000, debt=500_000)
+        config = GameConfig.baseline_v1_s2(8)
+        markets = [make_market("M01", base_prize=480_000)]
+        long_memory = "あ" * 2500
+        prompt = build_commit_prompt(
+            player, markets, 2, self._base_state(), config, memory=long_memory,
+        )
+        assert long_memory in prompt
+
 
 class TestNormalizeMemory:
     """normalize_memory() — 最大文字数への切り詰め"""
@@ -348,6 +389,63 @@ class TestNormalizeMemory:
 
     def test_empty_memory_stays_empty(self):
         assert normalize_memory("", 1000) == ""
+
+
+class TestNormalizeMemoryBoundaryShrink:
+    """
+    normalize_memory_with_truncation() — 意味境界を優先した切り詰め（TRUNCATED修正、2026-08-22）
+
+    実ログでは normalize_memory が memory[:max_chars] のハードカットのみだったため
+    52/105が文中で切断されていた。段落・文・かぎ括弧などの境界を優先しつつ、
+    境界が max_chars*0.85 より手前にしか無い場合や境界そのものが無い場合は
+    従来どおりハードカットにフォールバックする（既存テスト互換）。
+    """
+
+    def test_under_cap_not_truncated(self):
+        """上限以下ならそのまま返す（境界探索自体が発生しない）"""
+        memory = "文" * 2500
+        result, truncated = normalize_memory_with_truncation(memory, 3000)
+        assert result == memory
+        assert truncated is False
+
+    def test_over_cap_cuts_at_paragraph_boundary(self):
+        """段落境界（\\n\\n）が保持窓内にあればそこで切る（文中切断を避ける）"""
+        memory = "あ" * 2600 + "\n\n" + "い" * 500
+        result, truncated = normalize_memory_with_truncation(memory, 3000)
+        assert truncated is True
+        assert len(result) <= 3000
+        assert "い" not in result
+        assert result.endswith("あ")
+
+    def test_over_cap_cuts_at_sentence_boundary(self):
+        """段落境界が無くても文末（。）が保持窓内にあればそこで切る"""
+        memory = "あ" * 2600 + "。" + "い" * 500
+        result, truncated = normalize_memory_with_truncation(memory, 3000)
+        assert truncated is True
+        assert "い" not in result
+        assert result.endswith("。")
+
+    def test_no_boundary_falls_back_to_hard_cut(self):
+        """区切り文字が一切無ければ従来どおりハードカットする（既存テスト互換）"""
+        memory = "X" * 5000
+        result, truncated = normalize_memory_with_truncation(memory, 3000)
+        assert truncated is True
+        assert len(result) == 3000
+        assert result == "X" * 3000
+
+    def test_boundary_before_keep_ratio_floor_falls_back_to_hard_cut(self):
+        """保持窓（max_chars*0.85以降）より手前にしか境界が無ければ無視してハードカットする"""
+        memory = "あ" * 10 + "。" + "い" * 3200
+        result, truncated = normalize_memory_with_truncation(memory, 3000)
+        assert truncated is True
+        assert len(result) == 3000
+        assert result == memory[:3000]
+
+    def test_normalize_memory_wrapper_matches_with_truncation(self):
+        """互換ラッパーnormalize_memory()はnormalize_memory_with_truncation()の本文と一致する"""
+        memory = "あ" * 2600 + "。" + "い" * 500
+        expected, _ = normalize_memory_with_truncation(memory, 3000)
+        assert normalize_memory(memory, 3000) == expected
 
 
 class TestExtractMemory:
@@ -375,6 +473,95 @@ class TestExtractMemory:
         result = extract_memory(text)
         assert result == "表向きは友好的に"
         assert "内心" not in result
+
+
+class TestExtractMemoryWithStatus:
+    """
+    extract_memory_with_status() — WRAPPER_LEAK/WRONG_PAYLOAD修正の検証（2026-08-22）
+
+    実ログ105件の調査で判明した2バグへの対処:
+      - WRAPPER_LEAK: JSON文字列値中の生改行等でjson.loadsが失敗し、
+        フェンス+`{"memory": "`まで含めた生テキストが丸ごと保存されていた（39/105）
+      - WRONG_PAYLOAD: {"strategy": {...}}等memoryキーの無いJSONが
+        丸ごとmemoryとして採用されていた（3/105）
+    """
+
+    def test_fenced_json_with_literal_newlines_is_recovered(self):
+        """JSON文字列値中に生の改行が入っていてもjson.loadsに頼らず本文を復旧する"""
+        text = '```json\n{"memory": "行1\n行2「引用」"}\n```'
+        memory, status = extract_memory_with_status(text)
+        assert status == "ok_recovered"
+        assert memory == '行1\n行2「引用」'
+
+    def test_unfenced_json_with_literal_newlines_is_recovered(self):
+        """コードフェンスが無い生改行入りJSONでも同様に復旧する"""
+        text = '{"memory": "行1\n行2"}'
+        memory, status = extract_memory_with_status(text)
+        assert status == "ok_recovered"
+        assert memory == "行1\n行2"
+
+    def test_escaped_newline_restored_as_real_newline(self):
+        """正規のJSONエスケープ（\\n）は通常のjson.loads経由で改行として復元される"""
+        text = '{"memory": "行1\\n行2"}'
+        memory, status = extract_memory_with_status(text)
+        assert status == "ok"
+        assert memory == "行1\n行2"
+
+    def test_japanese_quotes_and_symbols_intact(self):
+        """日本語のかぎ括弧・記号を含む正常JSONが壊れず抽出される"""
+        text = '{"memory": "「約束」→★合意 【重要】"}'
+        memory, status = extract_memory_with_status(text)
+        assert status == "ok"
+        assert memory == "「約束」→★合意 【重要】"
+
+    def test_strategy_only_json_rejected(self):
+        """memoryキーの無いJSON（strategyのみ）は採用しない（WRONG_PAYLOAD修正）"""
+        text = '```json\n{"strategy": {"target_market": "M01"}}\n```'
+        memory, status = extract_memory_with_status(text)
+        assert status == "rejected_no_memory_key"
+        assert memory == ""
+
+    def test_strategy_and_action_json_rejected(self):
+        text = '{"strategy": {"foo": "bar"}, "action": {"type": "pass"}}'
+        memory, status = extract_memory_with_status(text)
+        assert status == "rejected_no_memory_key"
+        assert memory == ""
+
+    def test_memory_non_string_rejected(self):
+        """memoryキーはあるが値が文字列でない場合も採用しない"""
+        for text in ('{"memory": 123}', '{"memory": null}', '{"memory": ["a", "b"]}'):
+            memory, status = extract_memory_with_status(text)
+            assert status == "rejected_no_memory_key", text
+            assert memory == "", text
+
+    def test_non_json_prose_accepted_as_plaintext(self):
+        """JSON/ラッパーの痕跡が無い素の散文はそのまま採用される（従来どおり）"""
+        text = "P04を信用しない。R4はP02と組む。"
+        memory, status = extract_memory_with_status(text)
+        assert status == "ok_plaintext"
+        assert memory == text
+
+    def test_malformed_wrapper_without_memory_key_does_not_leak(self):
+        """memoryキーが無く復旧の手がかりも無い壊れたJSONラッパーは空文字を返す"""
+        text = '```json\n{"strategy": {"target'
+        memory, status = extract_memory_with_status(text)
+        assert status == "rejected_unparsable_wrapper"
+        assert memory == ""
+        assert not memory.startswith("```")
+        assert not memory.startswith('{"memory')
+        assert not memory.startswith('{"strategy')
+
+    def test_open_fence_without_close_is_salvaged(self):
+        """閉じフェンス欠落（Gemini等でtruncatedになった応答）でも本文を拾う"""
+        text = '```json\n{"memory": "R5でP02と同盟成立\n次は'
+        memory, status = extract_memory_with_status(text)
+        assert status == "ok_recovered"
+        assert memory == "R5でP02と同盟成立\n次は"
+
+    def test_empty_text_returns_empty_status(self):
+        memory, status = extract_memory_with_status("")
+        assert memory == ""
+        assert status == "empty"
 
 
 class TestLLMAgentReflect:
@@ -507,6 +694,97 @@ class TestLLMAgentReflect:
 
         sent_prompt = mock_call.call_args.args[2]
         assert "R1でP04に裏切られた" in sent_prompt
+
+    @patch.object(__import__("llm.llm_agent", fromlist=["LLMAgent"]).LLMAgent, "_call_llm")
+    def test_memory_preserved_on_strategy_payload(self, mock_call):
+        """memoryキーの無いJSON（strategyのみ）が返っても前ラウンドのメモリを維持する（WRONG_PAYLOAD修正）"""
+        agent = self._make_agent()
+        agent._memory = "既存メモ"
+        mock_call.return_value = ('{"strategy": {"target_market": "M01"}}', {})
+        agent.reflect(self._make_player(), 5, self._visible_state())
+        assert agent._memory == "既存メモ"
+        assert agent.memory_history == []
+
+    @patch.object(__import__("llm.llm_agent", fromlist=["LLMAgent"]).LLMAgent, "_call_llm")
+    def test_memory_preserved_on_malformed_wrapper(self, mock_call):
+        """復旧不能な壊れたJSONラッパーが返っても前ラウンドのメモリを維持する（WRAPPER_LEAK修正）"""
+        agent = self._make_agent()
+        agent._memory = "既存メモ"
+        mock_call.return_value = ('```json\n{"strategy": {"target', {})
+        agent.reflect(self._make_player(), 5, self._visible_state())
+        assert agent._memory == "既存メモ"
+
+    @patch.object(__import__("llm.llm_agent", fromlist=["LLMAgent"]).LLMAgent, "_call_llm")
+    def test_memory_updated_on_literal_newline_json(self, mock_call):
+        """JSON文字列値中に生改行が入っていても正しく復旧・更新される（WRAPPER_LEAK修正）"""
+        agent = self._make_agent()
+        mock_call.return_value = ('```json\n{"memory": "R5でP02と同盟成立\nR6は油断しない"}\n```', {})
+        agent.reflect(self._make_player(), 5, self._visible_state())
+        assert agent._memory == "R5でP02と同盟成立\nR6は油断しない"
+
+    @patch.object(__import__("llm.llm_agent", fromlist=["LLMAgent"]).LLMAgent, "_call_llm")
+    def test_memory_not_truncated_under_3000(self, mock_call):
+        agent = self._make_agent(memory_max_chars=3000)
+        long_text = "あ" * 2500
+        mock_call.return_value = ('{"memory": "' + long_text + '"}', {})
+        agent.reflect(self._make_player(), 1, self._visible_state())
+        assert agent._memory == long_text
+        assert len(agent._memory) == 2500
+
+    @patch.object(__import__("llm.llm_agent", fromlist=["LLMAgent"]).LLMAgent, "_call_llm")
+    def test_log_fields_recorded_on_ok(self, mock_call):
+        """正常抽出時にllm_loggerの最新エントリへobservabilityフィールドが後付けされる"""
+        agent = self._make_agent()
+        agent.llm_logger._entries = [{}]
+        mock_call.return_value = ('{"memory": "テスト"}', {})
+        agent.reflect(self._make_player(), 1, self._visible_state())
+
+        entry = agent.llm_logger._entries[-1]
+        assert entry["memory_parse_status"] == "ok"
+        assert entry["memory_chars_raw"] == len("テスト")
+        assert entry["memory_chars_saved"] == len("テスト")
+        assert entry["memory_truncated"] is False
+        assert entry["fallback_reason"] is None
+        assert entry["memory_fallback_streak"] == 0
+
+    @patch.object(__import__("llm.llm_agent", fromlist=["LLMAgent"]).LLMAgent, "_call_llm")
+    def test_log_fields_recorded_on_fallback(self, mock_call):
+        """fallback（旧Memory保持）時にstatus/fallback_reason/streakが記録される"""
+        agent = self._make_agent()
+        agent.llm_logger._entries = [{}]
+        agent._memory = "既存メモ"
+        mock_call.return_value = ('{"strategy": {"foo": "bar"}}', {})
+        agent.reflect(self._make_player(), 2, self._visible_state())
+
+        entry = agent.llm_logger._entries[-1]
+        assert entry["memory_parse_status"] == "rejected_no_memory_key"
+        assert entry["fallback_reason"] == "rejected_no_memory_key"
+        assert entry["memory_chars_saved"] == len("既存メモ")
+        assert entry["memory_fallback_streak"] == 1
+        assert agent._memory == "既存メモ"
+
+    @patch.object(__import__("llm.llm_agent", fromlist=["LLMAgent"]).LLMAgent, "_call_llm")
+    def test_fallback_streak_increments_and_resets(self, mock_call):
+        """連続fallbackでstreakが増え、成功したら0に戻る"""
+        agent = self._make_agent()
+        agent.llm_logger._entries = [{}]
+
+        mock_call.return_value = ('{"strategy": {}}', {})
+        agent.reflect(self._make_player(), 1, self._visible_state())
+        assert agent.memory_fallback_streak == 1
+        assert agent.memory_fallback_count == 1
+
+        agent.llm_logger._entries.append({})
+        agent.reflect(self._make_player(), 2, self._visible_state())
+        assert agent.memory_fallback_streak == 2
+        assert agent.memory_fallback_count == 2
+
+        agent.llm_logger._entries.append({})
+        mock_call.return_value = ('{"memory": "回復"}', {})
+        agent.reflect(self._make_player(), 3, self._visible_state())
+        assert agent.memory_fallback_streak == 0
+        assert agent.memory_fallback_count == 2
+        assert agent._memory == "回復"
 
 
 class TestMemorySecrecy:

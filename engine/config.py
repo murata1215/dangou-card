@@ -8,6 +8,16 @@
 
 from pydantic import BaseModel, field_validator
 
+HANDOVER_MEMORY_MAX_CHARS = 3000
+"""
+引き継ぎメモリ（Handover Memory）の既定最大文字数の単一ソース。
+
+GameConfig.memory_max_chars の既定値、およびviewer側の表示上限
+（viewer/log_parser.py: _extract_memory_text）が参照する。
+実ログ102件の実測分布で 3000字は 101/102 (99.0%) を無切断でカバーする
+（2026-08-22時点の分析。doc/changelog.md参照）。
+"""
+
 
 class GameConfig(BaseModel):
     """
@@ -123,8 +133,29 @@ class GameConfig(BaseModel):
     既定False。S2プリセットでのみTrue。
     """
 
-    memory_max_chars: int = 1000
-    """引き継ぎメモリの最大文字数（超過分は切り詰める）"""
+    memory_max_chars: int = HANDOVER_MEMORY_MAX_CHARS
+    """引き継ぎメモリの最大文字数（超過分は意味境界を優先して切り詰める）"""
+
+    # --- 脱落時の最終コメント（FINAL_REFLECTION） ---
+    final_reflection_enabled: bool = False
+    """
+    True: 脱落確定ラウンドの末尾で、脱落者本人に1回だけ最終コメント
+    （敗因・他プレイヤー評価・最後の一言など）を書かせる。
+    ゲーム結果・勝敗・資産・契約・生存判定には一切影響しない演出/記録専用。
+    既定Falseで旧挙動保持。memory_enabled とは独立フラグ
+    （Memoryを切ってもFINAL_REFLECTIONだけ試せる）。
+    """
+
+    final_reflection_max_chars: int = 2000
+    """最終コメントの保存上限（超過分は意味境界を優先して切り詰める）"""
+
+    final_reflection_max_tokens: int = 3000
+    """final_reflection callだけに適用するmax_output_tokens。
+    これはprovider側の物理的truncationを避けるためのハード上限であり、
+    狙う長さではない（プロンプト側は800〜1500字程度の簡潔な本文を促す。
+    3000という数値自体はプロンプトに一切出さない）。2026-08-22の実API
+    疎通試験で旧値1000だとL1(claude-haiku-4-5)がfinish_reason=max_tokens
+    で出力途中切断されることを実測したため引き上げた。"""
 
     # --- 本戦LLMコスト上限（GameCostBudgetを明示注入した試合だけで有効） ---
     per_player_game_cost_cap_usd: float = 5.0
@@ -207,6 +238,7 @@ class GameConfig(BaseModel):
             "mandatory_repay_k": 0,
             "card_trade_enabled": True,
             "memory_enabled": True,
+            "final_reflection_enabled": True,
         })
 
     @classmethod
@@ -248,4 +280,5 @@ class GameConfig(BaseModel):
             "mandatory_repay_k": 0,
             "card_trade_enabled": True,
             "memory_enabled": True,
+            "final_reflection_enabled": True,
         })
