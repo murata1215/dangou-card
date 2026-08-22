@@ -145,6 +145,11 @@ attempt条件を保存ログから再現できる。未指定時のrequest spec�
 [`doc/cost/api_cost_estimate_2026-08-20.md`](doc/cost/api_cost_estimate_2026-08-20.md) に固定している。
 Console値とR12円建て実績はユーザー提供値であり、run内usageからの実測とは区別している。
 
+新モデルを評価する際は、正式ロスターのキー（`M3`等）を直接書き換えず、`M3_G37_EVAL`のような
+`_EVAL`接尾辞の検証専用キーを`MODEL_REGISTRY`に追加する。正式キーは既存モデルを指したまま変更されない。
+Gemini 3.7 Flash検証（`scripts/gemini_37_eval.py`）は、この方式でPhase 1〜3を実施し、正式M3
+（Gemini 3.5 Flash）比で実測64.04%低コストと確認した（詳細: `doc/gemini_37_flash_eval_report.md`）。
+
 コスト計算は全フェーズで実測usageベースの `_usage_cost()` に統一されており、Geminiのhidden
 thinking・xAI等のキャッシュ割引・Anthropicのusage慣習差を正しく反映する。詳細は `rules/project.md`
 の該当節を参照。

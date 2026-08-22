@@ -15,7 +15,14 @@ from llm.models import MODEL_REGISTRY
 from llm.adapters import AdapterError
 from scripts.model_matrix import BudgetedAdapter
 from scripts.l6_r12_report import generate_report
-from scripts.llm_trial import build_trial_manifest, effective_trial_model
+import scripts.llm_trial as llm_trial
+from scripts.llm_trial import (
+    L12_ONLY_ROSTER,
+    build_phase_c_agents,
+    build_trial_manifest,
+    effective_trial_model,
+    validate_l12_only_trial,
+)
 
 
 def test_l6_runtime_output_override_is_non_destructive_and_auditable():
@@ -47,6 +54,41 @@ def test_manifest_records_stop_after_round_without_changing_s2_total_rounds():
 
     assert manifest["num_rounds"] == 12
     assert manifest["stop_after_round"] == 3
+
+
+def test_l12_only_gate_requires_exact_l_roster_and_r12_s2_settings():
+    config = GameConfig.baseline_v1_s2(num_players=12).model_copy(update={
+        "per_player_game_cost_cap_usd": 3.0,
+        "game_cost_cap_usd": 15.0,
+    })
+    validate_l12_only_trial(L12_ONLY_ROSTER, config, 2000, True, 1, None)
+
+    with pytest.raises(ValueError, match="L1,L1"):
+        validate_l12_only_trial(["L1"] * 12, config, 2000, True, 1, None)
+    with pytest.raises(ValueError, match="Season 2"):
+        validate_l12_only_trial(L12_ONLY_ROSTER, GameConfig.baseline_v1(num_players=12), 2000, True, 1, None)
+    with pytest.raises(ValueError, match="2000"):
+        validate_l12_only_trial(L12_ONLY_ROSTER, config, 1999, True, 1, None)
+
+
+def test_l12_duplicate_model_seats_have_independent_agent_state_and_memory(tmp_path, monkeypatch):
+    """同一モデル2席でもadapter/logger/agent/memoryを共有しない。"""
+    class FakeAdapter:
+        pass
+
+    monkeypatch.setattr(llm_trial, "create_adapter", lambda model: FakeAdapter())
+    config = GameConfig.baseline_v1_s2(num_players=12)
+    agents, llm_agents, seat_map = build_phase_c_agents(
+        L12_ONLY_ROSTER, 0, config, tmp_path, seed=1202, max_output_tokens=2000,
+    )
+
+    assert len(agents) == len(llm_agents) == len(seat_map) == 12
+    assert {name.split(":", 1)[0] for name in seat_map.values()} == {f"L{i}" for i in range(1, 7)}
+    assert all(list(seat_map.values()).count(next(name for name in seat_map.values() if name.startswith(key + ":"))) == 2 for key in {f"L{i}" for i in range(1, 7)})
+    assert len({id(agent) for agent in llm_agents}) == 12
+    assert len({id(agent.memory_history) for agent in llm_agents}) == 12
+    assert len({id(agent.adapter) for agent in llm_agents}) == 12
+    assert all(agent.model_info.max_tokens == 2000 for agent in llm_agents)
 
 
 def test_s2_six_player_prizes_record_normal_and_final_market_multiplier():

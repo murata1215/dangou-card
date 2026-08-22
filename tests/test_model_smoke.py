@@ -97,7 +97,7 @@ def test_worst_case_cost_matches_estimate_cost_ordering():
 
 # --- hidden_thinking_reserve_tokens 対応（2026-08-18） ---
 
-_RESERVE_TARGET_KEYS = ["M3", "L3", "H3", "M4", "L4", "H4"]
+_RESERVE_TARGET_KEYS = ["M3", "M3_G37_EVAL", "L3", "H3", "M4", "L4", "H4"]
 _ZERO_RESERVE_KEYS = [
     k for k in MODEL_REGISTRY if k not in _RESERVE_TARGET_KEYS
 ]
@@ -117,9 +117,9 @@ def test_worst_case_cost_zero_reserve_models_unchanged(key, max_tokens):
     assert actual == pytest.approx(expected)
 
 
-@pytest.mark.parametrize("key", ["M3", "L3", "H3"])
+@pytest.mark.parametrize("key", ["M3", "M3_G37_EVAL", "L3", "H3"])
 def test_worst_case_cost_includes_gemini_hidden_thinking(key):
-    """Gemini対象3モデルは、予約分だけ旧式(estimate_cost直呼び)より高くなること。
+    """Gemini対象モデルは、予約分だけ旧式(estimate_cost直呼び)より高くなること。
     差分は 512 * output_price / 1_000_000 に厳密一致する"""
     model = get_model(key)
     assert model.hidden_thinking_reserve_tokens == 512
@@ -181,10 +181,9 @@ def test_observed_max_thinking_fits_in_reserve():
 
 
 def test_worst_case_cost_reserve_targets_are_exactly_expected_set():
-    """予約>0のキー集合が {M3,L3,H3,M4,L4,H4} の6件と厳密一致し、
-    存在しないキーが紛れ込んでいないこと（CORE_18内であることはtest_model_matrixで別途検証）"""
+    """予約>0は既存6件と検証専用M3_G37_EVALだけであること。"""
     reserved = {k for k, v in MODEL_REGISTRY.items() if v.hidden_thinking_reserve_tokens > 0}
-    assert reserved == {"M3", "L3", "H3", "M4", "L4", "H4"}
+    assert reserved == {"M3", "M3_G37_EVAL", "L3", "H3", "M4", "L4", "H4"}
 
 
 def test_dry_run_does_not_call_api(monkeypatch):

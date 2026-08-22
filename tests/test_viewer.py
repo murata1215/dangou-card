@@ -622,3 +622,371 @@ class TestCommentary:
             assert len(result["rounds"]["1"]) == 2
             assert len(result["rounds"]["2"]) == 1
             assert result["rounds"]["2"][0]["text"] == "R2a"
+
+
+class TestAutoCommitFailureElimination:
+    """AUTO_COMMIT_FAILURE（合法Commit0件による強制脱落）がViewerで
+    「脱落」として正しく表示されることを確認する回帰テスト。
+
+    engine/game.py の commit フェーズは、合法Commitが1件も無い場合に
+    forced_liquidation() を実行して is_alive=False にした上で
+    AUTO_COMMIT_FAILURE イベントのみをログする（ELIMINATION/FORCED_LIQUIDATION
+    は出さない）。Viewer側がこれを脱落として拾えていなかった不具合の修正確認。
+    """
+
+    def _write_llm_logs(self, trial: Path, game_id: str, players: list[str]) -> None:
+        logs = trial / "llm_logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        for pid in players:
+            entry = {
+                "player_id": pid, "model_id": "test-model", "phase": "negotiation",
+                "round_num": 1, "turn": 1, "response_text": "{}", "cost_usd": 0.001,
+            }
+            (logs / f"{game_id}_{pid}_llm_calls.jsonl").write_text(
+                json.dumps(entry, ensure_ascii=False) + "\n", encoding="utf-8",
+            )
+
+    def _make_auto_commit_failure_trial(self, tmp_path: Path) -> Path:
+        """P01,P03生存 / P02がR2 commitでAUTO_COMMIT_FAILUREにより脱落、
+        という合成ログを作る（実trial trial_C_l12_r12_20260822 のP09と同型）。
+        """
+        trial = tmp_path / "trial_acf"
+        self._write_llm_logs(trial, "game01", ["P01", "P02", "P03"])
+
+        record = {
+            # forced_liquidation() が返す清算記録（実測フィールドを再現）
+            "player_id": "P02", "round": 2,
+            "cash_before": 1399900, "debt_before": 754099,
+            "debt_repaid": 754099, "bad_debt": 0,
+            "cash_confiscated": 645801, "cards_destroyed": 7,
+        }
+        events = [
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup",
+             "data": {"player_id": "P01", "loan_amount": 1000000}},
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup",
+             "data": {"player_id": "P02", "loan_amount": 1000000}},
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup",
+             "data": {"player_id": "P03", "loan_amount": 1000000}},
+            # 契約の紐付けが引き続き機能することも同時に確認する（elifシャドウイング回帰）
+            {"event_type": "NEGOTIATION_ACTION", "round_num": 2, "phase": "negotiation",
+             "data": {"action": "contract_propose", "contract_id": "C_test",
+                       "player_id": "P02", "parties": ["P02", "P03"]}},
+            {"event_type": "NEGOTIATION_ACTION", "round_num": 2, "phase": "negotiation",
+             "data": {"action": "contract_sign", "contract_id": "C_test", "player_id": "P03"}},
+            {"event_type": "SNAPSHOT", "round_num": 1, "phase": "settlement", "step": 4,
+             "data": {"snapshots": {
+                 "P01": {"cash": 1000000, "free_cash": 500000},
+                 "P02": {"cash": 1399900, "free_cash": 645801},
+                 "P03": {"cash": 1000000, "free_cash": 500000},
+             }}},
+            {"event_type": "AUTO_COMMIT_FAILURE", "round_num": 2, "phase": "commit",
+             "data": {"player_id": "P02", "contract_id": "C_test",
+                       "reason": "contract_violation", **record}},
+            {"event_type": "SNAPSHOT", "round_num": 2, "phase": "settlement", "step": 4,
+             "data": {"snapshots": {
+                 "P01": {"cash": 1100000, "free_cash": 550000},
+                 "P03": {"cash": 1100000, "free_cash": 550000},
+             }}},
+        ]
+        trial.mkdir(exist_ok=True)
+        (trial / "game01_events.jsonl").write_text(
+            "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in events), encoding="utf-8",
+        )
+        return tmp_path
+
+    def test_auto_commit_failure_marks_eliminated(self, tmp_path):
+        """get_game_state(): AUTO_COMMIT_FAILUREを起こしたP02が脱落扱いになること"""
+        logs_dir = self._make_auto_commit_failure_trial(tmp_path)
+        state = get_game_state(logs_dir, "trial_acf", "game01")
+
+        assert "P02" in state["eliminated"]
+        assert state["survivors"] == 2
+
+        by_pid = {p["player_id"]: p for p in state["players"]}
+        assert by_pid["P02"]["status"] == "eliminated"
+        assert by_pid["P01"]["status"] != "eliminated"
+        assert by_pid["P03"]["status"] != "eliminated"
+
+    def test_auto_commit_failure_in_round_states(self, tmp_path):
+        """get_round_states(): elifシャドウイングが解消され、
+        R2のeliminatedにP02が1件だけ記録され、かつ契約outcomes紐付けも壊れないこと
+        """
+        logs_dir = self._make_auto_commit_failure_trial(tmp_path)
+        data = get_round_states(logs_dir, "trial_acf", "game01")
+
+        r2_elim = data["rounds"]["2"]["eliminated"]
+        assert len(r2_elim) == 1
+        assert r2_elim[0]["player_id"] == "P02"
+        assert r2_elim[0]["reason"] == "contract_violation"
+
+        # 契約への outcomes 紐付け（既存機能）が同じイベントで壊れていないこと（god view）
+        god_data = get_round_states(logs_dir, "trial_acf", "game01", view="god")
+        contracts = god_data["rounds"]["2"]["contracts"]
+        contract = next((c for c in contracts if c["contract_id"] == "C_test"), None)
+        assert contract is not None
+        outcomes = contract.get("outcomes", [])
+        assert any(o["event_type"] == "AUTO_COMMIT_FAILURE" for o in outcomes)
+
+    def test_auto_commit_failure_view_parity(self, tmp_path):
+        """public/godで脱落表示（rounds[R].eliminated）が一致すること"""
+        logs_dir = self._make_auto_commit_failure_trial(tmp_path)
+        public = get_round_states(logs_dir, "trial_acf", "game01", view="public")
+        god = get_round_states(logs_dir, "trial_acf", "game01", view="god")
+        assert public["rounds"]["2"]["eliminated"] == god["rounds"]["2"]["eliminated"]
+
+    def test_existing_elimination_paths_unaffected(self, tmp_path):
+        """既存の脱落経路（ELIMINATION+FORCED_LIQUIDATION二重発火 / BANKRUPTCY /
+        SURVIVAL_CHECK）が今回の変更後も重複なく正しく検出されること"""
+        trial = tmp_path / "trial_existing"
+        self._write_llm_logs(trial, "game01", ["P01", "P02", "P03", "P04"])
+        events = [
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P01"}},
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P02"}},
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P03"}},
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P04"}},
+            # P02: 型B違反 -> ELIMINATION -> FORCED_LIQUIDATION（実trialのP11型・二重発火）
+            {"event_type": "ELIMINATION", "round_num": 3, "phase": "settlement",
+             "data": {"player_id": "P02", "reason": "contract_violation"}},
+            {"event_type": "FORCED_LIQUIDATION", "round_num": 3, "phase": "settlement",
+             "data": {"player_id": "P02", "reason": "contract_violation"}},
+            # P03: Entry Fee不払い -> BANKRUPTCY
+            {"event_type": "BANKRUPTCY", "round_num": 4, "phase": "commit",
+             "data": {"player_id": "P03", "reason": "Cannot pay entry fee"}},
+            # P04: R12生存条件未達
+            {"event_type": "SURVIVAL_CHECK", "round_num": 12, "phase": "finance",
+             "data": {"player_id": "P04", "result": "eliminated"}},
+        ]
+        (trial / "game01_events.jsonl").write_text(
+            "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in events), encoding="utf-8",
+        )
+        state = get_game_state(tmp_path, "trial_existing", "game01")
+        assert sorted(state["eliminated"]) == ["P02", "P03", "P04"]
+        assert state["survivors"] == 1  # P01のみ生存
+
+    def test_auto_commit_success_not_eliminated(self, tmp_path):
+        """AUTO_COMMIT（成功側）だけでは誰も脱落扱いにならないこと（偽陽性防止）"""
+        trial = tmp_path / "trial_auto_ok"
+        self._write_llm_logs(trial, "game01", ["P01"])
+        events = [
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P01"}},
+            {"event_type": "AUTO_COMMIT", "round_num": 1, "phase": "commit",
+             "data": {"player_id": "P01", "market_id": "M01", "card": "HIGH_CARD_1"}},
+        ]
+        (trial / "game01_events.jsonl").write_text(
+            "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in events), encoding="utf-8",
+        )
+        state = get_game_state(tmp_path, "trial_auto_ok", "game01")
+        assert state["eliminated"] == []
+        assert state["survivors"] == 1
+
+        data = get_round_states(tmp_path, "trial_auto_ok", "game01")
+        assert data["rounds"]["1"]["eliminated"] == []
+
+    def test_real_trial_p09_eliminated_from_r6(self):
+        """実trial trial_C_l12_r12_20260822 のP09（AUTO_COMMIT_FAILURE, R6）が
+        脱落として検出されること。runが存在しない環境ではskip。"""
+        logs_dir = Path(__file__).resolve().parent.parent / "logs" / "llm"
+        trial_dir_name = "trial_C_l12_r12_20260822"
+        if not (logs_dir / trial_dir_name).exists():
+            pytest.skip(f"{trial_dir_name} not found")
+
+        state = get_game_state(logs_dir, trial_dir_name, "game01")
+        by_pid = {p["player_id"]: p for p in state["players"]}
+        assert "P09" in by_pid
+        assert by_pid["P09"]["status"] == "eliminated"
+        assert "P09" in state["eliminated"]
+
+        data = get_round_states(logs_dir, trial_dir_name, "game01")
+        r6_elim_pids = {e["player_id"] for e in data["rounds"]["6"]["eliminated"]}
+        assert "P09" in r6_elim_pids
+
+
+class TestEliminationDeduplication:
+    """get_round_states() の rd["eliminated"] が同一round・同一playerにつき
+    1件だけになることを確認する回帰テスト。
+
+    engineは1回の脱落に対し複数のevent（例: SURVIVAL_CHECK+FORCED_LIQUIDATION、
+    ELIMINATION+FORCED_LIQUIDATION）を出すことがある。get_game_state()側は
+    既に先勝ち重複排除しているが、get_round_states()側の3つのappend地点
+    （AUTO_COMMIT_FAILURE / BANKRUPTCY・FORCED_LIQUIDATION / SURVIVAL_CHECK）
+    には重複排除ガードが無く、実trial R12のP12で2件重複が顕在化していた不具合の修正確認。
+    """
+
+    def _write_llm_logs(self, trial: Path, game_id: str, players: list[str]) -> None:
+        logs = trial / "llm_logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        for pid in players:
+            entry = {
+                "player_id": pid, "model_id": "test-model", "phase": "negotiation",
+                "round_num": 1, "turn": 1, "response_text": "{}", "cost_usd": 0.001,
+            }
+            (logs / f"{game_id}_{pid}_llm_calls.jsonl").write_text(
+                json.dumps(entry, ensure_ascii=False) + "\n", encoding="utf-8",
+            )
+
+    def test_survival_check_and_forced_liquidation_dedup(self, tmp_path):
+        """R12生存条件未達（実trial P12型）: SURVIVAL_CHECK + FORCED_LIQUIDATION
+        の2件が rd["eliminated"] では1件に正規化されること"""
+        trial = tmp_path / "trial_survival"
+        self._write_llm_logs(trial, "game01", ["P01", "P02"])
+        events = [
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P01"}},
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P02"}},
+            {"event_type": "SURVIVAL_CHECK", "round_num": 12, "phase": "finance",
+             "data": {"player_id": "P02", "result": "eliminated", "reason": "condition_not_met"}},
+            {"event_type": "FORCED_LIQUIDATION", "round_num": 12, "phase": "finance",
+             "data": {"player_id": "P02", "reason": "condition_not_met"}},
+        ]
+        (trial / "game01_events.jsonl").write_text(
+            "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in events), encoding="utf-8",
+        )
+        data = get_round_states(tmp_path, "trial_survival", "game01")
+        r12_elim = data["rounds"]["12"]["eliminated"]
+        assert len(r12_elim) == 1
+        assert r12_elim[0]["player_id"] == "P02"
+        assert r12_elim[0]["reason"] == "condition_not_met"
+
+    def test_real_trial_p12_r12_single_entry(self):
+        """実trial trial_C_l12_r12_20260822 のP12（R12, SURVIVAL_CHECK+FORCED_LIQUIDATION）
+        が rd["eliminated"] で1件に正規化されること。runが存在しない環境ではskip。"""
+        logs_dir = Path(__file__).resolve().parent.parent / "logs" / "llm"
+        trial_dir_name = "trial_C_l12_r12_20260822"
+        if not (logs_dir / trial_dir_name).exists():
+            pytest.skip(f"{trial_dir_name} not found")
+
+        data = get_round_states(logs_dir, trial_dir_name, "game01")
+        r12_elim = data["rounds"]["12"]["eliminated"]
+        p12_entries = [e for e in r12_elim if e["player_id"] == "P12"]
+        assert len(p12_entries) == 1
+        assert p12_entries[0]["reason"] == "condition_not_met"
+
+    def test_real_trial_p09_r6_still_single(self):
+        """同runでP09 R6が引き続き1件・contract_violationのまま
+        （AUTO_COMMIT_FAILURE修正の巻き戻し防止）。runが存在しない環境ではskip。"""
+        logs_dir = Path(__file__).resolve().parent.parent / "logs" / "llm"
+        trial_dir_name = "trial_C_l12_r12_20260822"
+        if not (logs_dir / trial_dir_name).exists():
+            pytest.skip(f"{trial_dir_name} not found")
+
+        data = get_round_states(logs_dir, trial_dir_name, "game01")
+        r6_elim = data["rounds"]["6"]["eliminated"]
+        p09_entries = [e for e in r6_elim if e["player_id"] == "P09"]
+        assert len(p09_entries) == 1
+        assert p09_entries[0]["reason"] == "contract_violation"
+
+    def test_elimination_plus_forced_liquidation_dedup(self, tmp_path):
+        """型B契約違反（実trial P02/P11型）: ELIMINATION + FORCED_LIQUIDATION
+        の2件が1件に正規化されること"""
+        trial = tmp_path / "trial_elim_fl"
+        self._write_llm_logs(trial, "game01", ["P01", "P02"])
+        events = [
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P01"}},
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P02"}},
+            {"event_type": "ELIMINATION", "round_num": 3, "phase": "settlement",
+             "data": {"player_id": "P02", "reason": "contract_violation"}},
+            {"event_type": "FORCED_LIQUIDATION", "round_num": 3, "phase": "settlement",
+             "data": {"player_id": "P02", "reason": "contract_violation"}},
+        ]
+        (trial / "game01_events.jsonl").write_text(
+            "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in events), encoding="utf-8",
+        )
+        data = get_round_states(tmp_path, "trial_elim_fl", "game01")
+        r3_elim = data["rounds"]["3"]["eliminated"]
+        assert len(r3_elim) == 1
+        assert r3_elim[0]["player_id"] == "P02"
+
+    def test_bankruptcy_single_event_unchanged(self, tmp_path):
+        """BANKRUPTCY単発（既存経路）はそのまま1件で検出されること"""
+        trial = tmp_path / "trial_bankruptcy"
+        self._write_llm_logs(trial, "game01", ["P01", "P02"])
+        events = [
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P01"}},
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P02"}},
+            {"event_type": "BANKRUPTCY", "round_num": 4, "phase": "commit",
+             "data": {"player_id": "P02", "reason": "Cannot pay entry fee"}},
+        ]
+        (trial / "game01_events.jsonl").write_text(
+            "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in events), encoding="utf-8",
+        )
+        data = get_round_states(tmp_path, "trial_bankruptcy", "game01")
+        r4_elim = data["rounds"]["4"]["eliminated"]
+        assert len(r4_elim) == 1
+        assert r4_elim[0]["player_id"] == "P02"
+
+    def test_dedup_view_parity(self, tmp_path):
+        """public/godで正規化後のeliminatedが一致すること"""
+        trial = tmp_path / "trial_parity"
+        self._write_llm_logs(trial, "game01", ["P01", "P02"])
+        events = [
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P01"}},
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P02"}},
+            {"event_type": "SURVIVAL_CHECK", "round_num": 12, "phase": "finance",
+             "data": {"player_id": "P02", "result": "eliminated"}},
+            {"event_type": "FORCED_LIQUIDATION", "round_num": 12, "phase": "finance",
+             "data": {"player_id": "P02", "reason": "condition_not_met"}},
+        ]
+        (trial / "game01_events.jsonl").write_text(
+            "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in events), encoding="utf-8",
+        )
+        public = get_round_states(tmp_path, "trial_parity", "game01", view="public")
+        god = get_round_states(tmp_path, "trial_parity", "game01", view="god")
+        assert public["rounds"]["12"]["eliminated"] == god["rounds"]["12"]["eliminated"]
+
+    def test_dedup_does_not_change_survivors(self, tmp_path):
+        """get_round_states()側の重複排除がget_game_state()のsurvivors/eliminatedに
+        影響しないこと（同ログでの整合性確認）"""
+        trial = tmp_path / "trial_survivors"
+        self._write_llm_logs(trial, "game01", ["P01", "P02", "P03"])
+        events = [
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P01"}},
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P02"}},
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P03"}},
+            {"event_type": "SURVIVAL_CHECK", "round_num": 12, "phase": "finance",
+             "data": {"player_id": "P03", "result": "eliminated"}},
+            {"event_type": "FORCED_LIQUIDATION", "round_num": 12, "phase": "finance",
+             "data": {"player_id": "P03", "reason": "condition_not_met"}},
+        ]
+        (trial / "game01_events.jsonl").write_text(
+            "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in events), encoding="utf-8",
+        )
+        state = get_game_state(tmp_path, "trial_survivors", "game01")
+        assert sorted(state["eliminated"]) == ["P03"]
+        assert state["survivors"] == 2
+
+        data = get_round_states(tmp_path, "trial_survivors", "game01")
+        assert len(data["rounds"]["12"]["eliminated"]) == 1
+
+    def test_raw_outcomes_keep_multiple_events(self, tmp_path):
+        """rd["eliminated"]の正規化が契約outcomes（god限定・生データ）を
+        間引かないこと。複数の履行イベントが同一契約に紐付く場合、
+        outcomesは全件残る"""
+        trial = tmp_path / "trial_outcomes"
+        self._write_llm_logs(trial, "game01", ["P01", "P02"])
+        events = [
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P01"}},
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P02"}},
+            {"event_type": "NEGOTIATION_ACTION", "round_num": 3, "phase": "negotiation",
+             "data": {"action": "contract_propose", "contract_id": "C_dup",
+                       "player_id": "P02", "parties": ["P02", "P01"]}},
+            {"event_type": "NEGOTIATION_ACTION", "round_num": 3, "phase": "negotiation",
+             "data": {"action": "contract_sign", "contract_id": "C_dup", "player_id": "P01"}},
+            {"event_type": "TYPE_B_VIOLATION", "round_num": 3, "phase": "settlement",
+             "data": {"player_id": "P02", "contract_id": "C_dup", "reason": "contract_violation"}},
+            {"event_type": "ELIMINATION", "round_num": 3, "phase": "settlement",
+             "data": {"player_id": "P02", "reason": "contract_violation"}},
+            {"event_type": "FORCED_LIQUIDATION", "round_num": 3, "phase": "settlement",
+             "data": {"player_id": "P02", "reason": "contract_violation"}},
+        ]
+        (trial / "game01_events.jsonl").write_text(
+            "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in events), encoding="utf-8",
+        )
+        data = get_round_states(tmp_path, "trial_outcomes", "game01", view="god")
+        r3_elim = data["rounds"]["3"]["eliminated"]
+        assert len(r3_elim) == 1  # eliminated一覧は正規化される
+
+        contracts = data["rounds"]["3"]["contracts"]
+        contract = next((c for c in contracts if c["contract_id"] == "C_dup"), None)
+        assert contract is not None
+        outcomes = contract.get("outcomes", [])
+        # 生の履行イベント（TYPE_B_VIOLATION）は間引かれず残っている
+        assert any(o["event_type"] == "TYPE_B_VIOLATION" for o in outcomes)

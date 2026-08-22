@@ -936,3 +936,33 @@ LLMなしルールベースBot 8種（Random/Conservative/StrongCardSave/HighPri
   18モデルの最終Phase 3 state合計は`$0.927449`。再試験履歴を含むPhase 3合計とは区別する。
 - `doc/cost/api_cost_estimate_2026-08-20.md`に、Provider Consoleのユーザー提供値、M3 R12実績、
   棄却した線形外挿、および段階的R12計測方針を固定した。
+
+## 2026-08-22: Gemini 3.7 Flash 検証枠追加、L-only 12席 R12実戦、Viewer脱落表示バグ2件修正
+
+- `llm/models.py` に検証専用 `M3_G37_EVAL`（`gemini-3.7-flash`）を追加。正式ロスターの
+  `M3`（Gemini 3.5 Flash）は変更しない。Google公式価格（input $0.75 / output $3.75 per 1M、
+  2026-12-31までの導入価格）、`supports_temperature=False`、`reasoning_effort="low"` を反映。
+  `scripts/gemini_37_eval.py`（新設）でPhase 1〜3の段階的検証（実API疎通・談合カードJSON適合・
+  3.5 vs 3.7比較）を実施し、3.7は3.5比で実測64.04%低コストと確認（詳細:
+  `doc/devlog/2026-08-22_060137.md`〜`_064103.md`、`doc/cost/gemini_37_flash_pricing_2026-08-22.md`、
+  `doc/cost/gemini_35_37_comparison_pricing_2026-08-22.md`、`doc/gemini_37_flash_eval_report.md`）。
+- 固定ロスター `L1,L1,L2,L2,L3,L3,L4,L4,L5,L5,L6,L6`（L-only 12席・S2・R12）で実戦を完走。
+  1,407 calls / $5.993606、budget block 0、5席生還（詳細: `doc/devlog/2026-08-22_093500.md`、
+  `doc/trials/l12_r12_2026-08-22.md`、`doc/cost/l12_r12_pricing_2026-08-22.md`）。
+  `scripts/llm_trial.py` / `scripts/l6_r12_report.py` / `scripts/model_matrix.py` を
+  この実戦・レポート生成に必要な範囲で調整。
+- 上記R12実戦runのViewer表示で2件の既存バグを発見・修正（Engine・trialログ・秘匿境界は無変更）。
+  1. `viewer/log_parser.py` の `get_round_states()` が `AUTO_COMMIT_FAILURE`
+     （合法Commit0件による強制脱落）を脱落イベントとして未ハンドルで、当該プレイヤー
+     （run中のP09）が「生存」と誤表示されていた。ハンドリングを追加し修正
+     （`doc/devlog/2026-08-22_094134.md`）。
+  2. 同関数の脱落一覧に重複排除ガードが無く、`SURVIVAL_CHECK`+`FORCED_LIQUIDATION` の
+     二重発火（R12生存条件未達の当該プレイヤーP12）で同一ラウンドに同一人物が2件表示されていた。
+     `add_elimination()` ヘルパで同一round・同一playerを先勝ちで1件に正規化
+     （`doc/devlog/2026-08-22_104500.md`）。生のtimeline/契約outcomesは間引かない。
+  3. いずれも `dangou-viewer.service` を再起動して実API・実trialで反映確認済み
+     （`doc/devlog/2026-08-22_102900.md`、`doc/devlog/2026-08-22_112000.md`）。
+- `tests/test_viewer.py` に回帰14件（AUTO_COMMIT_FAILURE系6件 + 脱落重複排除系8件）を追加。
+  `tests/test_model_matrix.py` / `tests/test_model_smoke.py` / `tests/test_registry_18.py` /
+  `tests/test_l6_r12_trial.py` / `tests/test_gemini_37_eval.py`（新設）も本作業範囲で更新・追加。
+  全テストスイート **780 passed**。

@@ -17,6 +17,7 @@ import json
 import os
 import sys
 import time
+from collections import Counter
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -48,6 +49,36 @@ PHASE_C_ROSTER = ["M1", "L1", "M2", "L2", "M3", "M4", "M5", "M6"]
 # scripts/model_matrix.py の18モデル疎通テスト基盤が対象とするフルロスター。
 SEASON2_ROSTER_18 = [f"{t}{i}" for t in ("H", "M", "L") for i in range(1, 7)]
 
+# R12実戦の固定ロスター。L7は負荷試験専用かつ過去に利用不可だったため含めない。
+L12_ONLY_ROSTER = [key for key in ("L1", "L2", "L3", "L4", "L5", "L6") for _ in range(2)]
+
+
+def validate_l12_only_trial(
+    roster_keys: list[str], config: GameConfig, max_output_tokens: int | None,
+    abort_on_budget_block: bool, games: int | None, stop_after_round: int | None,
+) -> None:
+    """L1〜L6を各2席だけ使うR12本試験の不変条件を検証する。
+
+    この検証はadapter生成・API送信より前に行う。意図しないM/H/L7混入や
+    小規模試験への取り違えを、課金前に確実に止めるためのもの。
+    """
+    expected = Counter(L12_ONLY_ROSTER)
+    actual = Counter(roster_keys)
+    if actual != expected:
+        raise ValueError(
+            "--l12-only は L1,L1,L2,L2,L3,L3,L4,L4,L5,L5,L6,L6 のみ許可します"
+        )
+    if config.num_players != 12 or config.num_rounds != 12 or not config.surge_enabled:
+        raise ValueError("--l12-only は Season 2 / 12席 / R12 を必須とします")
+    if max_output_tokens != 2000:
+        raise ValueError("--l12-only は --max-output-tokens 2000 を必須とします")
+    if not abort_on_budget_block:
+        raise ValueError("--l12-only は --abort-on-budget-block を必須とします")
+    if games not in (None, 1):
+        raise ValueError("--l12-only は1試合だけ実行できます")
+    if stop_after_round is not None:
+        raise ValueError("--l12-only は途中停止を許可しません")
+
 
 def effective_trial_model(model_key: str, max_output_tokens: int | None) -> ModelInfo:
     """試験だけに適用する出力上限を持つModelInfoコピーを返す。
@@ -73,6 +104,7 @@ def build_trial_manifest(
     roster_keys: list[str], config: GameConfig, seed: int,
     max_output_tokens: int | None, abort_on_budget_block: bool,
     stop_after_round: int | None = None,
+    run_id: str | None = None, trial_profile: str | None = None,
 ) -> dict[str, Any]:
     """AFTER比較に必要な、秘密情報を含まない実効設定を固定する。
 
@@ -104,6 +136,8 @@ def build_trial_manifest(
             "cached_input_price_usd_per_million": model.cached_input_price,
         })
     return {
+        "run_id": run_id,
+        "trial_profile": trial_profile,
         "seed": seed,
         "roster_keys": roster_keys,
         "num_players": config.num_players,
@@ -119,6 +153,29 @@ def build_trial_manifest(
         "final_market_multiplier": config.final_market_multiplier,
         "models": models,
     }
+
+
+def build_phase_c_agents(
+    roster_keys: list[str], game_index: int, config: GameConfig, output_dir: Path,
+    seed: int, max_output_tokens: int | None,
+) -> tuple[dict[str, Any], list[LLMAgent], dict[str, str]]:
+    """Phase Cの各座席を独立したadapter/logger/agent/memoryで構築する。"""
+    seat_rng = stdlib_random.Random(seed + game_index)
+    shuffled_keys = list(roster_keys)
+    seat_rng.shuffle(shuffled_keys)
+    agents: dict[str, Any] = {}
+    llm_agents: list[LLMAgent] = []
+    seat_map: dict[str, str] = {}
+    for i, model_key in enumerate(shuffled_keys):
+        pid = f"P{i + 1:02d}"
+        model_info = effective_trial_model(model_key, max_output_tokens)
+        adapter = create_adapter(model_info)
+        llm_logger = LLMLogger(output_dir / "llm_logs", game_id=f"game{game_index + 1:02d}_{pid}")
+        agent = LLMAgent(pid, model_info, adapter, llm_logger, config)
+        agents[pid] = agent
+        llm_agents.append(agent)
+        seat_map[pid] = f"{model_key}:{model_info.name}"
+    return agents, llm_agents, seat_map
 
 
 def run_trial_game(
@@ -341,30 +398,11 @@ def run_trial_game_c(
     """
     game_seed = seed + game_index
 
-    # 座席シャッフル（seedからランダム化）
-    seat_rng = stdlib_random.Random(game_seed)
-    shuffled_keys = list(roster_keys)
-    seat_rng.shuffle(shuffled_keys)
-
-    agents: dict[str, Any] = {}
-    llm_agents: list[LLMAgent] = []
-    seat_map: dict[str, str] = {}  # pid → model_name
-
-    for i, model_key in enumerate(shuffled_keys):
-        pid = f"P{i + 1:02d}"
-        # runtime overrideはこの試験用copyだけへ適用する。MODEL_REGISTRYを
-        # 変更せず、adapter送信値とworst_case_costの予約値を揃える。
-        model_info = effective_trial_model(model_key, max_output_tokens)
-        adapter = create_adapter(model_info)
-        llm_logger = LLMLogger(
-            output_dir / "llm_logs",
-            game_id=f"game{game_index + 1:02d}_{pid}",
-        )
-        # 匿名化: player_idのみ。model_infoのname/providerはプロンプトに含めない
-        agent = LLMAgent(pid, model_info, adapter, llm_logger, config)
-        agents[pid] = agent
-        llm_agents.append(agent)
-        seat_map[pid] = f"{model_key}:{model_info.name}"
+    # runtime overrideはこの試験用copyだけへ適用する。MODEL_REGISTRYを変更せず、
+    # adapter送信値とworst_case_costの予約値を揃える。
+    agents, llm_agents, seat_map = build_phase_c_agents(
+        roster_keys, game_index, config, output_dir, seed, max_output_tokens,
+    )
 
     # 逐次追記モード: 進行中でもビューワーがラウンド状況を表示できるようにする
     event_path = output_dir / f"game{game_index + 1:02d}_events.jsonl"
@@ -1090,6 +1128,12 @@ def main() -> None:
                         help="Phase C試験で最初の予算block時にGAME_ABORTEDを記録して中断する")
     parser.add_argument("--stop-after-round", type=int, default=None,
                         help="Phase C試験で通常R完了後に停止（num_roundsは変更しない）")
+    parser.add_argument("--l12-only", action="store_true", default=False,
+                        help="L1〜L6各2席だけのS2/R12本試験として厳格に検証する")
+    parser.add_argument("--run-id", type=str, default=None,
+                        help="固定出力ID。同じIDの既存ログは二重送信防止のため拒否する")
+    parser.add_argument("--validate-only", action="store_true", default=False,
+                        help="Phase Cの公開manifestを表示して終了（adapter/APIを呼ばない）")
     args = parser.parse_args()
 
     # 修正8: レポート再生成モード
@@ -1107,6 +1151,12 @@ def main() -> None:
         parser.error("--max-output-tokens は正の整数で指定してください")
     if args.phase != "C" and (args.max_output_tokens is not None or args.abort_on_budget_block):
         parser.error("--max-output-tokens と --abort-on-budget-block は Phase C 専用です")
+    if args.l12_only and args.phase != "C":
+        parser.error("--l12-only は Phase C 専用です")
+    if args.validate_only and args.phase != "C":
+        parser.error("--validate-only は Phase C 専用です")
+    if args.run_id is not None and (not args.run_id.strip() or "/" in args.run_id or "\\" in args.run_id):
+        parser.error("--run-id は空白・パス区切りを含まないIDで指定してください")
 
     # Phase C ロスター決定（--roster指定 or デフォルト）
     phase_c_roster = args.roster.split(",") if args.roster else PHASE_C_ROSTER
@@ -1164,17 +1214,35 @@ def main() -> None:
     if cap_updates:
         config = config.model_copy(update=cap_updates)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path(f"logs/llm/trial_{args.phase}_{timestamp}")
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if args.l12_only:
+        try:
+            validate_l12_only_trial(
+                phase_c_roster, config, args.max_output_tokens, args.abort_on_budget_block,
+                games_override, args.stop_after_round,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
 
-    # 実行後にregistry既定値とruntime overrideを取り違えないよう、APIキー等を
-    # 含めない公開設定を試合開始前に固定する。異常終了時もpreflight記録として残る。
+    manifest = None
     if args.phase == "C":
         manifest = build_trial_manifest(
             phase_c_roster, config, args.seed, args.max_output_tokens,
             args.abort_on_budget_block, args.stop_after_round,
+            run_id=args.run_id, trial_profile="l12-only" if args.l12_only else None,
         )
+    if args.validate_only:
+        print(json.dumps(manifest, ensure_ascii=False, indent=2))
+        return
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = Path(f"logs/llm/trial_{args.phase}_{args.run_id or timestamp}")
+    if args.run_id and output_dir.exists():
+        parser.error(f"--run-id {args.run_id} は既存ログを指します。二重送信防止のため新しいIDを指定してください")
+    output_dir.mkdir(parents=True, exist_ok=False)
+
+    # 実行後にregistry既定値とruntime overrideを取り違えないよう、APIキー等を
+    # 含めない公開設定を試合開始前に固定する。異常終了時もpreflight記録として残る。
+    if args.phase == "C":
         (output_dir / "trial_manifest.json").write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",

@@ -228,8 +228,11 @@ def test_model_specific_temperature_and_phase2_overrides():
     for key, info in REG.items():
         if info.adapter_type not in ("openai_compat", "gemini"):
             continue
-        if key == "H2":
-            assert info.max_tokens_param == "max_completion_tokens"
+        if key in ("H2", "M3_G37_EVAL"):
+            if key == "H2":
+                assert info.max_tokens_param == "max_completion_tokens"
+            else:
+                assert info.max_tokens_param == "max_tokens"
             assert info.supports_temperature is False
         else:
             assert info.max_tokens_param == "max_tokens", key

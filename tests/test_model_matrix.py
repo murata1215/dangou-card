@@ -594,6 +594,13 @@ def test_phase2_adapter_error_records_no_raw_response(monkeypatch):
     assert result["response_model"] is None
 
 
+def test_phase2_gemini37_uses_schema_and_low_reasoning_effort():
+    """検証専用3.7は3.5のminimalを継承せず、公式対応のlowを送る。"""
+    info = MODEL_REGISTRY["M3_G37_EVAL"]
+    assert mm._phase2_schema_for_model(info) is not None
+    assert mm._phase2_request_options(info)["reasoning_effort"] == "low"
+
+
 def test_phase2_uses_model_specific_output_cap_only_for_configured_models(tmp_path, monkeypatch):
     """モデル別Phase 2上限だけがCLI既定400を上書きする。"""
     captured: list[tuple[str, int]] = []

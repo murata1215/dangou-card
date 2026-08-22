@@ -128,4 +128,13 @@ Stage 1 で捕捉したトークン内訳（cached/reasoning/total）を活用�
 - 2026-08-21_095602 | Viewer | 公開service再起動 | systemd user serviceを再起動し、R1〜R3 round-detail全18件と既存APIのHTTP 200を確認
 - 2026-08-21_172340 | Viewer | 神視点の運用有効化 | repo外tokenをuser systemdへ注入し、public/god認可・36件詳細・既存APIを確認
 - 2026-08-21_233205 | Docs | Viewer神視点の運用記録とコミット準備 | public/god境界とtoken非記録運用を正本へ反映
+- 2026-08-22 06:01 JST | Gemini 3.7 Flash 技術検証基盤: 検証専用キー・段階的評価ハーネス・公式価格スナップショットを追加（API未実行） → 2026-08-22_060137.md
+- 2026-08-22 06:13 JST | Gemini 3.7 Flash Phase 1 実API疎通: low thinking・2,000 token上限で5/5成功、$0.000960（Phase 2以降未実行） → 2026-08-22_061332.md
+- 2026-08-22 06:29 JST | Gemini 3.7 Flash Phase 2 JSON適合: 4主要経路が一発成功、correction 0、$0.014743（Phase 3以降未実行） → 2026-08-22_062920.md
 - 2026-08-21_130233 | Viewer | 神視点モード | public秘匿修正、追加トークン認可、公開／秘匿の構造化表示を追加
+- 2026-08-22 06:41 JST | Gemini 3.7 Flash Phase 3 比較: 3.5/3.7各12件JSON成功、3.7は実測64.04%低コスト（Phase 4未実行） → 2026-08-22_064103.md
+- 2026-08-22 09:35 JST | L-only 12席 × S2/R12: 1,407 calls / $5.993606で完走、5席生還、budget block 0 → 2026-08-22_093500.md
+- 2026-08-22 09:41 JST | Viewer脱落表示バグ修正: AUTO_COMMIT_FAILURE取りこぼしでP09が生存誤表示、elifシャドウイング修正・回帰6件追加、Engineは無変更 → 2026-08-22_094134.md
+- 2026-08-22 10:29 JST | Viewer再起動・実表示検証: dangou-viewer.service再起動(PID 1306737→1378197)、P09脱落表示反映を実API確認(survivors 6→5)、既存経路無回帰、trial/Engine/god.env無変更 → 2026-08-22_102900.md
+- 2026-08-22 10:45 JST | Viewer R12 P12脱落重複表示修正: SURVIVAL_CHECK+FORCED_LIQUIDATION二重発火をget_round_states()側で先勝ち正規化、回帰8件追加・全780件PASS、Engine/生timeline/秘匿境界は無変更、Viewer未再起動 → 2026-08-22_104500.md
+- 2026-08-22 11:20 JST | Viewer再起動: P12脱落重複表示修正の本番反映: dangou-viewer.service再起動(PID 1378197→1381486)、R12のP12表示が2件→1件に正規化を実API確認、P09/既存脱落経路/survivors/god認可は無回帰、trial/Engine/god.env無変更 → 2026-08-22_112000.md

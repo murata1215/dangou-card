@@ -173,3 +173,34 @@ parse correction仕様を変更してはならない。担保テスト: `tests/t
 `test_phase3_unsupported_effort_is_not_sent_and_audits_null`、
 `test_phase3_timeout_override_reaches_openai_sdk_without_registry_mutation`、
 `test_phase3_runtime_cli_parse_and_rejects_non_phase3_overrides`。
+
+## 新モデル検証は `_EVAL` 専用キーで正式ロスターと分離する
+
+新モデル（例: Gemini 3.7 Flash）を評価するときは、正式ロスターのキー（`M3`等）を書き換えず、
+`M3_G37_EVAL` のような検証専用キーを `MODEL_REGISTRY` に追加する。正式キーは常に既存モデルを指し続け、
+本戦・過去runの再現性を壊さない。検証専用キーは `tier=""` とし、Phase 1〜3の段階的評価
+（実API疎通 → 談合カードJSON適合 → 正式モデルとのコスト比較）を経てから、採用するかどうかを
+別途判断する。価格・sampling parameter対応・thinking挙動は provider公式一次情報を確認日付付きで
+コード内コメントに固定する。
+
+## Viewerの脱落判定はEngineが出す全イベント種別を尊重しつつ表示側で正規化する
+
+`viewer/log_parser.py` はEngineが出すJSONLイベントを解釈するだけで、Engineの脱落判定
+（`engine/elimination.py forced_liquidation()` が唯一の脱落確定経路）には一切介入しない。
+ただしEngineは1回の脱落に対し複数種類のイベント（`AUTO_COMMIT_FAILURE`単体、
+`ELIMINATION`+`FORCED_LIQUIDATION`、`MANDATORY_REPAY_FAILED`+`FORCED_LIQUIDATION`、
+`SURVIVAL_CHECK`+`FORCED_LIQUIDATION`など）を出すことがあるため、Viewer側の脱落系イベント
+ハンドリングは次の2点を常に両立させる。
+
+1. **新しい脱落イベント種別を追加するときは、`get_game_state()`（生存数・バッジ）と
+   `get_round_states()`（ラウンド別脱落者一覧）の両方に反映する。** 片方だけに追加すると
+   （実例: `AUTO_COMMIT_FAILURE`が`get_round_states()`のみ未対応だった）、生存数と
+   ラウンド詳細の表示が食い違う。
+2. **`rd["eliminated"]`のような表示用の脱落者一覧は、同一round・同一playerにつき1件に
+   正規化する。** 正規化は表示用データ構造だけに適用し、生のtimeline
+   （`get_player_timeline()`）や契約 `outcomes`（god限定）には適用しない。複数の脱落系
+   イベントが実際に発生した事実は、生ログ側でそのまま確認できる状態を維持する。
+
+代表1件を残す規則は「先勝ち」（最初に検出したイベントのreason/detailsを採用）で統一する。
+`get_game_state()`は元々 `if pid not in eliminated:` ガードで先勝ちだったため、
+`get_round_states()`側も同じ規則の `add_elimination()` ヘルパに揃える。

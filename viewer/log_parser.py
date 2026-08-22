@@ -14,6 +14,15 @@ import time
 from pathlib import Path
 from typing import Any
 
+# Engine が脱落を確定させたことを示すイベント種別。
+# AUTO_COMMIT_FAILURE は engine/game.py の commit フェーズが唯一の発火箇所で、
+# 直前に必ず forced_liquidation() を実行し is_alive=False にしているため、
+# 他の脱落イベント（ELIMINATION/BANKRUPTCY/FORCED_LIQUIDATION）と同様に
+# 脱落確定イベントとして扱う。
+ELIMINATION_EVENT_TYPES = (
+    "ELIMINATION", "BANKRUPTCY", "FORCED_LIQUIDATION", "AUTO_COMMIT_FAILURE",
+)
+
 
 class LogCache:
     """ファイル差分キャッシュ（mtime+sizeベース）"""
@@ -335,7 +344,7 @@ def get_game_state(logs_dir: Path, trial_dir_name: str, game_id: str) -> dict[st
                 pid = data.get("player_id", "")
                 if pid:
                     loan_by_pid[pid] = data.get("loan_amount", 0)
-            elif et in ("ELIMINATION", "BANKRUPTCY", "FORCED_LIQUIDATION"):
+            elif et in ELIMINATION_EVENT_TYPES:
                 pid = e.get("data", {}).get("player_id", "")
                 if pid and pid not in eliminated:
                     eliminated.append(pid)
@@ -923,6 +932,22 @@ def get_round_states(
             }
         return result["rounds"][rn]
 
+    def add_elimination(rd: dict[str, Any], player_id: Any, reason: Any) -> None:
+        """同一ラウンド・同一プレイヤーの脱落は1件だけ記録する。
+
+        engineは1回の脱落に対し複数のイベントを出すことがある
+        （例: R12生存条件未達なら SURVIVAL_CHECK + FORCED_LIQUIDATION の2件、
+        契約違反なら ELIMINATION + FORCED_LIQUIDATION の2件）。
+        get_game_state() 側は L349/L355 相当で既に先勝ち重複排除しており、
+        ラウンド脱落者一覧もそれに合わせる。生のtimeline/outcomesは対象外
+        （このヘルパは rd["eliminated"] のみを操作する）。
+        """
+        if not player_id:
+            return
+        if any(x.get("player_id") == player_id for x in rd["eliminated"]):
+            return
+        rd["eliminated"].append({"player_id": player_id, "reason": reason})
+
     players: list[str] = []
     # 契約の累積状態 {contract_id: {...}}
     contracts: dict[str, dict[str, Any]] = {}
@@ -1048,26 +1073,26 @@ def get_round_states(
                     c["signed_by"].append(signer)
 
         elif et in {"TYPE_A_EXECUTION", "TYPE_A_FAILURE", "TYPE_B_VIOLATION", "AUTO_COMMIT", "AUTO_COMMIT_FAILURE"}:
-            rnd(r)
+            rd = rnd(r)
             # すべての履行イベントにcontract_idがあるとは限らない。ある場合だけ契約に紐付ける。
             cid = data.get("contract_id")
             if cid in contracts:
                 contracts[cid].setdefault("outcomes", []).append({
                     "event_type": et, "round": r, "data": dict(data),
                 })
+            # AUTO_COMMIT_FAILURE は forced_liquidation 済み＝脱落確定
+            # （engine/game.py のcommitフェーズが唯一の発火箇所）。
+            # BANKRUPTCY/FORCED_LIQUIDATIONと同じelifチェーンに置くと
+            # このブロックで先にマッチしてしまい到達しないため、ここで記録する。
+            if et == "AUTO_COMMIT_FAILURE":
+                add_elimination(rd, data.get("player_id"), data.get("reason"))
 
         elif et in ("BANKRUPTCY", "FORCED_LIQUIDATION"):
             rd = rnd(r)
-            rd["eliminated"].append({
-                "player_id": data.get("player_id"),
-                "reason": data.get("reason"),
-            })
+            add_elimination(rd, data.get("player_id"), data.get("reason"))
         elif et == "SURVIVAL_CHECK" and data.get("result") == "eliminated":
             rd = rnd(r)
-            rd["eliminated"].append({
-                "player_id": data.get("player_id"),
-                "reason": "condition_not_met",
-            })
+            add_elimination(rd, data.get("player_id"), "condition_not_met")
 
     # プレイヤー順が取れなければ cash から補完
     if not players:

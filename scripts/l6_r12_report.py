@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import statistics
 import sys
 from pathlib import Path
 from typing import Any
@@ -46,18 +47,25 @@ def _call_summary(calls: list[dict[str, Any]]) -> dict[str, int | float]:
             except Exception:
                 # 壊れた生応答も試験の一次記録として残し、集計だけ0件扱いにする。
                 continue
+    latencies = [float(call.get("elapsed_ms", 0) or 0) for call in api_calls]
+    reasoning_tokens = sum(int(call.get("reasoning_tokens", 0) or 0) for call in api_calls)
     return {
         "calls": len(api_calls),
         "input": input_tokens,
         "cached": cached_tokens,
         "output": output_tokens,
         "thinking": max(0, total_tokens - input_tokens - output_tokens),
+        "reasoning_tokens": reasoning_tokens,
         "cost": sum(float(call.get("cost_usd", 0) or 0) for call in api_calls),
         "valid_json": valid_json,
         "errors": sum(int(call.get("error") is not None) for call in api_calls),
         "timeouts": sum(int(call.get("error_type") == "timeout") for call in api_calls),
         "retries": sum(int(call.get("retry_count", 0) or 0) for call in api_calls),
         "budget_blocks": sum(int(call.get("budget_blocked", False)) for call in calls),
+        "length": sum(int(call.get("finish_reason") == "length") for call in api_calls),
+        "latency_avg_ms": statistics.mean(latencies) if latencies else 0.0,
+        "latency_median_ms": statistics.median(latencies) if latencies else 0.0,
+        "latency_max_ms": max(latencies, default=0.0),
     }
 
 
@@ -75,9 +83,10 @@ def generate_report(log_dir: Path, output_path: Path) -> None:
     aborted = next((event for event in events if event["event_type"] == "GAME_ABORTED"), None)
 
     lines = ["# L1〜L6 Season 2 R12 実戦試験結果\n"]
+    completed = bool(game_end and game_end.get("data", {}).get("completed", False))
     lines.extend([
         f"- 試験ログ: `{log_dir}`",
-        f"- 完走: **{'いいえ（中断）' if aborted else 'はい'}**",
+        f"- 完走: **{'はい' if completed else ('いいえ（中断）' if aborted else 'いいえ（未完走）')}**",
         f"- seed: `{manifest['seed']}` / ruleset: `{manifest['ruleset']}` / roster: `{','.join(manifest['roster_keys'])}`",
         f"- 実効 output 上限: **{manifest['models'][0]['effective_max_output_tokens']} tokens（全席統一）**",
         f"- CoT: `{manifest['enable_cot']}` / cost cap: `${manifest['per_player_game_cost_cap_usd']}/player`, `${manifest['game_cost_cap_usd']}/game`",
@@ -94,8 +103,9 @@ def generate_report(log_dir: Path, output_path: Path) -> None:
         lines.append(f"\n- 中断: R{aborted['round_num']} / `{aborted['data']['reason']}`")
 
     lines.extend(["\n## プレイヤー別 API・結果\n",
-                  "| Seat | Model | Calls | Input | Cached | Output | Thinking | Cost | JSON | AUTO | Error / Timeout / Retry | Budget block |",
-                  "|---|---|---:|---:|---:|---:|---:|---:|---|---:|---|---:|"])
+                  "| Seat | Model | Calls | Input | Cached | Output | Thinking | Cost | JSON | AUTO | Error / Timeout / Retry | Length | Latency avg | Budget block |",
+                  "|---|---|---:|---:|---:|---:|---:|---:|---|---:|---|---:|---:|---:|"])
+    model_summaries: dict[str, dict[str, int | float]] = {}
     for pid in sorted(seat_map):
         calls = _read_jsonl(log_dir / "llm_logs" / f"game01_{pid}_llm_calls.jsonl")
         summary = _call_summary(calls)
@@ -103,12 +113,62 @@ def generate_report(log_dir: Path, output_path: Path) -> None:
             int(event["event_type"] == "AUTO_COMMIT" and event["data"].get("player_id") == pid)
             for event in events
         )
+        model_key = seat_map[pid].split(":", 1)[0]
+        aggregate = model_summaries.setdefault(model_key, {
+            "calls": 0, "input": 0, "cached": 0, "output": 0, "thinking": 0,
+            "reasoning_tokens": 0, "cost": 0.0, "valid_json": 0, "errors": 0,
+            "timeouts": 0, "retries": 0, "budget_blocks": 0, "length": 0,
+            "latency_weighted_ms": 0.0,
+        })
+        for key in ("calls", "input", "cached", "output", "thinking", "reasoning_tokens", "valid_json", "errors", "timeouts", "retries", "budget_blocks", "length"):
+            aggregate[key] += summary[key]
+        aggregate["cost"] += summary["cost"]
+        aggregate["latency_weighted_ms"] += summary["latency_avg_ms"] * summary["calls"]
         lines.append(
             f"| {pid} | {seat_map[pid]} | {summary['calls']} | {summary['input']:,} | "
             f"{summary['cached']:,} | {summary['output']:,} | {summary['thinking']:,} | "
             f"${summary['cost']:.4f} | {summary['valid_json']}/{summary['calls']} | {auto} | "
-            f"{summary['errors']} / {summary['timeouts']} / {summary['retries']} | {summary['budget_blocks']} |"
+            f"{summary['errors']} / {summary['timeouts']} / {summary['retries']} | {summary['length']} | "
+            f"{summary['latency_avg_ms']:.0f}ms | {summary['budget_blocks']} |"
         )
+
+    providers = {item["key"]: item["provider"] for item in manifest["models"]}
+    lines.extend(["\n## モデル別・Provider別集計\n",
+                  "| Model | Provider | Calls | Input | Output | Thinking | Cost | JSON | Error | Length | Avg latency |",
+                  "|---|---|---:|---:|---:|---:|---:|---|---:|---:|---:|"])
+    provider_summaries: dict[str, dict[str, float]] = {}
+    for key in sorted(model_summaries):
+        summary = model_summaries[key]
+        calls_count = int(summary["calls"])
+        avg_latency = float(summary["latency_weighted_ms"]) / calls_count if calls_count else 0.0
+        provider = providers.get(key, "?")
+        lines.append(
+            f"| {key} | {provider} | {calls_count} | {int(summary['input']):,} | {int(summary['output']):,} | "
+            f"{int(summary['thinking']):,} | ${float(summary['cost']):.4f} | "
+            f"{int(summary['valid_json'])}/{calls_count} | {int(summary['errors'])} | {int(summary['length'])} | {avg_latency:.0f}ms |"
+        )
+        provider_summary = provider_summaries.setdefault(provider, {"calls": 0.0, "cost": 0.0})
+        provider_summary["calls"] += calls_count
+        provider_summary["cost"] += float(summary["cost"])
+    lines.extend(["\n| Provider | Calls | Cost |", "|---|---:|---:|"])
+    for provider, summary in sorted(provider_summaries.items()):
+        lines.append(f"| {provider} | {int(summary['calls'])} | ${summary['cost']:.4f} |")
+
+    event_groups = {
+        "negotiation": lambda event: event["event_type"].startswith("NEGOTIATION"),
+        "DM": lambda event: event["event_type"] in {"DM", "DIRECT_MESSAGE"} or event.get("data", {}).get("action") == "dm",
+        "broadcast": lambda event: "BROADCAST" in event["event_type"] or event.get("data", {}).get("action") == "broadcast",
+        "contract": lambda event: "CONTRACT" in event["event_type"] or str(event.get("data", {}).get("action", "")).startswith("contract_"),
+        "card trade": lambda event: "TRADE" in event["event_type"] or event.get("data", {}).get("action") == "card_trade_propose",
+        "double-up": lambda event: event["event_type"].startswith("DOUBLE_UP"),
+        "commit": lambda event: event["event_type"] == "COMMIT",
+        "settlement": lambda event: event["event_type"] in {"MARKET_RESULT", "MANDATORY_REPAY", "INTEREST"},
+        "finance": lambda event: event["event_type"] in {"LOAN_CHOSEN", "MANDATORY_REPAY", "INTEREST"},
+        "reflection": lambda event: event["event_type"] == "ROUND_COMPLETE",
+    }
+    lines.extend(["\n## 主要イベント成立数\n", "| Event | Count |", "|---|---:|"])
+    for label, predicate in event_groups.items():
+        lines.append(f"| {label} | {sum(int(predicate(event)) for event in events)} |")
 
     end_data = game_end["data"] if game_end else {}
     survivors = end_data.get("survivors", [])

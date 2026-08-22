@@ -109,6 +109,25 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         # 512は実測最大343（L4実測）の約1.5倍の経験的安全マージン。provider保証の上限ではない。
         hidden_thinking_reserve_tokens=512,
     ),
+    # 検証専用。正式ロスターのM3（Gemini 3.5 Flash）は絶対に置換しない。
+    # Google Gemini API pricing / OpenAI compatibility docs を 2026-08-22 JST に確認:
+    # input $0.75 / output（thinking含む）$3.75 per 1M tokens（2026-12-31までの導入価格）。
+    # Gemini 3.7 Flash は sampling parameters (temperature/top_p/top_k) を受け付けないため、
+    # supports_temperature=False とし、thinking は呼出し側の reasoning_effort="low" で指定する。
+    "M3_G37_EVAL": ModelInfo(
+        model_id="gemini-3.7-flash",
+        provider="Google", name="Gemini 3.7 Flash (evaluation only)",
+        adapter_type="gemini",
+        input_price=0.75, output_price=3.75,
+        env_key="GEMINI_API_KEY", base_url=GEMINI_OPENAI_BASE_URL,
+        max_tokens=2000,
+        phase2_max_tokens=2000,
+        supports_temperature=False,
+        tier="",
+        # 3.7はthinkingを常時有効化（low/medium/highのみ、無効化不可）。
+        # 実測前は既存Geminiの保守的な予約を流用し、Phase 1で実測値に再評価する。
+        hidden_thinking_reserve_tokens=512,
+    ),
     "M4": ModelInfo(
         model_id="grok-4.5",
         provider="xAI", name="Grok 4.5",

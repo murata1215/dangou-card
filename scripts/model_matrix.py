@@ -520,7 +520,11 @@ def _phase2_user_content(model: ModelInfo) -> str:
 def _phase2_schema_for_model(model: ModelInfo) -> dict[str, Any] | None:
     if _is_h1_phase2_model(model):
         return build_h1_phase2_light_schema()
-    if model.model_id in {MODEL_REGISTRY["M3"].model_id, MODEL_REGISTRY["H3"].model_id}:
+    if model.model_id in {
+        MODEL_REGISTRY["M3"].model_id,
+        MODEL_REGISTRY["M3_G37_EVAL"].model_id,
+        MODEL_REGISTRY["H3"].model_id,
+    }:
         return build_phase2_response_schema()
     return None
 
@@ -532,12 +536,17 @@ def _phase2_request_options(model: ModelInfo) -> dict[str, Any]:
         assert schema is not None
         validate_h1_phase2_light_schema(schema)
         return {"thinking": {"type": "disabled"}, "output_config": {"format": {"type": "json_schema", "schema": schema}}}
-    if model.model_id in {MODEL_REGISTRY["M3"].model_id, MODEL_REGISTRY["H3"].model_id}:
+    if model.model_id in {
+        MODEL_REGISTRY["M3"].model_id,
+        MODEL_REGISTRY["M3_G37_EVAL"].model_id,
+        MODEL_REGISTRY["H3"].model_id,
+    }:
         assert schema is not None
         validate_phase2_schema_complexity(schema)
         # Gemini 3.5 Flash supports minimal; Gemini 3.1 Pro Preview's lowest
         # supported setting is low.  Do not combine this OpenAI-compatible
         # control with Gemini thinking_level/thinking_budget controls.
+        # Gemini 3.7 Flash rejects "minimal"; its supported levels are low/medium/high.
         reasoning_effort = "minimal" if model.model_id == MODEL_REGISTRY["M3"].model_id else "low"
         return {"reasoning_effort": reasoning_effort, "response_format": {"type": "json_schema", "json_schema": {"name": "phase2_negotiation", "strict": True, "schema": schema}}}
     return {}
