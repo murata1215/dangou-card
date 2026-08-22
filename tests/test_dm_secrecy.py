@@ -16,6 +16,10 @@ for_player_id を無視し、DM本文が全プレイヤーのプロンプトに
 8. 全プレイヤー分のvisible_stateを走査してもDM本文が非当事者側に一切出ないこと
 9. 匿名通信（anonymous_broadcast）が全員に届き、掲載者が秘匿されること
 10. commit/double_upのvisible_stateにmy_obligationsが入ること（実装漏れの是正）
+11. builder許可リストが正確であること（build_post_game_reflection_promptのみが
+    神視点情報の投入を許される唯一の例外であること）
+12. build_post_game_reflection_promptが実際に神視点情報（DM本文・匿名通信の
+    真の掲載者・非当事者向け契約条項）を含むこと（正のアサーション）
 """
 
 from engine.config import GameConfig
@@ -24,11 +28,13 @@ from engine.game import Game
 from engine.negotiation import StubAgent
 from engine.models import (
     MarketCommit, DmAction, BroadcastAction, AnonymousBroadcastAction,
+    Contract, ContractStatus, Obligation, ObligationType,
 )
 
+import llm.prompt_builder as prompt_builder
 from llm.prompt_builder import (
     _render_message_list, build_negotiation_prompt, build_commit_prompt,
-    build_reflection_prompt,
+    build_reflection_prompt, build_post_game_reflection_prompt,
 )
 
 from tests.conftest import make_player
@@ -233,6 +239,22 @@ class TestFullScanNoLeak:
             else:
                 assert "ROYAL_FLUSH_SECRET_XYZ" not in state_str
 
+    def test_no_failed_action_record_leaks_across_players(self):
+        """D2: 不成立アクション記録（my_failed_actions）が他プレイヤーへ漏れないこと"""
+        game = _make_game(num_players=6)
+        game._action_failures = {pid: [] for pid in game.players}
+        game._action_failures["P01"] = [
+            {"turn": 1, "action": "dm", "target": "P02",
+             "reason": "SENTINEL_FAILURE_LEAK_TEST", "consumed_slot": True},
+        ]
+        for pid in game.players:
+            state = game._build_visible_state(1, for_player_id=pid)
+            state_str = str(state.get("my_failed_actions", []))
+            if pid == "P01":
+                assert "SENTINEL_FAILURE_LEAK_TEST" in state_str
+            else:
+                assert "SENTINEL_FAILURE_LEAK_TEST" not in state_str
+
 
 class TestAnonymousBroadcastDelivery:
     """匿名通信の配信修復（Part B）"""
@@ -314,3 +336,100 @@ class TestObligationsVisibleInCommitAndDoubleUp:
         assert "message" not in captured["P03"]["messages"][0]
         # my_obligationsキーが存在する（for_player_id付きで呼ばれている証拠）
         assert "my_obligations" in captured["P01"]
+
+
+# builder許可リスト: 通常のプレイヤー向けプロンプト（神視点情報を一切含めてはいけない）
+KNOWN_AGENT_FACING = {
+    "build_system_prompt", "build_loan_prompt", "build_negotiation_prompt",
+    "build_commit_prompt", "build_double_up_prompt", "build_reflection_prompt",
+    "build_final_reflection_prompt", "build_completion_reflection_prompt",
+}
+# POST_GAME_REFLECTIONのみ、神視点情報の投入が許される唯一の例外
+GOD_INFO_ALLOWED = {"build_post_game_reflection_prompt"}
+
+
+class TestBuilderAllowList:
+    """T-A: llm/prompt_builder.py のbuild_*関数の許可リストが厳密に一致すること"""
+
+    def test_builder_allow_list_is_exact(self):
+        actual = {
+            name for name in dir(prompt_builder)
+            if name.startswith("build_") and callable(getattr(prompt_builder, name))
+        }
+        assert actual == KNOWN_AGENT_FACING | GOD_INFO_ALLOWED
+
+
+def _build_god_info_scenario_game() -> Game:
+    """
+    T-B用: 神視点情報（DM本文・匿名通信の真の掲載者・非当事者向け契約条項）を
+    仕込んだ最小シナリオ。tests/test_post_game_reflection.py::_build_scenario_game()
+    と同じ先例（直接state操作・_god_transcript/契約/eventの手動注入）を踏襲するが、
+    本ファイルの独立性を保つためあえて別実装とする。
+
+    視点プレイヤーはP02に固定する:
+    - DM P01→P02（P02は受信者本人なので(1)開示対象）
+    - 匿名通信の真の掲載者=P01（P02≠P01なので(2)開示対象）
+    - 契約はP03↔P04（P02は非当事者なので(3)開示対象）
+    """
+    config = GameConfig.baseline_v1(4)
+    agents = {f"P{i+1:02d}": StubAgent() for i in range(4)}
+    game = Game(config=config, agents=agents, seed=7, logger=EventLogger())
+    game._setup()
+    game.current_round = 3
+
+    game._god_transcript.append({
+        "round": 1, "turn": 1, "type": "dm",
+        "message": "DM_SECRECY_TEST_BODY_XYZ", "sender": "P01", "to": "P02",
+    })
+    game._god_transcript.append({
+        "round": 2, "turn": 1, "type": "anonymous_broadcast",
+        "message": "ANON_SECRECY_TEST_MSG", "actual_sender": "P01",
+    })
+
+    ob = Obligation(
+        obligation_id="OB_SECRET", contract_id="C_SECRET",
+        obligor="P03", counterparty="P04",
+        ob_type=ObligationType.TYPE_A_PAYMENT, round_num=1,
+        details={"amount": 3_000_000},
+    )
+    contract = Contract(
+        contract_id="C_SECRET", proposer="P03", parties=["P03", "P04"],
+        signed_by=["P03", "P04"], obligations=[ob], round_created=1,
+        status=ContractStatus.ACTIVE,
+    )
+    game.contracts = [contract]
+
+    _eliminate_for_secrecy_test(game, "P04", 3, reason="bankruptcy")
+    return game
+
+
+def _eliminate_for_secrecy_test(game: Game, pid: str, round_num: int, reason: str) -> None:
+    p = game.players[pid]
+    game.players[pid] = p.model_copy(update={
+        "is_alive": False, "elimination_reason": reason, "elimination_round": round_num,
+    })
+
+
+class TestPostGamePromptContainsGodInfo:
+    """T-B: build_post_game_reflection_prompt()が実際に神視点情報を含むこと（正のアサーション）"""
+
+    def test_post_game_prompt_does_contain_god_info(self):
+        game = _build_god_info_scenario_game()
+        result = game._finalize()
+        shared = game._build_god_shared_block(result)
+
+        # P02（DMの受信当事者・匿名通信の非掲載者・契約C_SECRETの非当事者）
+        # 視点で答え合わせプロンプトを組み立てる
+        ctx = game._build_post_game_context("P02", result, shared)
+        prompt = build_post_game_reflection_prompt(
+            game.players["P02"], game.config, ctx,
+        )
+
+        # (i) DM本文
+        assert "DM_SECRECY_TEST_BODY_XYZ" in prompt
+        # (ii) 匿名通信の真の掲載者がP01であること（ゲーム中は秘匿されていた事実）
+        assert "ANON_SECRECY_TEST_MSG" in prompt
+        assert "真の掲載者は P01" in prompt
+        # (iii) 非当事者向け秘密契約の存在（P02はC_SECRETの当事者ではない）
+        assert "非公開の契約" in prompt
+        assert "P03・P04" in prompt

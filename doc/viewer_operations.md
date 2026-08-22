@@ -100,7 +100,7 @@ systemctl --user restart dangou-viewer.service
 
 `systemctl --user show -p Environment`やenvファイルの内容を端末・共有ログに出力してtokenを確認してはならない。Caddy設定は変わらないためreloadは不要である。
 
-神視点のAPIは`view=god`と`X-Viewer-God-Token`ヘッダの両方を必要とする。tokenなし・誤tokenはHTTP 403、正しいtokenだけがHTTP 200となることを、本文を表示しない検証で確認する。UIでは詳細モーダルの「神視点を有効化」にtokenを一時入力し、`🔒 神視点 ON — 秘匿情報を表示中`、公開／秘匿のアイコン・ラベル・カード区別が出ることを確認する。tokenはURLやブラウザ保存領域に残さない。
+神視点のAPIは`view=god`と`X-Viewer-God-Token`ヘッダの両方を必要とする。tokenなし・誤tokenはHTTP 403、正しいtokenだけがHTTP 200となることを、本文を表示しない検証で確認する。UIではヘッダー右側の`VIEW: PUBLIC 🔒`ボタンでtokenを1回入力すれば、以後は同一タブ内でプレイヤー詳細・ラウンド状況などすべてのGod対応表示に使い回される（プレイヤーを開き直すたびの再入力は不要）。有効化後は`🔒 神視点 ON — 秘匿情報を表示中`、公開／秘匿のアイコン・ラベル・カード区別が出ることを確認する。tokenはタブ限定の`sessionStorage`にのみ保持し、`localStorage`・URL・ブラウザの永続保存領域には残さない。`VIEW: GOD 🔓`ボタンを押すと明示的にログアウトでき、sessionStorageからも削除される。タブを閉じれば自動的に失効する。
 
 ## トラブルシューティング
 

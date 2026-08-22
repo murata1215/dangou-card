@@ -195,8 +195,11 @@ def test_gemini_phase2_overrides_and_reserves_are_model_specific():
 
     assert mm._phase2_effective_max_tokens(MODEL_REGISTRY["M3"], 400) == 512
     assert mm._phase2_effective_max_tokens(MODEL_REGISTRY["H3"], 400) == 912
-    assert mm._phase2_worst_case_cost(MODEL_REGISTRY["M3"], system, 512) == pytest.approx(0.014364)
-    assert mm._phase2_worst_case_cost(MODEL_REGISTRY["H3"], system, 912) == pytest.approx(0.023952)
+    # 2026-08-22サイクル「脱落済みplayer宛DM問題」でRULES_SUMMARYへ脱落公示/アクション枠
+    # フィードバックの文言を追加し、system prompt長が変化したため期待値を更新（意図的な
+    # 一度きりの変更。このコミットを跨ぐキャッシュ率・コスト予約値は比較不可）。
+    assert mm._phase2_worst_case_cost(MODEL_REGISTRY["M3"], system, 512) == pytest.approx(0.014568)
+    assert mm._phase2_worst_case_cost(MODEL_REGISTRY["H3"], system, 912) == pytest.approx(0.024224)
     assert mm._phase2_worst_case_cost(MODEL_REGISTRY["M3"], system, 512) < 0.03
     assert mm._phase2_worst_case_cost(MODEL_REGISTRY["H3"], system, 912) < 0.03
 

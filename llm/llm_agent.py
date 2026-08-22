@@ -30,12 +30,13 @@ from llm.prompt_builder import (
     build_system_prompt, build_loan_prompt,
     build_negotiation_prompt, build_commit_prompt,
     build_double_up_prompt, build_reflection_prompt,
-    build_final_reflection_prompt,
+    build_final_reflection_prompt, build_completion_reflection_prompt,
+    build_post_game_reflection_prompt,
 )
 from llm.response_parser import (
     parse_response, extract_json, ParseError, make_correction_message,
     LENGTH_TRUNCATION_HINT, extract_memory_with_status, normalize_memory_with_truncation,
-    parse_final_reflection,
+    parse_final_reflection, parse_post_game_reflection,
 )
 from llm.llm_logger import LLMLogger
 
@@ -75,6 +76,10 @@ class LLMAgent(PlayerAgent):
         self.commit_correction_count: int = 0
         # 修正4: 前回のメッセージ数を追跡（空回り検出用）
         self._last_message_count: int = 0
+        # D2: 前回の不成立アクション件数を追跡（自動pass握り潰し防止用）。
+        # 不成立アクションは _round_messages に入らず message count が動かないため、
+        # フィードバックを一度も読まないまま自動passして枠だけ溶ける事故が実測された。
+        self._last_failure_count: int = 0
         # 修正1: 当該ラウンドの交渉メッセージを保持
         self._current_round_messages: list[dict[str, Any]] = []
         self._current_round: int = 0
@@ -91,6 +96,9 @@ class LLMAgent(PlayerAgent):
         # 脱落時の最終コメント（FINAL_REFLECTION）。観戦/分析用に保持するのみで、
         # 次ラウンドのプロンプトには一切注入されない（脱落者なので次ラウンドが無い）。
         self.final_reflection: dict[str, Any] | None = None
+        # ゲーム完全終了後の答え合わせ振り返り（POST_GAME_REFLECTION）。
+        # final_reflection とは別属性（全LLMプレイヤーが両方を持つため上書き禁止）。
+        self.post_game_reflection: dict[str, Any] | None = None
 
     def _update_last_log_emotion(self, strategy: dict[str, Any]) -> None:
         """strategyからemotion・reasoningを抽出し、llm_loggerの最新エントリに後付けする"""
@@ -143,6 +151,24 @@ class LLMAgent(PlayerAgent):
             entry["final_reflection_truncated"] = result.get("truncated", False)
             entry["emotion"] = result.get("emotion")
             entry["final_reflection_salvaged"] = result.get("salvaged", [])
+            entry["final_reflection_variant"] = result.get("variant", "elimination")
+
+    def _update_last_log_post_game_reflection(self, result: dict[str, Any]) -> None:
+        """
+        post_game_reflect()の抽出結果をllm_loggerの最新エントリに後付けする
+        （_update_last_log_final_reflectionとは意図的に別メソッド・別プレフィックス。
+        FR分析用フィールドに押し込んでlog entryを汚染しないため）。
+
+        秘密情報・APIキーはここに含めない。comment本文は response_text に
+        既に全文があるため重複させない。神視点コンテキスト本体もここには入れない。
+        """
+        if self.llm_logger._entries:
+            entry = self.llm_logger._entries[-1]
+            entry["post_game_reflection_status"] = result.get("status")
+            entry["post_game_reflection_chars"] = result.get("chars", 0)
+            entry["post_game_reflection_truncated"] = result.get("truncated", False)
+            entry["post_game_reflection_emotion"] = result.get("emotion")
+            entry["post_game_reflection_salvaged"] = result.get("salvaged", [])
 
     def set_game_cost_budget(self, budget: GameCostBudget) -> None:
         """Gameから明示注入される本戦専用の共有budget。"""
@@ -283,9 +309,16 @@ class LLMAgent(PlayerAgent):
             self._current_round = round_num
             self._current_round_messages = []
             self._last_message_count = 0
+            self._last_failure_count = 0
+
+        # 不成立アクションは _round_messages に入らず message count が動かないため、
+        # フィードバックを一度も読まないまま自動passして枠だけ溶ける（D2との相互作用）。
+        failure_count = len(visible_state.get("my_failed_actions") or [])
+        has_new_failure = failure_count > self._last_failure_count
+        self._last_failure_count = failure_count
 
         # 修正4: 空回り削減 — 新規メッセージがなくturn>=2なら自動pass
-        if AUTO_PASS_ON_NO_NEWS and turn >= 2:
+        if AUTO_PASS_ON_NO_NEWS and turn >= 2 and not has_new_failure:
             current_msg_count = len(visible_state.get("messages", []))
             if current_msg_count <= self._last_message_count:
                 return PassAction(player_id=self.player_id)
@@ -581,4 +614,131 @@ class LLMAgent(PlayerAgent):
         result = parse_final_reflection(text, max_chars=self._config.final_reflection_max_chars)
         self.final_reflection = result  # 観戦/分析用に保持（次ラウンドへは渡さない）
         self._update_last_log_final_reflection(result)
+        return result
+
+    def completion_reflect(
+        self,
+        player_state: PlayerState,
+        round_num: int,
+        visible_state: dict,
+        completion_context: dict,
+    ) -> dict[str, Any]:
+        """
+        FINAL_REFLECTION completion variant（R12完走した生還者の最終コメント）
+
+        final_reflect() と同一の規約（no-retry・cost_exceeded/no_config skip・
+        BudgetBlockedError透過・self._memory/memory_historyには絶対に触れない）を
+        踏襲する兄弟メソッド。variant kwargで final_reflect() を分岐させず
+        別メソッドにする理由: 既存テストダブルの `final_reflect(self, player_state,
+        round_num, visible_state, elimination_context)` シグネチャに未知kwargを
+        渡すとTypeErrorがGame側のexcept Exceptionに飲まれ、沈黙するリグレッション
+        になるため。
+
+        parse_final_reflection の cause_key="key_factor" を使う（返り値のキー名
+        自体は互換のため常に "defeat_cause"）。self.final_reflection への格納・
+        _update_last_log_final_reflection の呼び出しはfinal_reflect()と共有できる
+        （1player 1回しかFINAL_REFLECTIONは呼ばれないため上書き競合が起きない）。
+        """
+        if self._config is None:
+            return {"status": "skipped", "reason": "no_config", "comment": "",
+                     "emotion": None, "defeat_cause": None, "chars": 0, "truncated": False,
+                     "salvaged": [], "variant": "completion"}
+        if self._cost_exceeded:
+            return {"status": "skipped", "reason": "cost_exceeded", "comment": "",
+                     "emotion": None, "defeat_cause": None, "chars": 0, "truncated": False,
+                     "salvaged": [], "variant": "completion"}
+
+        user_prompt = build_completion_reflection_prompt(
+            player_state, round_num, visible_state, self._config,
+            completion_context, memory=self._memory or None,
+        )
+        try:
+            text, _ = self._call_llm(
+                "completion_reflection", round_num, user_prompt,
+                max_tokens_override=self._config.final_reflection_max_tokens,
+            )
+        except BudgetBlockedError:
+            return {"status": "budget_blocked", "comment": "", "emotion": None,
+                     "defeat_cause": None, "chars": 0, "truncated": False,
+                     "salvaged": [], "variant": "completion"}
+        if not text:
+            return {"status": "empty", "comment": "", "emotion": None,
+                     "defeat_cause": None, "chars": 0, "truncated": False,
+                     "salvaged": [], "variant": "completion"}
+
+        result = parse_final_reflection(
+            text, max_chars=self._config.final_reflection_max_chars, cause_key="key_factor",
+        )
+        result["variant"] = "completion"
+        self.final_reflection = result  # 観戦/分析用に保持（1player 1回のため共有可）
+        self._update_last_log_final_reflection(result)
+        return result
+
+    @staticmethod
+    def _empty_post_game_result(status: str, **extra: Any) -> dict[str, Any]:
+        """post_game_reflect()の早期return用に、parse_post_game_reflection()の
+        "empty"経路と同じキー集合を持つdictを組み立てる（呼出側のkey存在依存を守る）。"""
+        result = {
+            "status": status, "comment": "", "chars": 0, "truncated": False,
+            "emotion": None, "self_assessment": None, "biggest_revelation": None,
+            "changed_opinion": None, "best_player": None, "best_player_raw": None,
+            "most_deceptive_player": None, "most_deceptive_player_raw": None,
+            "salvaged": [],
+        }
+        result.update(extra)
+        return result
+
+    def post_game_reflect(
+        self,
+        player_state: PlayerState,
+        round_num: int,
+        post_game_context: dict,
+    ) -> dict[str, Any]:
+        """
+        ゲーム完全終了後の全員答え合わせ振り返り（POST_GAME_REFLECTION）
+
+        final_reflect() / completion_reflect() と同一規約（no-retry・
+        cost_exceeded/no_config skip・BudgetBlockedError透過・
+        self._memory/memory_historyには絶対に触れない）を踏襲する3人目の兄弟
+        メソッド。呼出はGame側で「1player 1回」が保証される
+        （このメソッド自体は何度呼ばれても副作用のない読み取り専用処理）。
+
+        final_reflect/completion_reflectと違い self.final_reflection を
+        共有せず、新規属性 self.post_game_reflection に格納する
+        （全LLMプレイヤーが両方のreflectionを持つため上書き禁止）。
+        ログ後付けも _update_last_log_post_game_reflection という別メソッドを使う
+        （FR分析用フィールドを汚染しないため）。
+
+        retryは0（final_reflect/completion_reflectと同じ方針）。1回きりの
+        演出callで失敗しても失うものが無く、retryを入れるとコストと
+        budget blockリスクだけが増える。失敗は全てstatus付きdictで返し、
+        例外はGame側で握られる。
+        """
+        if self._config is None:
+            return self._empty_post_game_result("skipped", reason="no_config")
+        if self._cost_exceeded:
+            return self._empty_post_game_result("skipped", reason="cost_exceeded")
+
+        user_prompt = build_post_game_reflection_prompt(
+            player_state, self._config, post_game_context, memory=self._memory or None,
+        )
+        try:
+            text, _ = self._call_llm(
+                "post_game_reflection", round_num, user_prompt,
+                max_tokens_override=self._config.post_game_reflection_max_tokens,
+            )
+        except BudgetBlockedError:
+            return self._empty_post_game_result("budget_blocked")
+        if not text:
+            return self._empty_post_game_result("empty")
+
+        # roster照合は全12名（脱落者含む）が対象。survivor_idsだけだと脱落者への
+        # 正当な言及（best_player/most_deceptive_playerとして名指す）を誤って
+        # 未解決扱いしてしまう。
+        roster = set(post_game_context.get("shared", {}).get("roster") or []) or None
+        result = parse_post_game_reflection(
+            text, roster=roster, max_chars=self._config.post_game_reflection_max_chars,
+        )
+        self.post_game_reflection = result  # 観戦/分析用に保持（1player 1回）
+        self._update_last_log_post_game_reflection(result)
         return result

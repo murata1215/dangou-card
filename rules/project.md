@@ -74,7 +74,7 @@ DM（`type == "dm"`）は送信者・宛先以外に対し **`message` キー自
 
 Viewer APIは既定で`view=public`とし、DM本文・宛先、匿名発言の実発信者、契約条項・義務、sensitive action由来のreasoning previewを返してはならない。`get_player_timeline()`、`get_round_states()`、`get_player_round_detail()`のいずれも同じ公開境界を使うこと。公開表示の構造化itemには`visibility: "public"`と表示ラベルを付け、UI側の推測だけで秘匿性を判断しない。
 
-ゲーム内の秘匿情報を確認する必要がある場合だけ`view=god`を使用できる。God viewは`VIEWER_GOD_TOKEN`と`X-Viewer-God-Token`の一致を必須とし、未設定・不一致は403にする。tokenはrepo外の権限制限されたEnvironmentFileからuser systemdへ注入し、URL、ブラウザ永続領域、git、ログ、devlogへ値を残さない。God viewで返せるのは構造化済みのゲーム情報（DM、匿名発言の実発信者、契約と履行記録）だけであり、system prompt、user prompt、`response_text`、APIキー、認証情報、ゲーム外の運用情報は返さない。
+ゲーム内の秘匿情報を確認する必要がある場合だけ`view=god`を使用できる。God viewは`VIEWER_GOD_TOKEN`と`X-Viewer-God-Token`の一致を必須とし、未設定・不一致は403にする。tokenは`localStorage`等の永続領域・URL・git・ログ・devlogへ残さない。タブ終了で自動破棄される`sessionStorage`に限り、同一タブ内でGod認証を1回だけ行い以後の全God対応API呼び出しで使い回す（プレイヤー詳細を開き直すたびの再入力を避ける）目的での一時保持を許可する。サーバー側token（`VIEWER_GOD_TOKEN`）はrepo外の権限制限されたEnvironmentFileからuser systemdへ注入する運用を変えない。God viewで返せるのは構造化済みのゲーム情報（DM、匿名発言の実発信者、契約と履行記録）だけであり、system prompt、user prompt、`response_text`、APIキー、認証情報、ゲーム外の運用情報は返さない。
 
 神視点UIでは`visibility: "secret"`を受けたカードに、色だけでなく`🔒`等のアイコンと文字ラベルを常に表示する。公開カードも`🌐`等のラベルを持たせる。自由記述のreasoning／Handover Memoryがモデル自身によって秘匿内容を引用する意味論的漏洩は別リスクなので、公開viewでsensitive actionに紐付くpreviewを返さず、新たな可視化経路を追加するときは同じ境界を回帰テストで確認する。
 
@@ -221,3 +221,104 @@ C1/C6、2/2件）で§8.2秘匿情報（契約条項の逐語的復唱、交渉�
 新しい自由記述系の可視化経路を追加する際は、「一人称だから安全」と決めつけず、実データで
 §8.2該当語（契約ID、相手プレイヤーID、市場ID等）の混入有無を確認してから公開範囲を決めること。
 担保テスト: `tests/test_viewer.py::TestFinalReflectionViewer::test_public_view_hides_secret_content`。
+
+## POST_GAME_REFLECTION（ゲーム完全終了後の全員答え合わせ）はgod情報を積極的に含む唯一の例外
+
+`_finalize()`後に全生存者・全脱落者へ一律発火する`POST_GAME_REFLECTION`は、FINAL_REFLECTIONとは
+逆に**「他プレイヤーの内心・被匿名性・非当事者契約の種明かし」を意図的に読ませる**設計であり、
+上記のgod隔離原則そのものの唯一の例外として設けている。次の7点を必ず守ること。
+
+1. **god情報をプロンプトに積む権限を持つbuilderは`llm/prompt_builder.py`の
+   `build_post_game_reflection_prompt()`一つだけ**である。他8つの`build_*`は従来どおり
+   agent向け（god情報禁止）のままで、これを崩してはならない。担保テスト:
+   `tests/test_dm_secrecy.py::TestBuilderAllowList::test_builder_allow_list_is_exact`。
+2. POST_GAME_REFLECTIONの出力（`status`/`emotion`/`key_insight`/`self_assessment`/
+   `biggest_revelation`/`best_player`/`most_deceptive_player`/`changed_opinion`/`comment`等）は
+   **既存のpublic向けキーであっても全面god限定**とする。FINAL_REFLECTIONのような
+   「一部フィールドだけpublic」の二層設計は適用しない。理由は本イベントの自由記述が
+   構造的に他プレイヤーの秘密（DM本文・匿名の実発信者・非当事者向け契約条項）へ
+   直接言及しうるため。
+3. `POST_GAME_REFLECTION`は`_god_transcript`と同様の構造的隔離下で生成され、
+   `_build_visible_state()`/`_visible_messages()`を一切経由しない。
+4. POST_GAME_REFLECTIONの発火は**読み取り専用**であり、ゲーム状態・memory・契約・資産・
+   勝敗結果を一切変更しない（`_finalize()`後に実行されるため、変更しても既に確定した
+   結果へは反映されない設計）。
+5. POST_GAME_REFLECTIONは正常完走パス（`_finalize()`成功後）でのみ発火し、
+   JSONLログ上では**`GAME_END`より後**に出現する。ログ読み取り側（`viewer/log_parser.py`他）は
+   `GAME_END`検出で読み取りを打ち切ってはならない（現状`break`は存在しない。
+   `tests/test_l6_r12_trial.py`の`events[-1]=="GAME_END"`は"GAME_END以降にイベントが
+   存在しない"ことの担保ではなく、単に`_finalize()`直前ログの末尾検証であることに注意）。
+6. Viewer側は現サイクルでは`POST_GAME_REFLECTION`イベントを一切UIへ表示しない
+   （`viewer/log_parser.py`のif/elifディスパッチが未対応の`event_type`を黙ってスキップする
+   既存挙動に委ねている）。表示対応を追加する場合も、god限定の原則（上記2）を維持すること。
+   担保テスト: `tests/test_viewer.py::TestPostGameReflectionViewer`。
+7. モデル自身に「公開してよい一言」を書かせる`public_last_word`のような別フィールドは
+   **本サイクルでは実装していない**。将来追加する場合もFINAL_REFLECTIONの節と同様、
+   実データで§8.2該当語の混入有無を確認してから公開範囲を決めること。
+
+## 不成立アクションのフィードバックは本人限定・engine判定不介入
+
+`engine/actions.py`の`validate_action()`が不成立と判定したアクション（脱落者宛DM・送金・契約提案・
+カードトレード等、資金不足、その他の全拒否理由）は、行動枠を消費する（§2.5、既存仕様のまま変更しない）
+一方で、従来は失敗理由がイベントログにしか記録されず、行動主体のLLM自身へは一切フィードバックされて
+いなかった。これにより脱落済みプレイヤー宛のDMを繰り返し送り続け、ラウンド内の行動枠を丸ごと浪費して
+自滅する実害（`trial_C_l12_r12_20260822` R7-R9のP06、有効枠30中25枠を脱落済みP09宛DMで浪費し
+R9破産）が実際に発生した。
+
+修正として`engine/game.py`は`_action_failures: dict[player_id, list[dict]]`にラウンド単位で
+不成立記録（`turn`/`action`/`reason`/`target`/`consumed_slot`、直近`_ACTION_FAILURE_MEMO_MAX=12`件）を
+保持し、`_build_visible_state(for_player_id=...)`経由で**本人にのみ**`my_failed_actions`/
+`my_action_budget`として公開する。この記録・公開経路には次の不変条件がある。
+
+1. **engineの合否判定ロジック自体（`validate_action()`）は一切変更しない。** フィードバックは
+   判定結果を「本人に伝える」だけであり、判定基準（生存チェック等）を緩めたり厳しくしたりしない。
+   D1（`ContractProposeAction`/`CardTradeProposeAction`の脱落者宛先チェックの非対称性）は
+   フィードバックとは独立した別修正である。
+2. **`my_failed_actions`は`for_player_id`と完全一致するプレイヤーにのみ返す。** 他プレイヤーへの
+   `_build_visible_state()`呼び出しでは絶対に混入しないこと（DM本文と同じ「本人限定」原則）。
+   担保テスト: `tests/test_dm_secrecy.py::TestFullScanNoLeak::test_no_failed_action_record_leaks_across_players`。
+3. **`llm/llm_agent.py`の`AUTO_PASS_ON_NO_NEWS`最適化は新規失敗があるときバイパスする。**
+   （`has_new_failure = failure_count > self._last_failure_count`）。そうしないと「メッセージ増加なし」
+   の条件だけで自動パスされ、失敗フィードバックがプロンプトに積まれてもLLMに気づかせる機会がないまま
+   ラウンドが終わってしまう。
+4. §2.5（不成立アクションも行動枠を消費する）自体は意図的なゲームルールであり、本修正でも変更しない。
+   本修正はあくまで「なぜ失敗したか」を本人に見えるようにすることで、無意味な浪費を自己回避
+   できるようにする情報提供に留まる。
+
+担保テスト: `tests/test_dead_target_and_feedback.py`（`TestActionFailureRecord`・
+`TestActionFailureVisibility`・`TestActionFeedbackPrompt`・`TestDmLoopScenario`）。
+
+## Viewer のメッセージ表示は LLMログ（本文）と Engineイベント（成否）の join を必ず経由する
+
+`viewer/log_parser.py`の`_collect_round_messages()`はLLMログ（`{game_id}_{pid}_llm_calls.jsonl`）
+から交渉メッセージの本文・宛先を復元するが、**そのメッセージが実際にengineへ受理されたか
+（不成立で行動枠だけ消費されたか）は、LLMログ単体には含まれない**。LLMが送信を試みた
+という事実だけを表示し、成否を確認せずに通常メッセージと同列表示すると、脱落済みプレイヤー宛の
+不成立DMが「送れた」ように見えるビューワー側の誤表示を生む（今回の元バグの表示面。
+`trial_C_l12_r12_20260822`のP06→P09 R7-R9、実測25件全て不成立だが修正前は通常DMと同じ見た目だった）。
+
+修正として、Engineイベント（`{game_id}_events.jsonl`の`NEGOTIATION_ACTION`、`data.success`/
+`data.reason`を持つ）を`(player_id, round_num, turn)`で索引化する`_index_negotiation_outcomes()`と、
+LLMログ1件をこの索引と突き合わせる`_match_delivery()`を経由し、各メッセージへ`delivery`
+（`"delivered"`/`"rejected"`/`"unverified"`の3値）と、rejected時のみ`reject_reason`を付与する。
+
+1. **`"unverified"`（対応イベントが見つからない＝未検証）を`"rejected"`（明示的に不成立と判定
+   された）と絶対に混同表示しないこと。** これを混同すると「不明」を「不成立」と決めつける、
+   今回の元バグと同種の誤情報を新たに作り出すことになる。
+2. **`reject_reason`は宛先PIDを直接含みうる**（例: `"Target P09 is not alive"`）ため、
+   `view=="god"`のときのみ付与する。`view=="public"`のDM表示（本文・宛先が非公開のプレースホルダ）
+   には`delivery`/`reject_reason`のいずれも含めない（§8.2のDM秘匿境界の一部として扱う）。
+3. **後方互換は「`delivery`フィールドを一切付与しない」ことで担保する。** `NEGOTIATION_ACTION`に
+   `turn`を含まない旧形式のログ・イベント（`_collect_round_messages(trial_dir, game_id)`の2引数
+   呼び出しを含む）では`events`が渡されない、または索引が空になるため、機械的に`"unverified"`を
+   埋めたりしない。「わからない」を明示的な値で埋めることは、それ自体が誤情報の温床になる。
+4. `get_player_round_detail()`の`secret_events.round_totals`には`messages_rejected`
+   （そのラウンドの秘匿DM全体の不成立件数）と`messages_rejected_shown`（本人が関与し表示された
+   分のうちの不成立件数）を追加する。この2値も同じjoin結果に依存するため、`delivery`を持たない
+   旧ログでは両方0になる（誤って全件成立扱いにはしない）。
+
+担保テスト: `tests/test_viewer.py::TestNegotiationDeliveryJoin`（純関数の単体テスト、
+`_collect_round_messages`の後方互換テスト、`get_round_states`/`get_player_round_detail`経由の
+end-to-endテスト、public view非漏洩テストを含む）。実データ照合:
+`trial_C_l12_r12_20260822`でdelivered:653/rejected:25/unverified:4、P06→P09のR7-R9全25件が
+`rejected`かつ`reject_reason`一致を確認済み。

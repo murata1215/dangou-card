@@ -14,6 +14,7 @@ from viewer.log_parser import (
     LogCache, list_games, get_game_state, get_player_timeline,
     _extract_strategy, _extract_action, _extract_emotion,
     get_commentary, get_round_states, get_player_round_detail,
+    _index_negotiation_outcomes, _match_delivery, _collect_round_messages,
 )
 
 INDEX_HTML_PATH = Path(__file__).resolve().parent.parent / "viewer" / "static" / "index.html"
@@ -276,6 +277,152 @@ class TestPlayerRoundDetail:
         assert god["calls"][1]["action"]["display"]["label"] == "匿名発言"
         assert god["secret_events"]["contracts"][0]["display"]["label"] == "秘匿契約"
 
+    def _make_multi_player_trial(self, tmp_path: Path) -> Path:
+        """P01/P02/P03の3人でDM・契約の当事者性フィルタを検証するためのfixture。
+
+        _make_trial() はP01単独のため全DM・全契約がP01絡みとなり、
+        「関係ないプレイヤーのDM/契約が混入する」バグを構造的に検出できない。
+        このfixtureはP01と無関係なP02→P03のDM・契約(C02)を含めて非対称性を作る。
+        """
+        trial = tmp_path / "trial_multi"
+        logs = trial / "llm_logs"
+        logs.mkdir(parents=True)
+
+        def _entry(pid: str, round_num: int, turn: int, action: dict) -> dict:
+            return {
+                "player_id": pid, "model_id": "test-model", "phase": "negotiation",
+                "round_num": round_num, "turn": turn,
+                "response_text": json.dumps({"reasoning": "r", "action": action}, ensure_ascii=False),
+                "reasoning": "r", "reasoning_tokens": 0,
+            }
+
+        p01_entries = [
+            _entry("P01", 2, 1, {"type": "dm", "to": "P02", "message": "P01が送ったDM"}),
+            _entry("P01", 2, 2, {"type": "contract_propose",
+                                  "terms": [{"ob_type": "type_b_market", "market_id": "own_terms_marker"}]}),
+        ]
+        p02_entries = [
+            _entry("P02", 2, 1, {"type": "dm", "to": "P03", "message": "P01と無関係なDM"}),
+            _entry("P02", 2, 2, {"type": "contract_propose",
+                                  "terms": [{"ob_type": "type_b_market", "market_id": "foreign_terms_marker"}]}),
+        ]
+        p03_entries = [
+            _entry("P03", 2, 1, {"type": "dm", "to": "P01", "message": "P01が受け取ったDM"}),
+        ]
+        (logs / "game01_P01_llm_calls.jsonl").write_text(
+            "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in p01_entries), encoding="utf-8",
+        )
+        (logs / "game01_P02_llm_calls.jsonl").write_text(
+            "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in p02_entries), encoding="utf-8",
+        )
+        (logs / "game01_P03_llm_calls.jsonl").write_text(
+            "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in p03_entries), encoding="utf-8",
+        )
+        events = [
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "data": {"player_id": "P01"}},
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "data": {"player_id": "P02"}},
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "data": {"player_id": "P03"}},
+            {"event_type": "NEGOTIATION_ACTION", "round_num": 2,
+             "data": {"action": "contract_propose", "contract_id": "C01", "player_id": "P01", "parties": ["P01", "P02"]}},
+            {"event_type": "NEGOTIATION_ACTION", "round_num": 2,
+             "data": {"action": "contract_propose", "contract_id": "C02", "player_id": "P02", "parties": ["P02", "P03"]}},
+        ]
+        (trial / "game01_events.jsonl").write_text(
+            "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in events), encoding="utf-8",
+        )
+        (trial / "game01_seat_map.json").write_text(
+            '{"P01":"L1","P02":"L2","P03":"L3"}', encoding="utf-8",
+        )
+        return tmp_path
+
+    def test_god_secret_events_exclude_unrelated_dms(self, tmp_path):
+        logs_dir = self._make_multi_player_trial(tmp_path)
+        detail = get_player_round_detail(logs_dir, "trial_multi", "game01", "P01", 2, view="god")
+        serialized = json.dumps(detail["secret_events"], ensure_ascii=False)
+        assert "P01と無関係なDM" not in serialized
+        for m in detail["secret_events"]["messages"]:
+            assert m.get("sender") == "P01" or m.get("to") == "P01"
+
+    def test_god_secret_events_retain_received_dms(self, tmp_path):
+        logs_dir = self._make_multi_player_trial(tmp_path)
+        detail = get_player_round_detail(logs_dir, "trial_multi", "game01", "P01", 2, view="god")
+        received = [m for m in detail["secret_events"]["messages"] if m.get("message") == "P01が受け取ったDM"]
+        assert len(received) == 1
+        assert received[0]["sender"] == "P03"
+        assert received[0]["to"] == "P01"
+
+    def test_god_secret_events_retain_sent_dms(self, tmp_path):
+        logs_dir = self._make_multi_player_trial(tmp_path)
+        detail = get_player_round_detail(logs_dir, "trial_multi", "game01", "P01", 2, view="god")
+        sent = [m for m in detail["secret_events"]["messages"] if m.get("message") == "P01が送ったDM"]
+        assert len(sent) == 1
+        assert sent[0]["sender"] == "P01"
+
+    def test_god_secret_events_contracts_scoped_to_parties_or_proposer(self, tmp_path):
+        logs_dir = self._make_multi_player_trial(tmp_path)
+        detail_p01 = get_player_round_detail(logs_dir, "trial_multi", "game01", "P01", 2, view="god")
+        assert [c["contract_id"] for c in detail_p01["secret_events"]["contracts"]] == ["C01"]
+        serialized_p01 = json.dumps(detail_p01, ensure_ascii=False)
+        assert "foreign_terms_marker" not in serialized_p01
+        assert "own_terms_marker" in serialized_p01
+
+        # 対称性の確認: P03視点ではC02のみ(P01特殊ケースでないことの証明)
+        detail_p03 = get_player_round_detail(logs_dir, "trial_multi", "game01", "P03", 2, view="god")
+        assert [c["contract_id"] for c in detail_p03["secret_events"]["contracts"]] == ["C02"]
+
+    def test_god_secret_events_report_round_totals(self, tmp_path):
+        logs_dir = self._make_multi_player_trial(tmp_path)
+        detail = get_player_round_detail(logs_dir, "trial_multi", "game01", "P01", 2, view="god")
+        se = detail["secret_events"]
+        assert se["scope"] == "player"
+        totals = se["round_totals"]
+        assert totals["messages"] == 3
+        assert totals["messages_hidden"] == 1
+        assert totals["contracts"] == 2
+        assert totals["contracts_hidden"] == 1
+        assert len(se["messages"]) + totals["messages_hidden"] == totals["messages"]
+        assert len(se["contracts"]) + totals["contracts_hidden"] == totals["contracts"]
+
+    def test_god_secret_events_dm_with_missing_recipient_kept_for_sender(self, tmp_path):
+        logs_dir = self._make_multi_player_trial(tmp_path)
+        # P01発の宛先欠落DM(turn3)を追記
+        logs = logs_dir / "trial_multi" / "llm_logs"
+        extra_p01 = {
+            "player_id": "P01", "model_id": "test-model", "phase": "negotiation",
+            "round_num": 2, "turn": 3,
+            "response_text": json.dumps({"reasoning": "r", "action": {"type": "dm", "message": "宛先欠落だが送信者はP01"}}, ensure_ascii=False),
+            "reasoning": "r", "reasoning_tokens": 0,
+        }
+        extra_p02 = {
+            "player_id": "P02", "model_id": "test-model", "phase": "negotiation",
+            "round_num": 2, "turn": 3,
+            "response_text": json.dumps({"reasoning": "r", "action": {"type": "dm", "message": "宛先欠落かつ送信者もP01でない"}}, ensure_ascii=False),
+            "reasoning": "r", "reasoning_tokens": 0,
+        }
+        extra_p03 = {
+            "player_id": "P03", "model_id": "test-model", "phase": "negotiation",
+            "round_num": 2, "turn": 4,
+            "response_text": json.dumps({"reasoning": "r", "action": {"type": "dm", "to": ["P01", "P02"], "message": "宛先がlist形式でもP01を含む"}}, ensure_ascii=False),
+            "reasoning": "r", "reasoning_tokens": 0,
+        }
+        with (logs / "game01_P01_llm_calls.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps(extra_p01, ensure_ascii=False) + "\n")
+        with (logs / "game01_P02_llm_calls.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps(extra_p02, ensure_ascii=False) + "\n")
+        with (logs / "game01_P03_llm_calls.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps(extra_p03, ensure_ascii=False) + "\n")
+
+        detail = get_player_round_detail(logs_dir, "trial_multi", "game01", "P01", 2, view="god")
+        messages = detail["secret_events"]["messages"]
+        assert any(m.get("message") == "宛先欠落だが送信者はP01" for m in messages)
+        assert not any(m.get("message") == "宛先欠落かつ送信者もP01でない" for m in messages)
+        assert any(m.get("message") == "宛先がlist形式でもP01を含む" for m in messages)
+
+    def test_public_view_has_no_secret_events_key(self, tmp_path):
+        logs_dir = self._make_multi_player_trial(tmp_path)
+        detail = get_player_round_detail(logs_dir, "trial_multi", "game01", "P01", 2, view="public")
+        assert "secret_events" not in detail
+
     def test_public_rounds_and_timeline_do_not_leak_dm_or_terms(self, tmp_path):
         logs_dir = self._make_trial(tmp_path)
         public = get_round_states(logs_dir, "trial_memory", "game01")
@@ -328,6 +475,18 @@ class TestPlayerRoundDetail:
         for selector in (".visibility-public", ".visibility-secret", ".god-banner"):
             assert selector in css
 
+    def test_final_reflection_rendered_from_result_payload(self):
+        """renderRoundDetail()がresult.final_reflectionを参照すること。
+
+        バックエンドの返り値にtop-level final_reflectionは存在しない
+        (result配下のみ)。誤ってdetail.final_reflectionを参照すると
+        FINAL_REFLECTIONセクションが常にundefinedとなり描画されない。
+        """
+        html = INDEX_HTML_PATH.read_text(encoding="utf-8")
+        assert "const fr = result.final_reflection;" in html
+        # detail.final_reflection_round(正当)への誤ヒットを避けるため完全一致の旧バグ行のみ否定する
+        assert "const fr = detail.final_reflection;" not in html
+
     def test_invalid_round_rejected(self, tmp_path):
         logs_dir = self._make_trial(tmp_path)
         with pytest.raises(ValueError):
@@ -338,6 +497,372 @@ class TestPlayerRoundDetail:
         assert 'id="detail-tab-round"' in html
         assert 'id="detail-tab-raw"' in html
         assert "renderRawTimeline" in html
+
+
+class TestNegotiationDeliveryJoin:
+    """D5: LLMログ（本文）とEngineイベント（成否）のjoinによるdelivery判定。
+
+    Plan: /home/uso8m/.claude/plans/linked-stirring-catmull.md §6
+    delivery は "delivered" / "rejected" / "unverified" の3値。
+    「不明(unverified)」を「不成立(rejected)」と混同しないことが最重要の不変条件
+    （それが元バグ = 脱落済みP09宛DMの誤表示 と同種の誤情報になるため）。
+    """
+
+    def _make_delivery_trial(self, tmp_path: Path) -> Path:
+        """P01/P02/P03の3人、R5で delivered/rejected/unverified の3ケースを含むfixture。
+
+        - P01 turn1 dm→P02: NEGOTIATION_ACTION success=True → delivered
+        - P01 turn2 dm→P09(脱落者を模擬): NEGOTIATION_ACTION success=False → rejected
+        - P01 turn3 dm→P03: 対応するNEGOTIATION_ACTIONが無い → unverified
+        - P02 turn1 broadcast: success=True → delivered
+        - P02 turn2 anonymous_broadcast: success=False → rejected
+        """
+        trial = tmp_path / "trial_delivery"
+        logs = trial / "llm_logs"
+        logs.mkdir(parents=True)
+
+        def _entry(pid: str, round_num: int, turn: int, action: dict) -> dict:
+            return {
+                "player_id": pid, "model_id": "test-model", "phase": "negotiation",
+                "round_num": round_num, "turn": turn,
+                "response_text": json.dumps({"reasoning": "r", "action": action}, ensure_ascii=False),
+                "reasoning": "r", "reasoning_tokens": 0,
+            }
+
+        p01_entries = [
+            _entry("P01", 5, 1, {"type": "dm", "to": "P02", "message": "配信成功DM"}),
+            _entry("P01", 5, 2, {"type": "dm", "to": "P09", "message": "脱落者宛て不成立DM"}),
+            _entry("P01", 5, 3, {"type": "dm", "to": "P03", "message": "対応イベント無し未検証DM"}),
+        ]
+        p02_entries = [
+            _entry("P02", 5, 1, {"type": "broadcast", "message": "公開成功発言"}),
+            _entry("P02", 5, 2, {"type": "anonymous_broadcast", "message": "匿名不成立発言"}),
+        ]
+        (logs / "game01_P01_llm_calls.jsonl").write_text(
+            "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in p01_entries), encoding="utf-8",
+        )
+        (logs / "game01_P02_llm_calls.jsonl").write_text(
+            "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in p02_entries), encoding="utf-8",
+        )
+        events = [
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "data": {"player_id": "P01"}},
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "data": {"player_id": "P02"}},
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "data": {"player_id": "P03"}},
+            {"event_type": "NEGOTIATION_ACTION", "round_num": 5,
+             "data": {"action": "dm", "player_id": "P01", "turn": 1, "success": True}},
+            {"event_type": "NEGOTIATION_ACTION", "round_num": 5,
+             "data": {"action": "dm", "player_id": "P01", "turn": 2, "success": False,
+                       "reason": "Target P09 is not alive"}},
+            # turn3 (P01→P03) は意図的にイベント無し → unverified を検証
+            {"event_type": "NEGOTIATION_ACTION", "round_num": 5,
+             "data": {"action": "broadcast", "player_id": "P02", "turn": 1, "success": True}},
+            {"event_type": "NEGOTIATION_ACTION", "round_num": 5,
+             "data": {"action": "anonymous_broadcast", "player_id": "P02", "turn": 2, "success": False,
+                       "reason": "内容が長すぎます"}},
+        ]
+        (trial / "game01_events.jsonl").write_text(
+            "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in events), encoding="utf-8",
+        )
+        (trial / "game01_seat_map.json").write_text(
+            '{"P01":"L1","P02":"L2","P03":"L3"}', encoding="utf-8",
+        )
+        return tmp_path
+
+    # --- 純関数の単体テスト ---
+
+    def test_index_negotiation_outcomes_keys_on_pid_round_turn(self):
+        events = [
+            {"event_type": "NEGOTIATION_ACTION", "round_num": 5,
+             "data": {"action": "dm", "player_id": "P01", "turn": 1, "success": True}},
+            {"event_type": "MARKET_OPEN", "round_num": 5, "data": {}},
+        ]
+        index = _index_negotiation_outcomes(events)
+        assert index == {("P01", 5, 1): [{"action": "dm", "player_id": "P01", "turn": 1, "success": True}]}
+
+    def test_index_negotiation_outcomes_skips_entries_missing_turn(self):
+        """turn無し（旧ログ）はキー化できないため索引から除外される。"""
+        events = [
+            {"event_type": "NEGOTIATION_ACTION", "round_num": 5,
+             "data": {"action": "dm", "player_id": "P01"}},
+        ]
+        index = _index_negotiation_outcomes(events)
+        assert index == {}
+
+    def test_match_delivery_returns_delivered_for_success_true(self):
+        index = {("P01", 5, 1): [{"action": "dm", "success": True}]}
+        delivery, reason = _match_delivery(index, "P01", 5, 1, "dm")
+        assert delivery == "delivered"
+        assert reason is None
+
+    def test_match_delivery_returns_rejected_with_reason_for_success_false(self):
+        index = {("P01", 5, 2): [{"action": "dm", "success": False, "reason": "Target P09 is not alive"}]}
+        delivery, reason = _match_delivery(index, "P01", 5, 2, "dm")
+        assert delivery == "rejected"
+        assert reason == "Target P09 is not alive"
+
+    def test_match_delivery_returns_unverified_when_turn_missing(self):
+        index = {("P01", 5, 1): [{"action": "dm", "success": True}]}
+        delivery, reason = _match_delivery(index, "P01", 5, None, "dm")
+        assert delivery == "unverified"
+        assert reason is None
+
+    def test_match_delivery_returns_unverified_when_no_candidates(self):
+        index: dict = {}
+        delivery, reason = _match_delivery(index, "P01", 5, 3, "dm")
+        assert delivery == "unverified"
+        assert reason is None
+
+    def test_match_delivery_returns_unverified_when_action_type_mismatch(self):
+        index = {("P01", 5, 1): [{"action": "contract_propose", "success": True}]}
+        delivery, reason = _match_delivery(index, "P01", 5, 1, "dm")
+        assert delivery == "unverified"
+        assert reason is None
+
+    # --- _collect_round_messages: 後方互換 + join動作 ---
+
+    def test_collect_round_messages_without_events_omits_delivery(self, tmp_path):
+        logs_dir = self._make_delivery_trial(tmp_path)
+        by_round = _collect_round_messages(logs_dir / "trial_delivery", "game01")
+        for msg in by_round["5"]:
+            assert "delivery" not in msg
+
+    def test_collect_round_messages_with_events_attaches_delivery(self, tmp_path):
+        logs_dir = self._make_delivery_trial(tmp_path)
+        events = json.loads(
+            "[" + ",".join(
+                (logs_dir / "trial_delivery" / "game01_events.jsonl").read_text(encoding="utf-8").splitlines()
+            ) + "]"
+        )
+        by_round = _collect_round_messages(logs_dir / "trial_delivery", "game01", events=events)
+        by_message = {m["message"]: m for m in by_round["5"]}
+        assert by_message["配信成功DM"]["delivery"] == "delivered"
+        assert by_message["脱落者宛て不成立DM"]["delivery"] == "rejected"
+        assert by_message["脱落者宛て不成立DM"]["reject_reason"] == "Target P09 is not alive"
+        assert by_message["対応イベント無し未検証DM"]["delivery"] == "unverified"
+        assert "reject_reason" not in by_message["対応イベント無し未検証DM"]
+
+    # --- get_round_states 経由の end-to-end join (god view) ---
+
+    def test_god_view_marks_delivered_dm(self, tmp_path):
+        logs_dir = self._make_delivery_trial(tmp_path)
+        data = get_round_states(logs_dir, "trial_delivery", "game01", view="god")
+        msgs = data["rounds"]["5"]["messages"]
+        m = next(m for m in msgs if m.get("message") == "配信成功DM")
+        assert m["delivery"] == "delivered"
+        assert "reject_reason" not in m
+
+    def test_god_view_marks_rejected_dm_with_reason(self, tmp_path):
+        logs_dir = self._make_delivery_trial(tmp_path)
+        data = get_round_states(logs_dir, "trial_delivery", "game01", view="god")
+        msgs = data["rounds"]["5"]["messages"]
+        m = next(m for m in msgs if m.get("message") == "脱落者宛て不成立DM")
+        assert m["delivery"] == "rejected"
+        assert m["reject_reason"] == "Target P09 is not alive"
+
+    def test_god_view_marks_unverified_dm_when_unmatched(self, tmp_path):
+        logs_dir = self._make_delivery_trial(tmp_path)
+        data = get_round_states(logs_dir, "trial_delivery", "game01", view="god")
+        msgs = data["rounds"]["5"]["messages"]
+        m = next(m for m in msgs if m.get("message") == "対応イベント無し未検証DM")
+        assert m["delivery"] == "unverified"
+        assert "reject_reason" not in m
+
+    def test_god_view_marks_delivered_broadcast(self, tmp_path):
+        logs_dir = self._make_delivery_trial(tmp_path)
+        data = get_round_states(logs_dir, "trial_delivery", "game01", view="god")
+        msgs = data["rounds"]["5"]["messages"]
+        m = next(m for m in msgs if m.get("message") == "公開成功発言")
+        assert m["delivery"] == "delivered"
+
+    def test_god_view_marks_rejected_anonymous_broadcast(self, tmp_path):
+        logs_dir = self._make_delivery_trial(tmp_path)
+        data = get_round_states(logs_dir, "trial_delivery", "game01", view="god")
+        msgs = data["rounds"]["5"]["messages"]
+        m = next(m for m in msgs if m.get("message") == "匿名不成立発言")
+        assert m["delivery"] == "rejected"
+        assert m["reject_reason"] == "内容が長すぎます"
+
+    # --- public view: reject_reason（宛先PIDを含みうる）が漏れないこと ---
+
+    def test_public_view_dm_has_no_delivery_or_reason_fields(self, tmp_path):
+        logs_dir = self._make_delivery_trial(tmp_path)
+        data = get_round_states(logs_dir, "trial_delivery", "game01", view="public")
+        msgs = data["rounds"]["5"]["messages"]
+        dm_msgs = [m for m in msgs if m.get("type") == "dm"]
+        assert dm_msgs, "public dm entries should still be present as opaque placeholders"
+        for m in dm_msgs:
+            assert "delivery" not in m
+            assert "reject_reason" not in m
+
+    def test_public_view_never_leaks_dead_target_pid_via_reject_reason(self, tmp_path):
+        logs_dir = self._make_delivery_trial(tmp_path)
+        data = get_round_states(logs_dir, "trial_delivery", "game01", view="public")
+        serialized = json.dumps(data, ensure_ascii=False)
+        assert "P09" not in serialized
+        assert "Target P09 is not alive" not in serialized
+
+    def test_public_view_broadcast_delivery_also_hidden(self, tmp_path):
+        """delivery/reject_reasonはgod専用。broadcastのように非秘匿な種別でも同様に隠す
+        （視点間で挙動を統一し、実装/テストの単純さを優先する設計判断）。"""
+        logs_dir = self._make_delivery_trial(tmp_path)
+        data = get_round_states(logs_dir, "trial_delivery", "game01", view="public")
+        msgs = data["rounds"]["5"]["messages"]
+        m = next(m for m in msgs if m.get("message") == "公開成功発言")
+        assert "delivery" not in m
+
+    # --- get_player_round_detail の round_totals 拡張 ---
+
+    def test_round_totals_reports_messages_rejected_for_owner(self, tmp_path):
+        logs_dir = self._make_delivery_trial(tmp_path)
+        detail = get_player_round_detail(logs_dir, "trial_delivery", "game01", "P01", 5, view="god")
+        totals = detail["secret_events"]["round_totals"]
+        assert totals["messages_rejected"] == 1
+        assert totals["messages_rejected_shown"] == 1
+
+    def test_round_totals_rejected_shown_excludes_unrelated_player(self, tmp_path):
+        """P01→P09の不成立DMはP03には無関係。round内の不成立総数は見えるが
+        本人絡みの不成立(messages_rejected_shown)は0であること。"""
+        logs_dir = self._make_delivery_trial(tmp_path)
+        detail = get_player_round_detail(logs_dir, "trial_delivery", "game01", "P03", 5, view="god")
+        totals = detail["secret_events"]["round_totals"]
+        assert totals["messages_rejected"] == 1
+        assert totals["messages_rejected_shown"] == 0
+
+    # --- 後方互換: turn無しの旧ログ/旧イベントでは delivery を一切付与しない ---
+
+    def test_legacy_events_without_turn_omit_delivery_entirely(self, tmp_path):
+        """NEGOTIATION_ACTIONにturnを含まない旧形式のeventsでは、
+        joinできる情報が無いため delivery フィールド自体を付与しない
+        （'unverified'を機械的に埋めて誤情報化しないための後方互換モード）。"""
+        trial = tmp_path / "trial_legacy"
+        logs = trial / "llm_logs"
+        logs.mkdir(parents=True)
+        entry = {
+            "player_id": "P01", "model_id": "test-model", "phase": "negotiation",
+            "round_num": 5, "turn": 1,
+            "response_text": json.dumps(
+                {"reasoning": "r", "action": {"type": "dm", "to": "P02", "message": "旧形式ログのDM"}},
+                ensure_ascii=False,
+            ),
+            "reasoning": "r", "reasoning_tokens": 0,
+        }
+        (logs / "game01_P01_llm_calls.jsonl").write_text(
+            json.dumps(entry, ensure_ascii=False) + "\n", encoding="utf-8",
+        )
+        # turn無しの旧形式NEGOTIATION_ACTION
+        events = [
+            {"event_type": "NEGOTIATION_ACTION", "round_num": 5,
+             "data": {"action": "dm", "player_id": "P01"}},
+        ]
+        (trial / "game01_events.jsonl").write_text(
+            "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in events), encoding="utf-8",
+        )
+        (trial / "game01_seat_map.json").write_text('{"P01":"L1"}', encoding="utf-8")
+
+        data = get_round_states(tmp_path, "trial_legacy", "game01", view="god")
+        msgs = data["rounds"]["5"]["messages"]
+        m = next(m for m in msgs if m.get("message") == "旧形式ログのDM")
+        assert "delivery" not in m
+        assert "reject_reason" not in m
+
+
+class TestGodViewSessionAuth:
+    """
+    God View認証の上位化・使い回し（sessionStorage方式、静的ファイルのみの変更）の
+    静的文字列ベース回帰テスト。Viewer全体で1回だけGod認証し、モーダルの開閉や
+    試合切替を跨いで使い回せることを、JSテストランナー無しの本リポジトリの既存方式
+    （index.html/style.cssの文字列検査）で担保する。
+    Plan: /home/uso8m/.claude/plans/linked-stirring-catmull.md §8.1
+    """
+
+    @staticmethod
+    def _html():
+        base = Path(__file__).resolve().parent.parent / "viewer" / "static"
+        return (base / "index.html").read_text(encoding="utf-8")
+
+    @staticmethod
+    def _css():
+        base = Path(__file__).resolve().parent.parent / "viewer" / "static"
+        return (base / "style.css").read_text(encoding="utf-8")
+
+    def test_god_ui_lives_outside_modal_overlay(self):
+        # T1: God UI（#god-toggle）が #modal-overlay より前（＝ヘッダー側）にあること
+        html = self._html()
+        toggle_pos = html.index('id="god-toggle"')
+        modal_pos = html.index('id="modal-overlay"')
+        assert toggle_pos < modal_pos
+
+    def test_view_button_wording(self):
+        # T2: ヘッダー常設トグルの文言
+        html = self._html()
+        assert "VIEW: PUBLIC" in html
+        assert "VIEW: GOD" in html
+
+    def test_existing_markers_preserved(self):
+        # T3: 既存テスト（test_god_view_ui_has_accessible_visibility_markers）が
+        # 依存する文字列が本改修後も維持されていること（回帰の二重担保）
+        html = self._html()
+        css = self._css()
+        for marker in ("🔒 神視点 ON", "🌐 公開", "🎭 匿名発言", "📜 🔒 秘匿契約", "X-Viewer-God-Token"):
+            assert marker in html
+        for selector in (".visibility-public", ".visibility-secret", ".god-banner"):
+            assert selector in css
+
+    def test_god_token_uses_session_storage_not_local_storage(self):
+        # T4: God tokenの保存にsessionStorageを使い、localStorageは使わない
+        # （localStorageはテーマ保存専用のまま）
+        html = self._html()
+        assert "sessionStorage" in html
+        assert "GOD_TOKEN_KEY" in html
+        # localStorageの"実コード"使用箇所（コメント除く）はテーマ関連のみであること
+        for line in html.splitlines():
+            stripped = line.strip()
+            if "localStorage" in line and not stripped.startswith("//"):
+                assert "viewer-theme" in line, f"unexpected localStorage usage: {line!r}"
+
+    def test_god_token_never_placed_in_url(self):
+        # T5: God tokenをURL/query stringに載せていない（header経由のみ）
+        html = self._html()
+        assert "X-Viewer-God-Token" in html
+        assert "godToken}`" not in html
+        assert "token=${godToken}" not in html
+        assert "?god=" not in html
+        assert "&god=" not in html
+
+    def test_forbidden_403_downgrade_is_centralized_in_viewerfetch(self):
+        # T6: 403の一元downgradeが viewerFetch() 内に存在すること
+        html = self._html()
+        fetch_start = html.index("function viewerFetch")
+        fetch_block = html[fetch_start:fetch_start + 800]
+        assert "res.status === 403" in fetch_block
+
+    def test_closing_modal_does_not_discard_god_state(self):
+        # T7: closePlayerDetail() がGod状態を破棄しない（モーダル閉で再入力不要にする回帰）
+        html = self._html()
+        fn_start = html.index("function closePlayerDetail")
+        fn_end = html.index("\n}", fn_start)
+        fn_body = html[fn_start:fn_end]
+        assert "godMode = false" not in fn_body
+        assert "godToken = ''" not in fn_body
+
+    def test_explicit_logout_clears_session_storage(self):
+        # T8: 明示ログアウト経路が sessionStorage を削除すること
+        html = self._html()
+        assert "clearGodToken" in html
+        assert "removeItem" in html
+
+    def test_reload_restoration_reuses_situation_endpoint_as_validator(self):
+        # 追加検証: リロード復元が専用の確認APIを新設せず、
+        # 既存の /rounds エンドポイント（loadSituation）を検証に流用していること
+        html = self._html()
+        assert "loadStoredGodToken" in html
+        assert "storeGodToken" in html
+
+    def test_style_css_retains_visibility_and_banner_selectors(self):
+        # T10
+        css = self._css()
+        for selector in (".god-banner", ".visibility-public", ".visibility-secret"):
+            assert selector in css
 
 
 class TestCarryoverDisplay:
@@ -1267,6 +1792,200 @@ class TestFinalReflectionViewer:
         存在すること（frontend側にテスト基盤が無いため文字列検査で担保する）"""
         html = INDEX_HTML_PATH.read_text(encoding="utf-8")
         assert "final_reflection" in html
-        assert "🔒 脱落時コメント（神視点）" in html
+        # variant対応（completion/elimination）で見出しはテンプレート化された。
+        # 🔒ラベル自体とラベル切替ロジック、両方のラベル文言が存在することを確認する。
+        assert "🔒 ${heading}（神視点）" in html
+        assert "'完走コメント'" in html
+        assert "'脱落時コメント'" in html
         assert "escapeHtml(fr.comment" in html or "escapeHtml(fr.comment || '')" in html
         assert "escapeHtml(fr.defeat_cause)" in html
+
+
+class TestPostGameReflectionViewer:
+    """POST_GAME_REFLECTION（ゲーム完全終了後の全員答え合わせ）が、
+    今サイクルではViewer UIへ一切表示されないこと（T-C）を確認する回帰テスト。
+
+    本フェイズは`rules/project.md`の許可リストで神視点情報の投入が許される
+    唯一のフェイズだが、Viewer側の表示対応は本サイクルのスコープ外
+    （`public_last_word`等の新UIは未実装）。`viewer/log_parser.py`は
+    POST_GAME_REFLECTIONイベントを一切解釈しない設計になっている
+    （if/elifチェーンに分岐が無く、既知の未対応event_typeとして
+    黙って読み飛ばされる）ため、god/public いずれの経路にも
+    `post_game_reflections`相当のキーやその中身が一切漏れないことを確認する。
+
+    `TestPlayerRoundDetail._make_trial`や`TestEliminationDeduplication`の
+    fixtureは既存の秘匿情報リーク検知assertに使われているため拡張せず、
+    `TestFinalReflectionViewer`と同じ「独立fixture・手書きevents」パターンで
+    新設する。
+    """
+
+    def _write_llm_logs(self, trial: Path, game_id: str, players: list[str]) -> None:
+        logs = trial / "llm_logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        for pid in players:
+            entry = {
+                "player_id": pid, "model_id": "test-model", "phase": "negotiation",
+                "round_num": 1, "turn": 1, "response_text": "{}", "cost_usd": 0.001,
+            }
+            (logs / f"{game_id}_{pid}_llm_calls.jsonl").write_text(
+                json.dumps(entry, ensure_ascii=False) + "\n", encoding="utf-8",
+            )
+
+    def _write_events(self, trial: Path, game_id: str, events: list[dict]) -> None:
+        (trial / f"{game_id}_events.jsonl").write_text(
+            "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in events), encoding="utf-8",
+        )
+
+    def _pg_event(self, round_num: int, **overrides) -> dict:
+        """POST_GAME_REFLECTIONイベント。データには秘匿情報（DM本文・匿名通信の
+        真の掲載者・非当事者向け契約条項）を含む特徴的な文字列を仕込む。"""
+        data = {
+            "player_id": "P02", "round": round_num, "survived": True,
+            "elimination_reason": None, "elimination_round": None,
+            "final_cash": 4_000_000, "final_rank": 1, "model_id": "test-model",
+            "status": "ok", "emotion": "楽", "key_insight": None,
+            "self_assessment": "堅実に立ち回れた。",
+            "biggest_revelation": (
+                "PG_SECRET_MARKER: P01との秘密のDM本文で type_b_market を独占する約束をしたが、"
+                "実は匿名通信の真の掲載者はP03だった。"
+            ),
+            "best_player": "P03", "most_deceptive_player": "P01",
+            "changed_opinion": "P01を信頼しすぎていた。",
+            "comment": "PG_SECRET_MARKER: ゲーム全体を振り返ると、非当事者だった秘密契約C_SECRETの存在が最大の驚きだった。",
+            "comment_chars": 60, "truncated": False, "salvaged": [],
+        }
+        data.update(overrides)
+        return {
+            "event_type": "POST_GAME_REFLECTION", "round_num": round_num, "phase": "post_game",
+            "step": None, "data": data,
+        }
+
+    def _base_events(self) -> list[dict]:
+        return [
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P01"}},
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P02"}},
+            {"event_type": "GAME_END", "round_num": 12, "phase": "finalize", "data": {
+                "survivors": [{"player_id": "P01", "cash": 3_000_000}, {"player_id": "P02", "cash": 4_000_000}],
+                "eliminated": [],
+            }},
+        ]
+
+    def test_no_public_route_returns_post_game_content(self, tmp_path):
+        """公開view: state/rounds/timeline/round-detailのいずれのJSONにも
+        PG特徴文字列・`post_game_reflections`キーが一切現れないこと"""
+        trial = tmp_path / "trial_pg_public_gate"
+        self._write_llm_logs(trial, "game01", ["P01", "P02"])
+        events = self._base_events() + [self._pg_event(12)]
+        self._write_events(trial, "game01", events)
+
+        state = get_game_state(tmp_path, "trial_pg_public_gate", "game01")
+        rounds_public = get_round_states(tmp_path, "trial_pg_public_gate", "game01", view="public")
+        rounds_god = get_round_states(tmp_path, "trial_pg_public_gate", "game01", view="god")
+        timeline_public = get_player_timeline(tmp_path, "trial_pg_public_gate", "game01", "P02", view="public")
+        timeline_god = get_player_timeline(tmp_path, "trial_pg_public_gate", "game01", "P02", view="god")
+        detail_public = get_player_round_detail(tmp_path, "trial_pg_public_gate", "game01", "P02", 12, view="public")
+        detail_god = get_player_round_detail(tmp_path, "trial_pg_public_gate", "game01", "P02", 12, view="god")
+
+        for payload in (
+            state, rounds_public, rounds_god, timeline_public, timeline_god,
+            detail_public, detail_god,
+        ):
+            blob = json.dumps(payload, ensure_ascii=False)
+            assert "PG_SECRET_MARKER" not in blob
+            assert "post_game_reflections" not in blob
+            assert "post_game_reflection" not in blob
+
+    def test_variant_backward_compat_defaults_to_elimination(self, tmp_path):
+        """POST_GAME_REFLECTIONイベントが混在していても、既存のFINAL_REFLECTION
+        (variantキー無し=旧イベント)がelimination扱いのまま従来どおり描画されること"""
+        trial = tmp_path / "trial_pg_compat_elim"
+        self._write_llm_logs(trial, "game01", ["P01", "P02"])
+        fr_event = {
+            "event_type": "FINAL_REFLECTION", "round_num": 5, "phase": "final_reflection",
+            "step": None, "data": {
+                "player_id": "P02", "round": 5, "elimination_reason": "bankruptcy",
+                "elimination_phase": "commit", "elimination_event": "BANKRUPTCY",
+                "model_id": "test-model", "status": "ok", "emotion": "哀",
+                "defeat_cause": "借入額が過大だった", "comment": "私は数字を読み間違えた。",
+                "comment_chars": 13, "truncated": False, "salvaged": [],
+            },
+        }
+        events = self._base_events() + [
+            {"event_type": "BANKRUPTCY", "round_num": 5, "phase": "commit",
+             "data": {"player_id": "P02", "reason": "Cannot pay entry fee"}},
+            fr_event,
+            self._pg_event(12),
+        ]
+        self._write_events(trial, "game01", events)
+
+        detail = get_player_round_detail(tmp_path, "trial_pg_compat_elim", "game01", "P02", 5, view="god")
+        fr = detail["result"]["final_reflection"]
+        assert fr is not None
+        # 旧イベント形状（variantキー無し）はlog_parser側の既定値補完により
+        # "elimination"として描画される（新規の秘匿情報開示ではない。
+        # 脱落有無自体はrd["eliminated"]/SURVIVAL_CHECK経由で既に公開情報）。
+        assert fr.get("variant") == "elimination"
+        assert fr["defeat_cause"] == "借入額が過大だった"
+
+    def test_completion_variant_renders_as_kansou(self, tmp_path):
+        """variant='completion'のFINAL_REFLECTIONが完走コメントとして描画され、
+        併存するPOST_GAME_REFLECTIONの内容とは混同されないこと"""
+        trial = tmp_path / "trial_pg_completion"
+        self._write_llm_logs(trial, "game01", ["P01", "P02"])
+        fr_event = {
+            "event_type": "FINAL_REFLECTION", "round_num": 12, "phase": "final_reflection",
+            "step": None, "data": {
+                "player_id": "P02", "round": 12, "variant": "completion",
+                "elimination_reason": None, "elimination_phase": None, "elimination_event": None,
+                "model_id": "test-model", "status": "ok", "emotion": "楽",
+                "defeat_cause": "慎重な立ち回り", "comment": "生き残れて良かった。",
+                "comment_chars": 9, "truncated": False, "salvaged": [],
+            },
+        }
+        events = self._base_events() + [fr_event, self._pg_event(12)]
+        self._write_events(trial, "game01", events)
+
+        detail = get_player_round_detail(tmp_path, "trial_pg_completion", "game01", "P02", 12, view="god")
+        fr = detail["result"]["final_reflection"]
+        assert fr is not None
+        assert fr["variant"] == "completion"
+        assert fr["comment"] == "生き残れて良かった。"
+        # POST_GAME_REFLECTIONの秘匿マーカーはfinal_reflection側へ混入しない
+        assert "PG_SECRET_MARKER" not in json.dumps(fr, ensure_ascii=False)
+
+    def test_existing_final_reflection_public_shape_unchanged(self, tmp_path):
+        """POST_GAME_REFLECTIONイベントの併存によって、既存のFINAL_REFLECTION
+        public view schema（キー構成）が変化しないこと"""
+        trial = tmp_path / "trial_pg_shape"
+        self._write_llm_logs(trial, "game01", ["P01", "P02"])
+        fr_event = {
+            "event_type": "FINAL_REFLECTION", "round_num": 5, "phase": "final_reflection",
+            "step": None, "data": {
+                "player_id": "P02", "round": 5, "elimination_reason": "bankruptcy",
+                "elimination_phase": "commit", "elimination_event": "BANKRUPTCY",
+                "model_id": "test-model", "status": "ok", "emotion": "哀",
+                "defeat_cause": "借入額が過大だった", "comment": "私は数字を読み間違えた。",
+                "comment_chars": 13, "truncated": False, "salvaged": [],
+            },
+        }
+        events_without_pg = self._base_events() + [
+            {"event_type": "BANKRUPTCY", "round_num": 5, "phase": "commit",
+             "data": {"player_id": "P02", "reason": "Cannot pay entry fee"}},
+            fr_event,
+        ]
+        events_with_pg = events_without_pg + [self._pg_event(12)]
+
+        trial_a = tmp_path / "trial_pg_shape_a"
+        trial_b = tmp_path / "trial_pg_shape_b"
+        self._write_llm_logs(trial_a, "game01", ["P01", "P02"])
+        self._write_llm_logs(trial_b, "game01", ["P01", "P02"])
+        self._write_events(trial_a, "game01", events_without_pg)
+        self._write_events(trial_b, "game01", events_with_pg)
+
+        detail_a = get_player_round_detail(tmp_path, "trial_pg_shape_a", "game01", "P02", 5, view="public")
+        detail_b = get_player_round_detail(tmp_path, "trial_pg_shape_b", "game01", "P02", 5, view="public")
+
+        fr_a = detail_a["result"]["final_reflection"]
+        fr_b = detail_b["result"]["final_reflection"]
+        assert set(fr_a.keys()) == set(fr_b.keys())
+        assert fr_a == fr_b

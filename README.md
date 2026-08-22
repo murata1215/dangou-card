@@ -201,10 +201,14 @@ unit 定義: `~/.config/systemd/user/dangou-viewer.service`（`ExecStart` は `.
 
 公開Viewerの再起動・障害切り分けは[Viewer運用マニュアル](doc/viewer_operations.md)を参照。開発用の起動方法は`viewer/README.md`を参照。
 
-通常のViewer APIはDM本文・宛先、匿名発言者、契約条項を非公開にする。運用者向けの神視点は、詳細モーダルの「神視点を有効化」で別管理の`VIEWER_GOD_TOKEN`を入力した場合だけ利用できる。tokenの保管・反映・確認手順も[Viewer運用マニュアル](doc/viewer_operations.md)を正とする。
+通常のViewer APIはDM本文・宛先、匿名発言者、契約条項を非公開にする。運用者向けの神視点は、ヘッダーの`VIEW: PUBLIC 🔒`/`VIEW: GOD 🔓`切替で別管理の`VIEWER_GOD_TOKEN`を入力した場合だけ利用できる。一度有効化すればタブ内では以後の全プレイヤー詳細で再入力不要（tokenはタブ限定のsessionStorageに保持し、タブを閉じると失効）。tokenの保管・反映・確認手順も[Viewer運用マニュアル](doc/viewer_operations.md)を正とする。
 
 脱落者のラウンド詳細には「脱落時コメント」セクション（FINAL_REFLECTION）を表示する。通常表示では感情のみ、
 神視点では敗因・最後の言葉の本文まで見られる（自由記述が§8.2秘匿情報を含み得るため）。
+
+神視点のDM・公開発言には、LLMログとEngineイベントの突合結果として`✅ 成立`/`❌ 不成立`/`❔ 未検証`の
+delivery badgeを表示する。脱落済みプレイヤー宛のDM等、engineに拒否されたアクション（行動枠は消費済み）が
+通常メッセージと見分けがつかない形で表示されないようにするための表示（`rules/project.md`該当節）。
 
 ## プロジェクト構成
 

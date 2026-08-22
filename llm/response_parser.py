@@ -155,6 +155,11 @@ _FENCE_CLOSED_RE = re.compile(r'^\s*```(?:json)?\s*\n?(.*?)\n?```\s*$', re.DOTAL
 _FENCE_OPEN_RE = re.compile(r'^\s*```(?:json)?\s*\n?(.*)$', re.DOTALL)
 _MEMORY_KEY_RE = re.compile(r'"memory"\s*:\s*"')
 _COMMENT_KEY_RE = re.compile(r'"comment"\s*:\s*"')
+_SELF_ASSESSMENT_KEY_RE = re.compile(r'"self_assessment"\s*:\s*"')
+_BIGGEST_REVELATION_KEY_RE = re.compile(r'"biggest_revelation"\s*:\s*"')
+_CHANGED_OPINION_KEY_RE = re.compile(r'"changed_opinion"\s*:\s*"')
+_BEST_PLAYER_KEY_RE = re.compile(r'"best_player"\s*:\s*"')
+_MOST_DECEPTIVE_PLAYER_KEY_RE = re.compile(r'"most_deceptive_player"\s*:\s*"')
 
 
 def _strip_code_fence(text: str) -> str:
@@ -176,6 +181,11 @@ def _strip_code_fence(text: str) -> str:
 _FIELD_KEY_RES: dict[str, re.Pattern[str]] = {
     "memory": _MEMORY_KEY_RE,
     "comment": _COMMENT_KEY_RE,
+    "self_assessment": _SELF_ASSESSMENT_KEY_RE,
+    "biggest_revelation": _BIGGEST_REVELATION_KEY_RE,
+    "changed_opinion": _CHANGED_OPINION_KEY_RE,
+    "best_player": _BEST_PLAYER_KEY_RE,
+    "most_deceptive_player": _MOST_DECEPTIVE_PLAYER_KEY_RE,
 }
 
 
@@ -436,9 +446,16 @@ def normalize_emotion(strategy: dict[str, Any]) -> dict[str, Any]:
     return strategy
 
 
-def parse_final_reflection(text: str, max_chars: int = 2000) -> dict[str, Any]:
+def parse_final_reflection(
+    text: str, max_chars: int = 2000, cause_key: str = "defeat_cause"
+) -> dict[str, Any]:
     """
     脱落者の最終コメント（FINAL_REFLECTION）応答を解析する
+
+    cause_key: 敗因に相当するキー名（既定 "defeat_cause"）。completion variant
+    （R12完走者向け）では意味的に「敗因」が不適切なため "key_factor" 等を渡す。
+    返り値の辞書キーは常に "defeat_cause" のまま（呼出側/イベント/Viewerの
+    後方互換のため）。cause_key はJSONから読み取る/サルベージする元キー名のみを差し替える。
 
     extract_memory_with_status() と設計を意図的に変えている点:
     Memoryは「壊れた抽出結果で前ラウンドの正しいMemoryを上書きする」ことが
@@ -509,24 +526,24 @@ def parse_final_reflection(text: str, max_chars: int = 2000) -> dict[str, Any]:
         if not isinstance(comment, str):
             comment = data.get("final_comment")
         if isinstance(comment, str) and comment.strip():
-            return _finalize(comment, data.get("emotion"), data.get("defeat_cause"), "ok")
+            return _finalize(comment, data.get("emotion"), data.get(cause_key), "ok")
 
         # comment キーが無い/空 → 残りフィールドから最低限組み立てる
         fallback_parts = []
-        for key in ("defeat_cause", "final_word", "message"):
+        for key in (cause_key, "final_word", "message"):
             v = data.get(key)
             if isinstance(v, str) and v.strip():
                 fallback_parts.append(v.strip())
         if fallback_parts:
             return _finalize(
-                " / ".join(fallback_parts), data.get("emotion"), data.get("defeat_cause"),
+                " / ".join(fallback_parts), data.get("emotion"), data.get(cause_key),
                 "ok_assembled",
             )
         logger.warning(
             "final_reflection parse rejected: JSON parsed but no usable 'comment' "
             "(keys=%s)", sorted(data.keys()),
         )
-        return _finalize("", data.get("emotion"), data.get("defeat_cause"), "rejected_no_comment")
+        return _finalize("", data.get("emotion"), data.get(cause_key), "rejected_no_comment")
 
     stripped = _strip_code_fence(text)
     looks_like_wrapper = stripped.startswith("{") or bool(_COMMENT_KEY_RE.search(stripped))
@@ -537,7 +554,7 @@ def parse_final_reflection(text: str, max_chars: int = 2000) -> dict[str, Any]:
         if emotion_raw:
             salvaged.append("emotion")
 
-        cause_raw = _recover_string_field_bounded(stripped, "defeat_cause")
+        cause_raw = _recover_string_field_bounded(stripped, cause_key)
         if cause_raw:
             salvaged.append("defeat_cause")
 
@@ -579,8 +596,226 @@ def parse_final_reflection(text: str, max_chars: int = 2000) -> dict[str, Any]:
         return _finalize(degraded, emotion_raw, cause_raw, "ok_plaintext_wrapper", salvaged)
 
     # JSON/ラッパーの痕跡が無い、素の散文はそのまま採用する
-    # （自由記述の最終コメントとして、疑わしきは棄却より採用を優先）
+    # （自由記述の最終コメントとして、疑わしきは棄却より優先）
     return _finalize(stripped, None, None, "ok_plaintext")
+
+
+_PG_ROSTER_ID_RE = re.compile(r'^P\d{2}$')
+
+
+def _resolve_pg_player_ref(
+    raw: Any, roster: set[str] | None,
+) -> tuple[str | None, str | None, bool]:
+    """
+    POST_GAME_REFLECTIONのbest_player/most_deceptive_playerを非破壊的に検証する。
+
+    - 有効（正規表現 `^P\\d{2}$` に一致し、roster指定時はmembershipも一致）
+      → (正規化id, None, False)
+    - 空 / "なし" / "該当なし" → (None, None, False) — 名指しを断るのは正当な回答で
+      あってパース失敗ではないため、salvagedフラグは立てない
+    - それ以外で解決できない（幻覚のP13、モデル名、注釈付きテキスト等）
+      → (None, 元テキスト, True) — 呼出側がsalvagedへ"<field>_unresolved"を積む
+
+    自己言及は合法（自分を最善/最も欺瞞的と名指すのは正当な結果の一つ）なので
+    自己比較は一切行わない。roster is None の場合は正規表現チェックのみ
+    （ゲームインスタンス無しで単体テストできるようにするため）。
+    """
+    if not isinstance(raw, str):
+        return None, None, False
+    s = raw.strip()
+    if not s or s in ("なし", "該当なし"):
+        return None, None, False
+    candidate = s.upper()
+    if _PG_ROSTER_ID_RE.match(candidate) and (roster is None or candidate in roster):
+        return candidate, None, False
+    return None, s, True
+
+
+def parse_post_game_reflection(
+    text: str, roster: set[str] | None = None, max_chars: int = 1000,
+) -> dict[str, Any]:
+    """
+    ゲーム完全終了後、全player（脱落者＋生還者）向けの答え合わせ振り返り
+    （POST_GAME_REFLECTION）応答を解析する
+
+    parse_final_reflection() と同じ7段salvage ladderを流用し、判定は
+    comment単独で行う（FRと同一方針）。異なるのは自由記述の任意フィールドが
+    4つに増えることと、best_player/most_deceptive_player がroster照合を
+    要する点。
+
+    文字数上限: comment=max_chars（既定1000）、self_assessment=250、
+    biggest_revelation=300、changed_opinion=250。合計1,800字がPOST_GAME全体の
+    散文上限になる（FRの単一2,000字より低いのは、4フィールドが1つの
+    トークン予算を分け合うため）。
+
+    Args:
+        text: LLMのレスポンステキスト（空文字列なら status="empty"）
+        roster: 有効なplayer_idの集合。Noneなら正規表現チェックのみ行う
+        max_chars: comment の保存上限文字数
+
+    Returns:
+        {"status", "comment", "chars", "truncated", "emotion",
+         "self_assessment", "biggest_revelation", "changed_opinion",
+         "best_player", "best_player_raw",
+         "most_deceptive_player", "most_deceptive_player_raw", "salvaged"}
+        salvaged: 個別サルベージ/切り詰め/未解決roster参照で発生したマーカーのリスト
+                  （strict JSON成功時やgenuineな素の散文では空になり得る）
+    """
+    if not text:
+        return {
+            "status": "empty", "comment": "", "chars": 0, "truncated": False,
+            "emotion": None, "self_assessment": None, "biggest_revelation": None,
+            "changed_opinion": None, "best_player": None, "best_player_raw": None,
+            "most_deceptive_player": None, "most_deceptive_player_raw": None,
+            "salvaged": [],
+        }
+
+    def _cap_aux(value: Any, cap: int, field_name: str, salvaged: list[str]) -> str | None:
+        if not isinstance(value, str) or not value.strip():
+            return None
+        v = value.strip()
+        shrunk, trunc = _shrink_to_boundary(v, cap)
+        if trunc:
+            salvaged.append(f"{field_name}_truncated")
+        return shrunk
+
+    def _finalize(
+        comment: str, emotion: Any, self_assessment: Any, biggest_revelation: Any,
+        changed_opinion: Any, best_player_raw: Any, most_deceptive_player_raw: Any,
+        status: str, salvaged: list[str] | None = None,
+    ) -> dict[str, Any]:
+        salvaged = list(salvaged or [])
+        comment = (comment or "").strip()
+        saved, truncated = normalize_memory_with_truncation(comment, max_chars)
+        norm_emotion = normalize_emotion(
+            {"emotion": emotion if isinstance(emotion, str) else ""}
+        )["emotion"]
+
+        sa = _cap_aux(self_assessment, 250, "self_assessment", salvaged)
+        br = _cap_aux(biggest_revelation, 300, "biggest_revelation", salvaged)
+        co = _cap_aux(changed_opinion, 250, "changed_opinion", salvaged)
+
+        best_player, best_player_raw_out, best_invalid = _resolve_pg_player_ref(
+            best_player_raw, roster,
+        )
+        if best_invalid:
+            salvaged.append("best_player_unresolved")
+        most_deceptive, most_deceptive_raw_out, most_invalid = _resolve_pg_player_ref(
+            most_deceptive_player_raw, roster,
+        )
+        if most_invalid:
+            salvaged.append("most_deceptive_player_unresolved")
+
+        return {
+            "status": status, "comment": saved, "chars": len(saved), "truncated": truncated,
+            "emotion": norm_emotion,
+            "self_assessment": sa, "biggest_revelation": br, "changed_opinion": co,
+            "best_player": best_player, "best_player_raw": best_player_raw_out,
+            "most_deceptive_player": most_deceptive,
+            "most_deceptive_player_raw": most_deceptive_raw_out,
+            "salvaged": salvaged,
+        }
+
+    data = extract_json(text)
+    if isinstance(data, dict):
+        comment = data.get("comment")
+        if isinstance(comment, str) and comment.strip():
+            return _finalize(
+                comment, data.get("emotion"), data.get("self_assessment"),
+                data.get("biggest_revelation"), data.get("changed_opinion"),
+                data.get("best_player"), data.get("most_deceptive_player"), "ok",
+            )
+
+        # comment キーが無い/空 → 残りフィールドから最低限組み立てる
+        fallback_parts = []
+        for key in ("biggest_revelation", "self_assessment", "changed_opinion"):
+            v = data.get(key)
+            if isinstance(v, str) and v.strip():
+                fallback_parts.append(v.strip())
+        if fallback_parts:
+            return _finalize(
+                " / ".join(fallback_parts), data.get("emotion"), data.get("self_assessment"),
+                data.get("biggest_revelation"), data.get("changed_opinion"),
+                data.get("best_player"), data.get("most_deceptive_player"), "ok_assembled",
+            )
+        logger.warning(
+            "post_game_reflection parse rejected: JSON parsed but no usable 'comment' "
+            "(keys=%s)", sorted(data.keys()),
+        )
+        return _finalize(
+            "", data.get("emotion"), data.get("self_assessment"), data.get("biggest_revelation"),
+            data.get("changed_opinion"), data.get("best_player"), data.get("most_deceptive_player"),
+            "rejected_no_comment",
+        )
+
+    stripped = _strip_code_fence(text)
+    looks_like_wrapper = stripped.startswith("{") or bool(_COMMENT_KEY_RE.search(stripped))
+    if looks_like_wrapper:
+        salvaged: list[str] = []
+
+        def _bounded(key: str) -> str | None:
+            v = _recover_string_field_bounded(stripped, key)
+            if v:
+                salvaged.append(key)
+            return v
+
+        emotion_raw = _bounded("emotion")
+        self_assessment_raw = _bounded("self_assessment")
+        biggest_revelation_raw = _bounded("biggest_revelation")
+        changed_opinion_raw = _bounded("changed_opinion")
+        best_player_raw = _bounded("best_player")
+        most_deceptive_player_raw = _bounded("most_deceptive_player")
+
+        # comment: 境界サルベージを優先し、見つからなければ末尾切断に備えた
+        # 既存の貪欲マッチへフォールバックする（FRと同じ方針）
+        comment_raw = _recover_string_field_bounded(stripped, "comment")
+        if comment_raw:
+            salvaged.append("comment")
+        else:
+            comment_raw = _recover_string_field(stripped, "comment")
+            if comment_raw:
+                salvaged.append("comment")
+
+        if comment_raw:
+            logger.warning(
+                "post_game_reflection parse: strict JSON failed, salvaged fields=%s "
+                "(status=ok_recovered)", salvaged,
+            )
+            return _finalize(
+                comment_raw, emotion_raw, self_assessment_raw, biggest_revelation_raw,
+                changed_opinion_raw, best_player_raw, most_deceptive_player_raw,
+                "ok_recovered", salvaged,
+            )
+
+        if biggest_revelation_raw:
+            # commentが完全に失われた場合でも、biggest_revelationが取れていれば
+            # 「本人の答え合わせ反応」を完全な空にはしない（FRのdefeat_cause代用と同じ方針）
+            logger.warning(
+                "post_game_reflection parse: comment unrecoverable, using "
+                "biggest_revelation as comment fallback (salvaged=%s, status=ok_assembled)",
+                salvaged,
+            )
+            return _finalize(
+                biggest_revelation_raw, emotion_raw, self_assessment_raw, biggest_revelation_raw,
+                changed_opinion_raw, best_player_raw, most_deceptive_player_raw,
+                "ok_assembled", salvaged,
+            )
+
+        # 個別サルベージも尽きた＝ラッパーの痕跡はあるが復旧不能。
+        # 生のJSONラッパー文字列をそのままcommentへ流出させない（wrapper leak対策）。
+        logger.warning(
+            "post_game_reflection parse: unparsable JSON wrapper, degrading to "
+            "stripped text (status=ok_plaintext_wrapper)",
+        )
+        degraded = _degrade_wrapper_to_text(stripped)
+        return _finalize(
+            degraded, emotion_raw, self_assessment_raw, biggest_revelation_raw,
+            changed_opinion_raw, best_player_raw, most_deceptive_player_raw,
+            "ok_plaintext_wrapper", salvaged,
+        )
+
+    # JSON/ラッパーの痕跡が無い、素の散文はそのまま採用する
+    return _finalize(stripped, None, None, None, None, None, None, "ok_plaintext")
 
 
 def _convert_action(

@@ -1,5 +1,169 @@
 # Changelog
 
+## 2026-08-23: 脱落済みplayer宛DM問題の根本修正（Engine D1-D4 + Viewer D5）
+
+Viewer God ViewでP06@R9に脱落済みP09宛の秘密DMが多数、通常DMと見分けがつかない形で表示されていた
+問題を調査したところ、表示バグ1件（D5）に加えEngine側の根本原因4件（D1-D4）が判明したため、
+Planに基づき1サイクルでまとめて修正した。実データ確認では、P06はR7-R9で30枠中25枠を脱落済み
+P09宛の不成立DMに浪費しており、これがR9の破産に直結していた。
+
+- **D1（`engine/actions.py`）**: `ContractProposeAction`/`CardTradeProposeAction`の宛先生存
+  チェックが`DmAction`/`TransferAction`と非対称だった（前者は脱落者を宛先にしても資金チェックしか
+  通らず不成立にならないケースがあった）ため、両アクションへ生存チェックを追加して対称化した。
+  `CardTradeProposeAction`は宛先が1人でも生存していれば成立させる（既存の
+  `engine/game.py`側スキップに委ねる）。
+- **D2（`engine/game.py` + `llm/prompt_builder.py` + `llm/llm_agent.py`）**: 不成立アクションの
+  理由が従来イベントログにしか残らず、行動主体のLLM自身へフィードバックされていなかった。
+  `_action_failures`（ラウンド単位、直近12件）を新設し`_build_visible_state()`経由で
+  **本人にのみ**`my_failed_actions`/`my_action_budget`として公開、`build_negotiation_prompt`/
+  `build_reflection_prompt`へ配線した。`AUTO_PASS_ON_NO_NEWS`最適化は新規失敗発生時にバイパスする
+  よう修正（そうしないとフィードバックが積まれても気づく機会がないまま自動パスされうる）。
+  §2.5（不成立アクションも行動枠を消費する仕様）自体は変更していない。
+- **D3（`llm/prompt_builder.py`）**: 脱落は全体へ公示される、脱落者宛アクションは必ず不成立になる
+  旨をRULES_SUMMARYへ明記し、`eliminated_players`を`_build_visible_state()`へ追加して
+  `build_negotiation_prompt`/`build_reflection_prompt`へ配線した。
+- **D4（`engine/game.py` + `llm/prompt_builder.py`）**: `Contract.status`は脱落後も`ACTIVE`のまま
+  （§6.3により当該義務は自動失効するが状態機械自体は変更していない、既存仕様のまま）だが、
+  表示上「まだ有効な契約」に見えて混乱を招くため、`contracts_public`へ`eliminated_parties`
+  （派生表示キーのみ、Engine状態は無変更）を追加し、`build_reflection_prompt`の契約表示へ
+  「脱落済み→当該義務は失効済み・解除交渉は不要」の注記を付けた。
+- **D5（`viewer/log_parser.py` + `viewer/static/`）**: ViewerがLLMログ（本文）だけを見て
+  Engineイベント（成否）とjoinしていなかったため、不成立DMが「送れた」ように通常DMと同列表示
+  されていた。`_index_negotiation_outcomes()`/`_match_delivery()`（純関数、
+  `(player_id, round_num, turn)`で索引・突合）を新設し、`_collect_round_messages()`へ`events`
+  引数を追加して各メッセージへ`delivery`（`delivered`/`rejected`/`unverified`の3値）と
+  `reject_reason`（rejected時のみ、god view限定）を付与した。`reject_reason`は宛先PIDを
+  直接含みうるため（例: `"Target P09 is not alive"`）public viewには一切出さない。
+  `"unverified"`（未検証）を`"rejected"`（不成立）と混同表示しないことを最重要の不変条件とし、
+  `turn`を含まない旧形式ログ・イベントでは`delivery`フィールド自体を一切付与しない後方互換モードと
+  した（機械的に埋めると新たな誤情報源になるため）。UIは状況パネル・プレイヤー詳細モーダルの両方へ
+  delivery badge（✅成立/❌不成立/❔未検証）を表示するよう`index.html`/`style.css`を改修した。
+- **重複排除**: `get_round_states()`内でevents有無に応じて2箇所に重複していたメッセージ投影ロジックを
+  `_project_message(message, view)`へ統合した（純リファクタ、挙動不変を既存テストで確認）。
+- **テスト**: `tests/test_dead_target_and_feedback.py`新設48件（D1-D4の全カバレッジ、
+  `TestDmLoopScenario`で実際のバグシナリオをend-to-end再現）、`test_dm_secrecy.py`へ
+  `my_failed_actions`の非当事者漏洩なしテストを1件追加、`tests/test_viewer.py`へ
+  `TestNegotiationDeliveryJoin`20件（純関数単体・後方互換・god/public境界・round_totals拡張）を
+  追加。全体回帰1014/1014 PASS（既存945 + 新規69）。
+- **副産物**: RULES_SUMMARY文言追加によりシステムプロンプトのトークン数が変動し、
+  `test_model_matrix.py`/`test_phase2_schema.py`のハードコード済みworst-caseコスト
+  スナップショット2件（`0.0268`→`0.027485`、`0.014364`→`0.014568`、`0.023952`→`0.024224`）が
+  実測値からずれたため更新した。本コミットを跨ぐキャッシュ率・コスト実測値は単純比較できない
+  （意図的な一度きりの変更）。
+- **実測確認**: `trial_C_l12_r12_20260822`（読み取り専用、LLM API送信なし）でdelivery分布が
+  delivered:653/rejected:25/unverified:4となり、P06→P09のR7-R9全25件が`rejected`かつ理由
+  `"Target P09 is not alive"`で一致することを確認。Viewerを再起動しcurlでgod/public両viewを
+  実地確認、public viewでは`delivery`/`reject_reason`/`"P09"`のいずれも一切出現しないことを
+  機械確認した。
+
+## 2026-08-22: Viewerプレイヤー詳細「神視点の秘匿情報」player-scope化
+
+プレイヤー詳細モーダルの「🔒 神視点の秘匿情報」セクションに、当該プレイヤーが送受信していない
+DM・当事者でない契約が大量に混入していたバグを修正した。`get_player_round_detail()`の
+`secret_events`だけが同関数内の他フィールド（`calls`/`result`）と異なり`pid`フィルタを持たず、
+ラウンド全体の秘密DM・terms付き契約をそのまま返していたことが原因。実データ
+（12人R12版trial）で計測したところ、P11@R3の秘密DM51件中本人関与は9件のみ、P06@R9は44件中
+7件のみで、全12名平均でDM 78%・契約81%が無関係だった。
+
+- **修正**: `viewer/log_parser.py`の`get_player_round_detail()`に、DM用（`sender == pid` または
+  `to == pid`、`to`が`list`型の場合の互換処理込み）・契約用（`proposer == pid` または
+  `pid in parties`）の絞り込みを追加。返り値に`"scope": "player"`と`"round_totals"`
+  （隠れた件数のみ、本文は含めない）を新設し、god利用者が「まだ他にある」ことを把握できるように
+  した。`viewer/server.py`および公開表示（`_safe_round_result()`等）は無変更。
+- **付随修正**: `viewer/static/index.html`の`renderRoundDetail()`が`detail.final_reflection`
+  （存在しないtop-levelキー）を参照しており、正しくは`detail.result.final_reflection`だったため
+  FINAL_REFLECTIONセクションが一度も描画されていなかったバグも同時に修正。到達不能だった
+  匿名発言の秘匿描画分岐（`anonymous_broadcast`は常に`visibility:"public"`のため`secret_events`
+  へ絶対に入らない）も削除した。
+- **UX判断**: round全体の神視点情報を別セクションへ分離する代替案は、既存の状況パネル
+  （round全体のDM・契約・匿名実発信者をgodで表示済み）と重複するため見送った。
+- **テスト**: `tests/test_viewer.py`に多人数fixture`_make_multi_player_trial()`と回帰8件
+  （無関係DM除外・受信DM保持・送信DM保持・契約のparties/proposer両対応と視点対称性・
+  round_totals不変条件・`to`型ぶれ境界・public無影響・FINAL_REFLECTION参照経路の否定的固定）を
+  追加。全体回帰は945/945 PASS（既存937 + 新規8、失敗0）。
+- **実測確認**: 修正後の実データでP11@R3が51件→9件、P06@R9が44件→7件、P05/P08@R12の契約が
+  11件→0件になることを確認。ユーザー報告の具体的な無関係DM（P04→P05、P05→P04、P07→P04、
+  P04→P07、P02→P05、P07→P02、P09→P05、P01→P03、P02→P06）がすべて非表示になることを個別照合。
+- **反映**: `viewer/log_parser.py`がPythonモジュールのため`systemctl --user restart
+  dangou-viewer.service`で反映済み。稼働中サービスへcurlでP11/R3を実測し修正を確認済み
+  （`scope: "player"`, messages 9件, `round_totals.messages_hidden` 42）。
+- **未実施**: 手動ブラウザ確認、`_safe_round_result()`の契約フィルタ変更（公開表示に影響するため
+  意図的にスコープ外）、状況パネルへのDMプレイヤー絞り込みUI追加、commit/push。
+- 詳細は `doc/devlog/2026-08-22_215059.md` を参照。
+
+## 2026-08-22: Viewer God View認証の上位化・使い回し（sessionStorage方式）
+
+Viewer God View解除UIをプレイヤー詳細モーダルの内部から切り離し、ヘッダー常設のトグルへ
+移設した。従来はモーダルを閉じる／別プレイヤーを開く／試合を切り替えるたびにGod token認証
+（`X-Viewer-God-Token`）が破棄され再入力が必要だったため運用負荷が高かった。バックエンド
+（`viewer/server.py`/`viewer/log_parser.py`）は無変更のまま、静的ファイル
+（`viewer/static/index.html`/`style.css`）のみでタブ全体1回の認証・使い回しを実現した。
+
+- **UI**: God UIを`#modal-overlay`外・`.header`末尾へ移設（`VIEW: PUBLIC 🔒`/`VIEW: GOD 🔓`の
+  常設トグル）。`#god-banner`はヘッダー直下の全幅バーとして常時可視化。要素idはすべて
+  既存のまま流用し、既存テスト・CSSセレクタとの互換を維持した。
+- **保存**: God tokenはタブ限定の`sessionStorage`にのみ保存（`localStorage`はテーマ保存専用の
+  まま不変、URL・query stringには一切載せない）。入力欄の`value`は読み取り直後に必ずクリアし
+  DOMへ残さない。
+- **認証フロー**: `viewerFetch()`に403の一元downgrade（`forceGodLogout()`: 即座にpublicへ
+  戻し`sessionStorage`削除、リトライループなし）を集約。ログインは実際のGod API呼び出しの
+  200/403で判定し、専用の確認APIは新設していない（追加リクエスト0件）。リロード時は
+  `sessionStorage`のtokenで楽観的にGOD状態から再開し、起動時に必ず呼ばれる`/rounds?view=god`
+  応答で自動検証・自動復帰する。
+- **破棄条件の見直し**: `closePlayerDetail()`と試合セレクタ変更ハンドラからGod状態の破棄を
+  削除（ラウンド依存キャッシュのみリセット）。明示ログアウト（VIEWボタン）と403受信のみが
+  God状態を破棄する。
+- **文書改訂**: `rules/project.md`（God tokenの永続領域禁止規定にsessionStorage例外を明記）、
+  `doc/viewer_operations.md`（操作手順をヘッダー常設トグル前提に更新）、`README.md`を
+  同一サイクルで改訂した。
+- **スコープ外**: `viewer/server.py`/`viewer/log_parser.py`は無変更（`view`パラメータの意味・
+  403条件・redaction境界は不変）。HttpOnly Cookie方式（将来案）、POST_GAME_REFLECTIONの
+  Viewer UI追加、手動ブラウザ確認・curl実測、Viewer再起動、commit/pushは未実施。
+- **テスト**: `tests/test_viewer.py`に`TestGodViewSessionAuth`を新設（10ケース）。全体回帰は
+  937/937 PASS（既存927 + 新規10、失敗0）。
+- 詳細は `doc/devlog/2026-08-22_201253.md` を参照。
+
+## 2026-08-22: FINAL_REFLECTION completion variant + POST_GAME_REFLECTION新設
+
+FINAL_REFLECTIONをR12まで完走した生還者にも発火させるcompletion variantを追加した
+（従来は脱落者限定のelimination variantのみ）。加えて、ゲーム完全終了後（`_finalize()`後）に
+全12名（生還者＋脱落者）へ一律1回だけ、匿名通信の真の発信者・DM本文・非当事者向け契約条項
+などの神視点情報を積極的に開示した上で答え合わせコメントを書かせる新フェイズ
+`POST_GAME_REFLECTION`を新設した。既存のgod隔離原則（DM/匿名/契約は当事者以外に開示しない）
+を維持したまま、本フェイズだけを唯一の意図的な例外として構造的に切り分けている。
+
+- **収集**: `engine/game.py`に`self._god_transcript`（DM本文・匿名放送の真の発信者を蓄積、
+  `_visible_messages()`/`_build_visible_state()`からは一切参照しない構造的隔離対象）を新設。
+  `Game.run()`の通常完了経路のみ`_finalize()`直後に`_phase_post_game_reflection(result)`を
+  呼ぶ（budget-abort/stop-after-round早期returnには非影響）。新設
+  `_build_god_shared_block(result)`（12人分バイト同一の共有ブロック、`round_digest`は
+  MARKET_RESULTのみに圧縮しprompt長爆発を回避）と`_build_post_game_context(pid, result, shared)`
+  （per-player最大12件の`revelations`。`self.players`/`self.logger.events`/`_god_transcript`/
+  `self.contracts`からの読み取り専用）で構成する。
+- **API**: `llm/prompt_builder.py`に`build_post_game_reflection_prompt()`を新設。既存8つの
+  `build_*`（すべてagent向け・god情報禁止）と並ぶ9つ目で、god情報をプロンプトに積める
+  唯一の例外として設計し、allow-listテストで機械的に固定した。`llm/llm_agent.py`に
+  `LLMAgent.post_game_reflect()`（結果は独立属性`self.post_game_reflection`）、
+  `llm/response_parser.py`に`parse_post_game_reflection()`（既存7段salvageラダーを再利用、
+  `self_assessment`/`biggest_revelation`/`changed_opinion`の3任意フィールドとroster検証つき
+  `best_player`/`most_deceptive_player`を追加）を新設。`engine/config.py`に
+  `post_game_reflection_enabled`（既定`False`）/`post_game_reflection_max_chars`(1000)/
+  `post_game_reflection_max_tokens`(3000)を追加、両プリセットとも既定Falseのまま据え置き。
+- **FINAL_REFLECTION拡張**: `_phase_final_reflection()`を2パス化し、R12末の生存者にも
+  `_build_completion_context()`（本人が正当に知る公開情報のみ、他生還者の順位は含めない）経由で
+  completion variantを1回発火。elimination/completionは`is_alive`の極性で構造的に排他。
+- **スコープ外**: Viewerは本サイクルではPOST_GAME_REFLECTIONを一切表示しない
+  （未対応`event_type`を黙ってスキップする既存ディスパッチに委ねる設計）。
+  `post_game_reflection_enabled`のプリセット有効化・実API疎通試験・commit/pushは未実施。
+- **テスト**: `tests/test_post_game_reflection.py`新設、`tests/test_final_reflection.py`に
+  発火行列テスト追加、`tests/test_dm_secrecy.py`にbuilder allow-list厳密一致テストとgod情報
+  混入テストを追加、`tests/test_viewer.py`に`TestPostGameReflectionViewer`を追加（Viewer側の
+  非表示・旧ログ`variant`後方互換を確認）。`scripts/post_game_reflection_smoke.py`を新設し
+  API無し3ゲート（parser-selftest/dry-run/mock）全PASS、実APIコール0件。全体回帰は
+  927/927 PASS（既存を含む全件、失敗0）。
+- 詳細は `doc/devlog/2026-08-22_200711.md` を参照。Viewer再起動・実API疎通試験は本サイクルでは
+  実施していない。
+
 ## 2026-08-22: Viewer FINAL_REFLECTION表示（public/god二層設計）
 
 Engine側で実装・実API試験済み（GO判定、`doc/trials/final_reflection_smoke2_2026-08-22.md`）の

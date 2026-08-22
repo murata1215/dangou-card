@@ -26,8 +26,14 @@
   <label><input type="checkbox" id="auto-refresh" checked> 自動更新</label>
   <label><input type="checkbox" id="commentary-toggle" checked> 実況</label>
   <label><input type="checkbox" id="situation-toggle" checked> 状況</label>
+  <div class="god-controls">
+    <button type="button" id="god-toggle" class="god-toggle">VIEW: PUBLIC 🔒</button>
+    <input id="god-token-input" type="password" autocomplete="off" placeholder="神視点トークン" hidden>
+    <span id="god-status" class="god-status">🌐 公開表示</span>
+  </div>
   <button id="theme-toggle" class="theme-toggle" title="テーマ切替">🌙</button>
 </div>
+<div id="god-banner" class="god-banner" hidden>🔒 神視点 ON — 秘匿情報を表示中</div>
 
 <div class="grid" id="player-grid"></div>
 
@@ -123,12 +129,6 @@
   <div class="modal">
     <span class="close" id="modal-close">&times;</span>
     <h2 id="modal-title">—</h2>
-    <div class="god-controls">
-      <button type="button" id="god-toggle" class="god-toggle">🔒 神視点を有効化</button>
-      <input id="god-token-input" type="password" autocomplete="off" placeholder="神視点トークン" hidden>
-      <span id="god-status" class="god-status">🌐 公開表示</span>
-    </div>
-    <div id="god-banner" class="god-banner" hidden>🔒 神視点 ON — 秘匿情報を表示中</div>
     <div class="detail-tabs" role="tablist">
       <button class="detail-tab active" id="detail-tab-round" type="button">ラウンド表示</button>
       <button class="detail-tab" id="detail-tab-raw" type="button">生ログ</button>
@@ -228,7 +228,9 @@ async function loadGames() {
 document.getElementById('game-select').addEventListener('change', (e) => {
   try {
     currentGame = JSON.parse(e.target.value);
-    godMode = false; godToken = ''; detailRawTimeline = null; updateGodControls();
+    // God認証はViewer全体（タブ）で1回だけの使い回しとするため、試合切替では破棄しない。
+    // ラウンド依存のキャッシュのみリセットする。
+    detailRawTimeline = null; situationLoadedKey = null;
     lastRenderSig = null; // 試合切替時は必ず初回描画
     loadState();
   } catch (err) {}
@@ -387,37 +389,84 @@ let detailRawTimeline = null;
 let godMode = false;
 let godToken = '';
 
-function viewerFetch(url) {
-  const separator = url.includes('?') ? '&' : '?';
-  const headers = godMode ? {'X-Viewer-God-Token': godToken} : {};
-  return fetch(`${url}${separator}view=${godMode ? 'god' : 'public'}`, {headers});
+// God token はタブ限定の sessionStorage にのみ保存する（localStorage/URL/ログには残さない。
+// rules/project.md の god隔離原則に従う。tokenはconsole.log/DOMのtextContentへも出さない）。
+const GOD_TOKEN_KEY = 'viewer-god-token';
+function loadStoredGodToken() {
+  try { return sessionStorage.getItem(GOD_TOKEN_KEY) || ''; } catch (e) { return ''; }
 }
+function storeGodToken(t) { try { sessionStorage.setItem(GOD_TOKEN_KEY, t); } catch (e) {} }
+function clearGodToken() { try { sessionStorage.removeItem(GOD_TOKEN_KEY); } catch (e) {} }
 
 function updateGodControls(message = '') {
   const input = document.getElementById('god-token-input');
   document.getElementById('god-banner').hidden = !godMode;
-  document.getElementById('god-toggle').textContent = godMode ? '🌐 公開表示へ戻す' : '🔒 神視点を有効化';
+  document.getElementById('god-toggle').textContent = godMode ? 'VIEW: GOD 🔓' : 'VIEW: PUBLIC 🔒';
   document.getElementById('god-status').textContent = message || (godMode ? '🔒 神視点・秘匿情報' : '🌐 公開表示');
   input.hidden = godMode;
+}
+
+// 403（token無効/失効）を一元的にpublicへdowngradeする。無限リトライしない
+// （即座にgodMode=falseへ落とすため、以降のリクエストはpublicとして正常応答する）。
+function forceGodLogout(message) {
+  godMode = false; godToken = ''; clearGodToken();
+  detailRawTimeline = null; situationLoadedKey = null;
+  updateGodControls(message);
+}
+
+async function viewerFetch(url) {
+  const separator = url.includes('?') ? '&' : '?';
+  const headers = godMode ? {'X-Viewer-God-Token': godToken} : {};
+  const res = await fetch(`${url}${separator}view=${godMode ? 'god' : 'public'}`, {headers});
+  if (res.status === 403 && godMode) {
+    forceGodLogout('🔒 神視点認証が無効です（公開表示に戻しました）');
+  }
+  return res;
+}
+
+async function refreshGodDependentViews() {
+  detailRawTimeline = null;
+  situationLoadedKey = null;
+  if (detailPlayer && document.getElementById('modal-overlay').classList.contains('active')) {
+    await loadRoundDetail();
+  }
+  await loadSituation();
 }
 
 document.getElementById('god-toggle').addEventListener('click', async () => {
   const input = document.getElementById('god-token-input');
   if (godMode) {
-    godMode = false; godToken = ''; input.value = ''; detailRawTimeline = null;
-    updateGodControls(); situationLoadedKey = null; await loadRoundDetail(); await loadSituation(); return;
+    // 明示ログアウト
+    forceGodLogout();
+    await refreshGodDependentViews();
+    return;
   }
   if (input.hidden) { input.hidden = false; input.focus(); return; }
-  if (!input.value) { updateGodControls('🔒 トークンを入力してください'); return; }
-  godToken = input.value;
+  const entered = input.value;
+  input.value = ''; // DOMへ残さない
+  if (!entered) { updateGodControls('🔒 トークンを入力してください'); return; }
+  godToken = entered;
   godMode = true;
   detailRawTimeline = null;
+  situationLoadedKey = null; // 検証呼び出しを確実にキャッシュへ阻まれず実行させる
+  const modalOpen = detailPlayer && document.getElementById('modal-overlay').classList.contains('active');
   try {
-    await loadRoundDetail();
-    updateGodControls(); situationLoadedKey = null; await loadSituation();
+    if (modalOpen) {
+      await loadRoundDetail(); // 実APIの200/403で認証結果を判定（専用の確認APIは新設しない）
+    } else {
+      await loadSituation();
+    }
+    // 上記呼び出しが403を検知していればforceGodLogout経由でgodMode=falseに戻っている
+    if (godMode) {
+      storeGodToken(entered);
+      updateGodControls();
+      if (modalOpen) {
+        situationLoadedKey = null;
+        await loadSituation();
+      }
+    }
   } catch (_) {
-    godMode = false; godToken = ''; input.value = '';
-    updateGodControls('🔒 神視点を有効化できませんでした');
+    forceGodLogout('🔒 神視点を有効化できませんでした');
   }
 });
 
@@ -451,7 +500,7 @@ async function loadRoundDetail() {
   try {
     const res = await viewerFetch(url);
     if (!res.ok) {
-      if (res.status === 403 && godMode) { godMode = false; godToken = ''; updateGodControls('🔒 神視点トークンが無効です'); }
+      // 403の一元downgradeはviewerFetch()内で完結している（ここでは追加処理不要）
       throw new Error(`HTTP ${res.status}`);
     }
     const detail = await res.json();
@@ -506,27 +555,37 @@ function renderRoundDetail(detail) {
   const eliminated = (result.eliminated || []).map(e => e.reason || 'eliminated').join(', ') || 'なし';
   const secretEvents = detail.secret_events || {};
   const secretMessages = (secretEvents.messages || []).map(m => {
-    if (m.type === 'dm') return `<article class="detail-call visibility-secret"><span class="visibility-label">🔒 秘匿DM</span><br><b>${escapeHtml(m.sender || '?')} → ${escapeHtml(m.to || '?')}</b><pre class="detail-full-text">${escapeHtml(m.message || '')}</pre></article>`;
-    return `<article class="detail-call visibility-secret"><span class="visibility-label">🎭 匿名発言</span><br>公開上の発信者: 匿名<br><span class="visibility-label">🔒 神視点: 実発信者 ${escapeHtml(m.actual_sender || '?')}</span><pre class="detail-full-text">${escapeHtml(m.message || '')}</pre></article>`;
+    const rowClass = m.delivery === 'rejected' ? ' msg-rejected' : (m.delivery === 'unverified' ? ' msg-unverified' : '');
+    return `<article class="detail-call visibility-secret${rowClass}"><span class="visibility-label">🔒 秘匿DM</span> ${deliveryBadge(m)}<br><b>${escapeHtml(m.sender || '?')} → ${escapeHtml(m.to || '?')}</b><pre class="detail-full-text">${escapeHtml(m.message || '')}</pre></article>`;
   }).join('');
   const secretContracts = (secretEvents.contracts || []).map(c => `<article class="detail-call visibility-secret"><span class="visibility-label">📜 🔒 秘匿契約</span><br><b>${escapeHtml(c.contract_id || '?')}</b> / ${(c.parties || []).map(escapeHtml).join(', ')}<pre class="detail-full-text">${escapeHtml(JSON.stringify({terms: c.terms, outcomes: c.outcomes || []}, null, 2))}</pre></article>`).join('');
-  const fr = detail.final_reflection;
+  const secretTotals = secretEvents.round_totals;
+  const rejectedNote = secretTotals && secretTotals.messages_rejected
+    ? ` / うち不成立${secretTotals.messages_rejected}件（表示中${secretTotals.messages_rejected_shown}件）<span class="detail-warn">⚠ 不成立分はEngineに拒否されたアクションです（枠は消費済み）</span>`
+    : '';
+  const secretScopeNote = secretTotals
+    ? `<div class="detail-muted">このRの秘匿DM${secretTotals.messages}件中、この選手が関与する${secretTotals.messages - secretTotals.messages_hidden}件を表示（残り${secretTotals.messages_hidden}件は状況パネルで確認） / 秘匿契約${secretTotals.contracts}件中${secretTotals.contracts - secretTotals.contracts_hidden}件を表示（残り${secretTotals.contracts_hidden}件）${rejectedNote}</div>`
+    : '';
+  const fr = result.final_reflection;
   let frSection = '';
   if (fr) {
     const frVendor = guessVendor(detailPlayer.modelName || '');
     const frEmotion = emotionDisplay(fr.emotion || '平静', frVendor);
     const truncatedNote = fr.truncated ? '<div class="detail-muted">⚠ 上限により末尾を切り詰め</div>' : '';
+    const isCompletion = fr.variant === 'completion';
+    const heading = isCompletion ? '完走コメント' : '脱落時コメント';
+    const causeLabel = isCompletion ? '決め手' : '敗因';
     if (godMode) {
       const defeatCause = fr.defeat_cause
-        ? `<div><b>敗因:</b> ${escapeHtml(fr.defeat_cause)}</div>`
-        : '<div class="detail-muted">敗因: 記録なし</div>';
+        ? `<div><b>${causeLabel}:</b> ${escapeHtml(fr.defeat_cause)}</div>`
+        : `<div class="detail-muted">${causeLabel}: 記録なし</div>`;
       const comment = fr.has_comment
         ? `<pre class="detail-full-text">${escapeHtml(fr.comment || '')}</pre>`
         : '<div class="detail-empty">最後の言葉: 記録なし</div>';
       const salvagedNote = (fr.salvaged && fr.salvaged.length) ? ` / salvaged: ${escapeHtml(fr.salvaged.join(', '))}` : '';
       const metaNote = `<div class="detail-meta">status: ${escapeHtml(fr.status || '?')}${salvagedNote} / ${fr.comment_chars || 0}字</div>`;
       frSection = `<section class="detail-section final-reflection secret-section">
-        <h3>🔒 脱落時コメント（神視点）</h3>
+        <h3>🔒 ${heading}（神視点）</h3>
         <div class="final-reflection-emotion">${frEmotion}</div>
         ${defeatCause}
         <div><b>最後の言葉:</b></div>
@@ -536,7 +595,7 @@ function renderRoundDetail(detail) {
       </section>`;
     } else {
       frSection = `<section class="detail-section final-reflection">
-        <h3>脱落時コメント</h3>
+        <h3>${heading}</h3>
         <div class="final-reflection-emotion">${frEmotion}</div>
         <span class="visibility-label">🔒 最後の言葉が記録されています（本文は神視点のみ）</span>
         ${truncatedNote}
@@ -555,7 +614,7 @@ function renderRoundDetail(detail) {
     <section class="detail-section"><h3>R${r}の結果</h3>
       <div class="detail-result"><b>Commit:</b> ${escapeHtml(commit)}<br><b>市場:</b><br>${markets}<br><b>公開契約:</b><br>${contracts}<br><b>脱落:</b> ${escapeHtml(eliminated)}</div>
     </section>
-    ${godMode ? `<section class="detail-section secret-section"><h3>🔒 神視点の秘匿情報</h3>${secretMessages || secretContracts ? secretMessages + secretContracts : '<div class="detail-empty">このRの秘匿イベント記録なし</div>'}</section>` : ''}
+    ${godMode ? `<section class="detail-section secret-section"><h3>🔒 神視点の秘匿情報（この選手の関与分）</h3>${secretScopeNote}${secretMessages || secretContracts ? secretMessages + secretContracts : '<div class="detail-empty">このRにこの選手が関与した秘匿イベントはありません</div>'}</section>` : ''}
     <section class="detail-section memory-end"><h3>R終了後のHandover Memory</h3>${memoryText(detail.memory.end, endFallback)}</section>
     ${frSection}`;
   container.querySelectorAll('[data-round]').forEach(button => button.addEventListener('click', () => {
@@ -622,9 +681,9 @@ function renderRawTimeline(timeline) {
 
 // --- モーダル閉じ ---
 function closePlayerDetail() {
-  godMode = false; godToken = ''; detailRawTimeline = null;
-  document.getElementById('god-token-input').value = '';
-  updateGodControls();
+  // God認証はViewer全体（タブ）で1回だけの使い回しとするため、モーダルを閉じても破棄しない
+  // （破棄するとプレイヤーを開き直すたびに再入力が必要になり運用負荷が高かった）。
+  detailRawTimeline = null;
   document.getElementById('modal-overlay').classList.remove('active');
 }
 document.getElementById('modal-close').addEventListener('click', closePlayerDetail);
@@ -714,6 +773,27 @@ function escapeHtml(text) {
   const div = document.createElement('div');
   div.textContent = text || '';
   return div.innerHTML;
+}
+
+// D5: delivery（delivered/rejected/unverified）のバッジ表示。
+// god view専用フィールド。'unverified'（未検証）を'rejected'（不成立）と
+// 混同表示しないこと（脱落済みP09宛DMが「送れた」ように見えていた元バグの再発防止）。
+function deliveryClass(m) {
+  if (!m || !m.delivery) return '';
+  if (m.delivery === 'rejected') return 'delivery-rejected';
+  if (m.delivery === 'unverified') return 'delivery-unverified';
+  return 'delivery-delivered';
+}
+function deliveryBadge(m) {
+  if (!m || !m.delivery) return '';
+  if (m.delivery === 'rejected') {
+    const reason = m.reject_reason ? `: ${escapeHtml(m.reject_reason)}` : '';
+    return `<span class="delivery-badge delivery-rejected" title="Engineイベントとの突合で不成立と判定">❌ 不成立${reason}</span>`;
+  }
+  if (m.delivery === 'unverified') {
+    return '<span class="delivery-badge delivery-unverified" title="対応するEngineイベントが見つからず成否未検証">❔ 未検証</span>';
+  }
+  return '<span class="delivery-badge delivery-delivered" title="Engineイベントとの突合で成立を確認済み">✅ 成立</span>';
 }
 
 // --- 自動更新 ---
@@ -1088,14 +1168,16 @@ function renderSituation() {
       const isDm = m.type === 'dm';
       const isAnonymous = m.type === 'anonymous_broadcast';
       const display = m.display || {icon: m.visibility === 'secret' ? '🔒' : '🌐', label: m.visibility === 'secret' ? '秘匿' : '公開'};
+      const dBadge = deliveryBadge(m);
+      const rowClass = m.delivery === 'rejected' ? ' msg-rejected' : (m.delivery === 'unverified' ? ' msg-unverified' : '');
       if (isDm && !godMode) {
-        gHtml += `<div class="sit-msg dm visibility-secret"><span class="visibility-label">${escapeHtml(display.icon)} ${escapeHtml(display.label)}</span> ${escapeHtml(m.label || 'DM送信（本文・宛先は非公開）')}</div>`;
+        gHtml += `<div class="sit-msg dm visibility-secret${rowClass}"><span class="visibility-label">${escapeHtml(display.icon)} ${escapeHtml(display.label)}</span> ${escapeHtml(m.label || 'DM送信（本文・宛先は非公開）')}</div>`;
       } else if (isAnonymous) {
         const identity = godMode && m.actual_sender ? `<br><span class="visibility-label">🔒 神視点: 実発信者 ${escapeHtml(pidLabel(m.actual_sender))}</span>` : '';
-        gHtml += `<div class="sit-msg bc visibility-public"><span class="visibility-label">🎭 匿名発言</span><br>公開上の発信者: 匿名<br>${escapeHtml(m.message || '')}${identity}</div>`;
+        gHtml += `<div class="sit-msg bc visibility-public${rowClass}"><span class="visibility-label">🎭 匿名発言</span> ${dBadge}<br>公開上の発信者: 匿名<br>${escapeHtml(m.message || '')}${identity}</div>`;
       } else {
         const to = isDm ? pidLabel(m.to) : '全体';
-        gHtml += `<div class="sit-msg ${isDm ? 'dm visibility-secret' : 'bc visibility-public'}"><span class="visibility-label">${escapeHtml(display.icon)} ${escapeHtml(display.label)}</span> `
+        gHtml += `<div class="sit-msg ${isDm ? 'dm visibility-secret' : 'bc visibility-public'}${rowClass}"><span class="visibility-label">${escapeHtml(display.icon)} ${escapeHtml(display.label)}</span> ${dBadge} `
           + `<b>${escapeHtml(pidLabel(m.sender))}</b> <span class="arrow">→ ${escapeHtml(to)}</span>: ${escapeHtml(m.message || '')}</div>`;
       }
     });
@@ -1138,6 +1220,12 @@ document.getElementById('theme-toggle').addEventListener('click', () => {
 
 // --- 初期化 ---
 applyTheme(document.documentElement.getAttribute('data-theme') || 'dark');
+// God認証のリロード復元: sessionStorageにtokenがあれば楽観的にGOD状態から再開する。
+// 無効ならloadSituation()（起動時に必ず呼ばれる /rounds?view=god）が返す403で
+// viewerFetch()内の一元downgradeにより自動的にpublicへ戻る（追加の検証APIは新設しない）。
+const storedGodToken = loadStoredGodToken();
+if (storedGodToken) { godToken = storedGodToken; godMode = true; }
+updateGodControls();
 initCharaImages();
 loadGames();
 startAutoRefresh();

@@ -12,6 +12,7 @@ from typing import Any
 from engine.config import GameConfig
 from engine.models import (
     PlayerState, Market, MarketCommit, MarketResult, Contract, ContractStatus, Bounty,
+    ObligationType,
     CardRank, Card, Action, PassAction, TransferAction, RepayAction,
     ContractProposeAction, ContractSignAction, AnonymousBroadcastAction,
     BountyPostAction, BountyCancelAction, MarketCommitAction,
@@ -121,6 +122,14 @@ class Game:
         self._action_counts: dict[str, int] = {}
         self._anon_broadcast_counts: dict[str, int] = {}
         self._round_messages: list[dict] = []  # ラウンド内のメッセージ履歴（Bot交渉用）
+        # 当該ラウンドで不成立になった自分のアクション記録（player_id → list）。
+        # 本人の visible_state にだけ返す私的情報。他プレイヤーには渡さない。
+        self._action_failures: dict[str, list[dict]] = {}
+
+        # POST_GAME_REFLECTION専用の神視点transcript。ラウンド跨ぎで消さない。
+        # 【絶対条件】_visible_messages() / _build_visible_state() から一切参照しない。
+        # CoT reasoning・Handover Memory と同格の構造的隔離対象（rules/project.md:45-59）。
+        self._god_transcript: list[dict] = []
 
         # S2: 霧のラウンドで使用されたカードID集合
         self._fog_card_ids: set[str] = set()
@@ -139,6 +148,10 @@ class Game:
         # state派生（is_alive/elimination_round）で対象を決めるため、
         # 同一脱落に対しengineが複数eventを出しても二重発火しない。
         self._final_reflection_done: set[str] = set()
+
+        # POST_GAME_REFLECTION: 答え合わせを呼んだplayer_idの集合。全12名
+        # （生還者＋脱落者）を対象に、通常完了経路でのみゲーム全体で1回だけ発火する。
+        self._post_game_reflection_done: set[str] = set()
 
     def run(self) -> GameResult:
         """
@@ -190,7 +203,11 @@ class Game:
             if self._stop_requested_after_round(round_num):
                 return self._finalize()
 
-        return self._finalize()
+        # 通常完了経路のみ: 結果確定後に全員へ神視点開示つきの答え合わせを行う。
+        # GameResultは構築済みで、このフェイズは戻り値・勝敗判定に一切影響しない。
+        result = self._finalize()
+        self._phase_post_game_reflection(result)
+        return result
 
     def _abort_requested_for_budget(self) -> bool:
         """試験限定の予算中断要求を1回だけイベント化する。
@@ -300,6 +317,7 @@ class Game:
         self._anon_broadcast_counts = {pid: 0 for pid in self.players}
         self._trade_counts = {pid: 0 for pid in self.players}
         self._round_messages = []  # ラウンド開始時にクリア
+        self._action_failures = {pid: [] for pid in self.players}
 
         alive_ids = [pid for pid, p in self.players.items() if p.is_alive]
 
@@ -339,9 +357,14 @@ class Game:
 
                 if not result.success:
                     # アクション不成立（任意支払い不足等）
-                    # 枠は原則消費（§2.5）
+                    # 枠は原則消費（§2.5 — このルールは変更しない）
                     if result.consumes_action:
                         self._action_counts[pid] = self._action_counts.get(pid, 0) + 1
+                    # 不成立の事実と理由を本人に返せるよう記録する。eventログだけでは
+                    # LLMへ一切届かず、同じ不成立を繰り返して枠を使い切る事故が実測された
+                    # （trial_C_l12_r12_20260822: P06 が R7-R9 で25回のDM不成立、R9破産）。
+                    self._record_action_failure(pid, action, result.reason, turn,
+                                                result.consumes_action)
                     self.logger.log("NEGOTIATION_ACTION", round_num, "negotiation", data={
                         "player_id": pid, "action": action.type,
                         "success": False, "reason": result.reason, "turn": turn,
@@ -366,6 +389,38 @@ class Game:
             if tp.status == CardTradeStatus.PROPOSED and tp.round_proposed == round_num:
                 tp.status = CardTradeStatus.EXPIRED
 
+    _ACTION_FAILURE_MEMO_MAX = 12
+    """本人へ返す不成立記録の保持上限（1ラウンド最大10アクション＋余裕）"""
+
+    def _record_action_failure(
+        self, pid: str, action: Action, reason: str | None,
+        turn: int, consumed: bool,
+    ) -> None:
+        """不成立アクションを本人の私的記録へ積む（表示専用・engine判定に不介入）。
+
+        【秘匿】message本文は絶対に含めない。含めるのは type / 宛先ID / engineが返した
+        reason / 巡 / 枠消費の有無だけで、いずれも本人自身の行為とengineの返答であり
+        他人の秘匿情報を含まない。それでも他プレイヤーへ渡らないよう、公開は
+        _build_visible_state() の for_player_id ブロック内に限定する。
+        """
+        entry: dict[str, Any] = {
+            "turn": turn,
+            "action": getattr(action, "type", "unknown"),
+            "reason": reason or "",
+            "consumed_slot": bool(consumed),
+        }
+        target = getattr(action, "to", None)
+        if target is None:
+            with_players = getattr(action, "with_players", None)
+            if with_players:
+                target = ", ".join(with_players)
+        if target:
+            entry["target"] = target
+        bucket = self._action_failures.setdefault(pid, [])
+        bucket.append(entry)
+        if len(bucket) > self._ACTION_FAILURE_MEMO_MAX:
+            del bucket[: -self._ACTION_FAILURE_MEMO_MAX]
+
     def _execute_negotiation_action(
         self, action: Action, pid: str, round_num: int, turn: int,
     ) -> None:
@@ -379,6 +434,9 @@ class Game:
             self._execute_negotiation_action_inner(action, pid, round_num, turn)
         except Exception as e:
             # アクション適用エラー: 不成立として記録し試合続行
+            self._record_action_failure(
+                pid, action, "実行時エラーにより不成立", turn, consumed=True,
+            )
             self.logger.log("ACTION_ERROR", round_num, "negotiation", data={
                 "player_id": pid,
                 "action": getattr(action, "type", "unknown"),
@@ -460,6 +518,10 @@ class Game:
                 "type": "anonymous_broadcast",
                 "message": action.message,
                 "turn": turn,
+            })
+            self._god_transcript.append({
+                "round": round_num, "turn": turn, "type": "anonymous_broadcast",
+                "message": action.message, "actual_sender": pid,
             })
             self.logger.log("NEGOTIATION_ACTION", round_num, "negotiation", data={
                 "player_id": pid, "action": "anonymous_broadcast",
@@ -651,6 +713,11 @@ class Game:
             if isinstance(action, DmAction):
                 msg_record["to"] = action.to
             self._round_messages.append(msg_record)
+            self._god_transcript.append({
+                "round": round_num, "turn": turn, "type": action.type,
+                "message": action.message, "sender": pid,
+                "to": action.to if isinstance(action, DmAction) else None,
+            })
             self.logger.log("NEGOTIATION_ACTION", round_num, "negotiation", data={
                 "player_id": pid, "action": action.type,
                 "success": True, "turn": turn,
@@ -1092,46 +1159,113 @@ class Game:
             "survival_cash": self.config.survival_cash,
         }
 
+    def _build_completion_context(self, pid: str, round_num: int) -> dict:
+        """
+        FINAL_REFLECTION completion variant（R12完走した生還者）prompt用に、
+        本人が正当に知っている公開情報のみで組み立てる読み取り専用コンテキスト。
+
+        survivor_ids は `_build_visible_state()["alive_players"]` と同じ公開情報
+        （sorted pid一覧）。**順位（rank）はここに含めない** —
+        他生還者の相対資産順を漏らすと「本人が知っていた情報のみ」条件に反する
+        （順位はPOST_GAME_REFLECTIONまで持ち越す）。
+
+        脱落系キー（reason/reason_label/phase/event_type/liquidation）は
+        Noneで明示的に埋め、_build_elimination_context()とイベントschemaの
+        キー集合を両variantで揃える。
+        """
+        p = self.players[pid]
+        survivor_ids = sorted(
+            other_pid for other_pid, other in self.players.items() if other.is_alive
+        )
+        return {
+            "player_id": pid,
+            "round": round_num,
+            "survived": True,
+            "final_cash": p.cash,
+            "final_debt": p.debt_balance,
+            "survival_cash": self.config.survival_cash,
+            "num_rounds": self.config.num_rounds,
+            "survivor_ids": survivor_ids,
+            "survivor_count": len(survivor_ids),
+            "total_players": len(self.players),
+            "reason": None,
+            "reason_label": None,
+            "phase": None,
+            "event_type": None,
+            "liquidation": None,
+            "is_final_round": True,
+        }
+
     def _phase_final_reflection(self, round_num: int) -> None:
         """
-        Phase 7: Final Reflection（脱落者の最終コメント。演出/記録専用）
+        Phase 7: Final Reflection（脱落者/完走者の最終コメント。演出/記録専用）
 
         当ラウンドで新たに脱落したプレイヤー本人に、脱落の事実と原因を伝えて
-        1回だけ最終コメントを書かせる。ゲーム状態・戻り値・生存判定には一切触れない。
-        通常Reflectionと違いR12もスキップせず、生存者は対象外。
+        1回だけ最終コメントを書かせる（elimination variant）。ゲーム状態・戻り値・
+        生存判定には一切触れない。通常Reflectionと違いR12もスキップせず、
+        R12末では生存者にも1回だけ完走版（completion variant）を書かせる。
+
+        R12生存者の結果はこのフェイズ時点で既に確定済み
+        （_phase_finance(12) がR12自動返済とsurvival checkを完了させ、
+        _phase_reflection(12) は即returnする）。よって「ループ内では結果が
+        未確定」という懸念は存在しない。
 
         対象は `self.players` の確定state（is_alive/elimination_round）から派生する
         （各脱落サイトへのqueue push不要）。同一脱落に対しengineが複数eventを
         出しても、call前に `_final_reflection_done` へ追加するため二重発火しない。
+        elimination対象（not is_alive）とcompletion対象（is_alive）は
+        `is_alive` の極性で構造的に排他であり、1playerにつきどちらか片方が
+        ちょうど1回だけ実行される（ゲーム全体でFINAL_REFLECTIONは1player 1回）。
         """
         if not self.config.final_reflection_enabled:
             return
-        newly = [
-            pid for pid, p in sorted(self.players.items())
-            if not p.is_alive
-            and p.elimination_round == round_num
-            and pid not in self._final_reflection_done
-        ]
-        for pid in newly:
+
+        targets: list[tuple[str, str]] = []
+        # pass 1: 当ラウンドの脱落者（既存挙動、完全に不変）
+        for pid, p in sorted(self.players.items()):
+            if (
+                not p.is_alive
+                and p.elimination_round == round_num
+                and pid not in self._final_reflection_done
+            ):
+                targets.append((pid, "elimination"))
+        # pass 2: R12完走の生還者。survival checkは_phase_finance(12)で確定済み
+        if round_num >= self.config.num_rounds:
+            marked = {pid for pid, _ in targets} | self._final_reflection_done
+            for pid, p in sorted(self.players.items()):
+                if p.is_alive and pid not in marked:
+                    targets.append((pid, "completion"))
+
+        for pid, variant in targets:
             # 例外が起きても再試行しないよう、call前に必ずマークする（1player 1回保証）
             self._final_reflection_done.add(pid)
             agent = self.agents.get(pid)
-            method = getattr(agent, "final_reflect", None)
-            if not callable(method):
-                continue  # Bot/StubAgent等はfinal_reflectを持たないので対象外
-            ctx = self._build_elimination_context(pid, round_num)
-            try:
-                result = method(
-                    self.players[pid], round_num,
-                    self._build_visible_state(round_num, for_player_id=pid), ctx,
-                )
-            except Exception as e:
-                result = {"status": "error", "error": str(e)[:200]}
+            if variant == "elimination":
+                method = getattr(agent, "final_reflect", None)
+                if not callable(method):
+                    continue  # Bot/StubAgent等はfinal_reflectを持たないので対象外
+                ctx = self._build_elimination_context(pid, round_num)
+                visible_state = self._build_visible_state(round_num, for_player_id=pid)
+                try:
+                    result = method(self.players[pid], round_num, visible_state, ctx)
+                except Exception as e:
+                    result = {"status": "error", "error": str(e)[:200]}
+            else:
+                method = getattr(agent, "completion_reflect", None)
+                if not callable(method):
+                    continue  # Bot/StubAgent等はcompletion_reflectを持たないので対象外
+                ctx = self._build_completion_context(pid, round_num)
+                visible_state = self._build_visible_state(round_num, for_player_id=pid)
+                try:
+                    result = method(self.players[pid], round_num, visible_state, ctx)
+                except Exception as e:
+                    result = {"status": "error", "error": str(e)[:200]}
             if not isinstance(result, dict):
                 result = {}
             self.logger.log("FINAL_REFLECTION", round_num, "final_reflection", data={
                 "player_id": pid,
                 "round": round_num,
+                "variant": variant,
                 "elimination_reason": ctx["reason"],
                 "elimination_phase": ctx["phase"],
                 "elimination_event": ctx["event_type"],
@@ -1143,6 +1277,308 @@ class Game:
                 "comment_chars": result.get("chars", 0),
                 "truncated": result.get("truncated", False),
                 "salvaged": result.get("salvaged", []),
+            })
+
+    def _build_god_shared_block(self, result: "GameResult") -> dict[str, Any]:
+        """
+        POST_GAME_REFLECTION用の共有ブロック（12人分バイト同一）。
+
+        `self.players` と `self.logger.events` からの読み取り専用で構築する
+        （`_build_elimination_context()` と同じ先例）。`result.survivors` は
+        `game.py:57-60` で既にcash降順に整列済みなので、ここで順位を
+        再計算して定義がずれることを避け、そのまま使う。
+
+        round_digest は MARKET_RESULT（市場勝者・賞金）のみを1ラウンド1行に圧縮する
+        （REVEALのカード単位内訳は含めない）。理由は2つ:
+        1. 12人×12ラウンドのカード単位内訳はprompt長が組合せ爆発する
+           （test_prompt_size_ceilingを容易に超える）。
+        2. `engine/settlement.py` はfog_roundsのカードを"FOG"にマスクし、
+           コミット自体もラウンド跨ぎで復元不能（`self._current_commits`はリセット
+           される）。市場勝者（player_id）はfogの影響を受けないため、この設計は
+           fog_rounds対応でもKeyErrorにならず優雅に劣化する。
+        """
+        roster = sorted(self.players.keys())
+
+        # 最終順位表: 生還者はcash降順（GameResult.survivorsで確定済み）。
+        # 脱落者は「脱落ラウンドが遅いほど上位」（後半まで生き残った実績を評価）、
+        # 同ラウンド脱落はpid昇順で決定的に並べる。
+        eliminated_sorted = sorted(
+            result.eliminated,
+            key=lambda p: (-(p.elimination_round or 0), p.player_id),
+        )
+        final_standings: list[str] = []
+        rank_by_player: dict[str, int] = {}
+        rank = 0
+        for p in result.survivors:
+            rank += 1
+            rank_by_player[p.player_id] = rank
+            final_standings.append(
+                f"{rank}位 {p.player_id} 生還 現金{p.cash // 10_000}万円"
+            )
+        for p in eliminated_sorted:
+            rank += 1
+            rank_by_player[p.player_id] = rank
+            reason = p.elimination_reason or "unknown"
+            final_standings.append(
+                f"{rank}位 {p.player_id} R{p.elimination_round}脱落（{reason}） "
+                f"現金{p.cash // 10_000}万円"
+            )
+
+        # ラウンドダイジェスト: MARKET_RESULTのみ（上記docstring参照）
+        market_events_by_round: dict[int, list] = {}
+        for event in self.logger.events:
+            if event.event_type != "MARKET_RESULT":
+                continue
+            market_events_by_round.setdefault(event.round_num, []).append(event)
+
+        round_digest: list[str] = []
+        for r in range(1, result.round_count + 1):
+            events = sorted(
+                market_events_by_round.get(r, []),
+                key=lambda e: (e.data or {}).get("market_id", ""),
+            )
+            if not events:
+                round_digest.append(f"R{r}: （市場結果なし）")
+                continue
+            parts = []
+            for e in events:
+                data = e.data or {}
+                winners = data.get("winners") or []
+                prize = data.get("prize_per_winner")
+                market_id = data.get("market_id", "?")
+                winners_label = "・".join(winners) if winners else "勝者なし"
+                prize_label = f"{prize // 10_000}万円" if isinstance(prize, int) else "不明"
+                parts.append(f"{market_id}→{winners_label}({prize_label})")
+            round_digest.append(f"R{r}: " + "; ".join(parts))
+
+        # 違反判定用の索引: TYPE_B_VIOLATIONはobligation_idを持つので直接、
+        # TYPE_A_FAILUREはobligation_idを持たないため(round, obligor)の組で近似する
+        # （同一義務者が同一ラウンドに複数のTYPE_A義務を持つ場合は区別できないが、
+        # POST_GAME_REFLECTIONは演出/記録専用なのでこの近似を許容する）。
+        violated_obligation_ids: set[str] = set()
+        type_a_failed_pairs: set[tuple[int, str]] = set()
+        for event in self.logger.events:
+            data = event.data or {}
+            if event.event_type == "TYPE_B_VIOLATION":
+                ob_id = data.get("obligation_id")
+                if ob_id:
+                    violated_obligation_ids.add(ob_id)
+            elif event.event_type == "TYPE_A_FAILURE":
+                pid = data.get("player_id")
+                if pid:
+                    type_a_failed_pairs.add((event.round_num, pid))
+
+        ob_type_labels = {
+            ObligationType.TYPE_A_PAYMENT: "A",
+            ObligationType.TYPE_B_MARKET: "B(市場指定)",
+            ObligationType.TYPE_B_CARD: "B(カード指定)",
+            ObligationType.TYPE_B_NO_MARKET: "B(市場禁止)",
+        }
+        contract_ledger: list[str] = []
+        violation_ledger: list[str] = []
+        for contract in self.contracts:
+            for ob in contract.obligations:
+                label = ob_type_labels.get(ob.ob_type, str(ob.ob_type))
+                if ob.ob_type == ObligationType.TYPE_A_PAYMENT:
+                    amount = ob.details.get("amount")
+                    detail_label = f"{amount // 10_000}万円" if isinstance(amount, int) else "?"
+                elif ob.ob_type == ObligationType.TYPE_B_MARKET:
+                    detail_label = str(ob.details.get("market_id", "?"))
+                elif ob.ob_type == ObligationType.TYPE_B_CARD:
+                    detail_label = str(ob.details.get("rank") or ob.details.get("card_id") or "?")
+                else:
+                    detail_label = str(ob.details.get("market_id", "?"))
+
+                if ob.round_num > result.round_count:
+                    status = "－未到達"
+                elif ob.ob_type == ObligationType.TYPE_A_PAYMENT:
+                    status = "✗不履行" if (ob.round_num, ob.obligor) in type_a_failed_pairs else "✓履行"
+                else:
+                    status = "✗違反" if ob.obligation_id in violated_obligation_ids else "✓履行"
+
+                line = f"{ob.obligor}→{ob.counterparty} 型{label} {detail_label}(R{ob.round_num}) {status}"
+                contract_ledger.append(line)
+                if status.startswith("✗"):
+                    violation_ledger.append(line)
+
+        return {
+            "roster": roster,
+            "final_standings": final_standings,
+            "round_digest": round_digest,
+            "contract_ledger": contract_ledger,
+            "violation_ledger": violation_ledger,
+            "rank_by_player": rank_by_player,
+        }
+
+    def _build_post_game_context(
+        self, pid: str, result: "GameResult", shared: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        POST_GAME_REFLECTION prompt用の、本人固有の神視点開示ブロックを組み立てる。
+
+        `self._god_transcript`（DM本文・匿名通信の真の掲載者）と `self.contracts`
+        （非当事者だった契約の条項）、TYPE_B_VIOLATION/TYPE_A_FAILUREイベント
+        （本人に対して破られた約束）から、本人が正当な手段では知り得なかった
+        事実のみを抽出する。**この関数の出力はGame stateに一切書き戻さない**
+        （読み取り専用、`_build_elimination_context()`と同じ先例）。
+        """
+        p = self.players[pid]
+        survived = p.is_alive
+
+        revelations: list[str] = []
+
+        # (1) 本人が送った/受け取ったDMの相手と要旨（本人には既知の情報だが、
+        #     「秘匿されていた」のは相手の受信有無ではなく本文そのものではないため、
+        #     ここでは本人が当事者のDMは対象外とし、代わりに(2)(3)(4)に注力する。
+        #     ただし要件上「本人宛/本人発DMの相手と要旨」も明示的に含める。
+        for entry in self._god_transcript:
+            if entry.get("type") != "dm":
+                continue
+            sender = entry.get("sender")
+            to = entry.get("to")
+            if sender != pid and to != pid:
+                continue
+            other = to if sender == pid else sender
+            direction = "あなたが送った" if sender == pid else "あなたが受け取った"
+            msg = entry.get("message") or ""
+            excerpt = msg if len(msg) <= 80 else msg[:80] + "…"
+            revelations.append(
+                f"R{entry.get('round')}: {other}との非公開DM（{direction}）: 「{excerpt}」"
+            )
+
+        # (2) 匿名通信の真の掲載者（本人が読めた公開ログ上の全匿名通信が対象。
+        #     個人別の既読判定は行わない — 公開ログは全員に等しく見えるため、
+        #     「誰が本当に発信したか」を全件開示するのが最も安全側の近似）
+        for entry in self._god_transcript:
+            if entry.get("type") != "anonymous_broadcast":
+                continue
+            actual = entry.get("actual_sender")
+            if not actual or actual == pid:
+                continue
+            msg = entry.get("message") or ""
+            excerpt = msg if len(msg) <= 60 else msg[:60] + "…"
+            revelations.append(
+                f"R{entry.get('round')}: 匿名通信「{excerpt}」の真の掲載者は {actual} でした"
+            )
+
+        # (3) 本人が非当事者だった契約の条項（存在は公示されているが内容は秘匿）
+        for contract in self.contracts:
+            if pid in contract.parties or not contract.obligations:
+                continue
+            ob = contract.obligations[0]
+            label = {
+                ObligationType.TYPE_A_PAYMENT: "型A(金銭)",
+                ObligationType.TYPE_B_MARKET: "型B(市場指定)",
+                ObligationType.TYPE_B_CARD: "型B(カード指定)",
+                ObligationType.TYPE_B_NO_MARKET: "型B(市場禁止)",
+            }.get(ob.ob_type, str(ob.ob_type))
+            parties_label = "・".join(contract.parties)
+            revelations.append(
+                f"R{contract.round_created}: {parties_label}の間に非公開の契約"
+                f"（{label}、義務{len(contract.obligations)}件）がありました"
+            )
+
+        # (4) 本人に対して破られた約束（TYPE_B_VIOLATION: obligation_idで
+        #     相手方=本人の義務を特定。TYPE_A_FAILUREはobligation_idを持たないため、
+        #     当該ラウンド・当該義務者のTYPE_A義務のうち相手方=本人が一意に
+        #     決まる場合のみ言及する）
+        ob_by_id: dict[str, Any] = {}
+        for contract in self.contracts:
+            for ob in contract.obligations:
+                ob_by_id[ob.obligation_id] = ob
+
+        for event in self.logger.events:
+            data = event.data or {}
+            if event.event_type == "TYPE_B_VIOLATION":
+                ob = ob_by_id.get(data.get("obligation_id"))
+                if ob is not None and ob.counterparty == pid:
+                    revelations.append(
+                        f"R{event.round_num}: {ob.obligor}があなたへの約束"
+                        f"（型{ob.ob_type.value}）を破りました"
+                    )
+            elif event.event_type == "TYPE_A_FAILURE":
+                obligor = data.get("player_id")
+                candidates = [
+                    ob for ob in ob_by_id.values()
+                    if ob.obligor == obligor
+                    and ob.round_num == event.round_num
+                    and ob.ob_type == ObligationType.TYPE_A_PAYMENT
+                    and ob.counterparty == pid
+                ]
+                if len(candidates) == 1:
+                    revelations.append(
+                        f"R{event.round_num}: {obligor}からあなたへの支払いが履行されませんでした"
+                    )
+
+        # 情報量を絞る（設計上8〜12項目目安。多すぎる場合は先頭から優先）
+        revelations = revelations[:12]
+
+        return {
+            "player_id": pid,
+            "own_rank": shared["rank_by_player"].get(pid),
+            "survived": survived,
+            "elimination_reason": None if survived else p.elimination_reason,
+            "elimination_round": None if survived else p.elimination_round,
+            "final_cash": p.cash,
+            "final_debt": p.debt_balance,
+            "shared": shared,
+            "revelations": revelations,
+        }
+
+    def _phase_post_game_reflection(self, result: "GameResult") -> None:
+        """
+        Phase 8: Post-Game Reflection（ゲーム完全終了後、全員の答え合わせ。
+        演出/記録専用。game state・戻り値・勝敗判定には一切影響しない）
+
+        `_finalize()`でGameResultが確定した直後、通常完了経路でのみ発火する
+        （run():203の1箇所のみが呼び出し元。予算abort・stop_after_roundの
+        早期returnは対象外 — `_finalize()`は既にこれらを`completed:False`と
+        タグ付け済み）。生還者・脱落者の全12名を対象とし、1player 1回のみ。
+
+        このフェイズだけが `build_post_game_reflection_prompt()` 経由で
+        神視点情報（DM本文・匿名通信の真の掲載者・非公開契約条項・破られた約束）
+        をpromptへ投入してよい（`rules/project.md`の許可リストで固定）。
+        """
+        if not self.config.post_game_reflection_enabled:
+            return
+        shared = self._build_god_shared_block(result)
+        for pid in sorted(self.players):
+            if pid in self._post_game_reflection_done:
+                continue
+            # 例外が起きても再試行しないよう、call前に必ずマークする（1player 1回保証）
+            self._post_game_reflection_done.add(pid)
+            agent = self.agents.get(pid)
+            method = getattr(agent, "post_game_reflect", None)
+            if not callable(method):
+                continue  # Bot/StubAgent等はpost_game_reflectを持たないので対象外
+            ctx = self._build_post_game_context(pid, result, shared)
+            try:
+                out = method(self.players[pid], self.current_round, ctx)
+            except Exception as e:
+                out = {"status": "error", "error": str(e)[:200]}
+            if not isinstance(out, dict):
+                out = {}
+            self.logger.log("POST_GAME_REFLECTION", self.current_round, "post_game", data={
+                "player_id": pid,
+                "round": self.current_round,
+                "survived": ctx["survived"],
+                "elimination_reason": ctx["elimination_reason"],
+                "elimination_round": ctx["elimination_round"],
+                "final_cash": ctx["final_cash"],
+                "final_rank": ctx["own_rank"],
+                "model_id": getattr(getattr(agent, "model_info", None), "model_id", None),
+                "status": out.get("status"),
+                "emotion": out.get("emotion"),
+                "key_insight": out.get("key_insight"),
+                "self_assessment": out.get("self_assessment"),
+                "biggest_revelation": out.get("biggest_revelation"),
+                "best_player": out.get("best_player"),
+                "most_deceptive_player": out.get("most_deceptive_player"),
+                "changed_opinion": out.get("changed_opinion"),
+                "comment": out.get("comment", ""),
+                "comment_chars": out.get("chars", 0),
+                "truncated": out.get("truncated", False),
+                "salvaged": out.get("salvaged", []),
             })
 
     def _finalize(self) -> GameResult:
@@ -1214,6 +1650,15 @@ class Game:
             "alive_players": [
                 pid for pid, p in self.players.items() if p.is_alive
             ],
+            # §8.1公開情報「脱落者と理由種別」。RULES_SUMMARY(L240)は公示を約束して
+            # いるが、これを届けるプロンプトが1つも無かった（仕様と実装の乖離）。
+            # 結果、脱落を知らずに書かれた引き継ぎメモが毎R再注入されDM不成立ループを
+            # 起こした（trial_C_l12_r12_20260822 の P06）。
+            "eliminated_players": [
+                {"player_id": pid, "round": p.elimination_round,
+                 "reason": p.elimination_reason}
+                for pid, p in sorted(self.players.items()) if not p.is_alive
+            ],
             "initial_loans": {
                 pid: p.initial_loan for pid, p in self.players.items()
             },
@@ -1225,8 +1670,19 @@ class Game:
                 for pid, p in self.players.items()
             },
             "contracts_public": [
-                {"contract_id": c.contract_id, "parties": c.parties,
-                 "status": c.status.value}
+                {
+                    "contract_id": c.contract_id,
+                    "parties": c.parties,
+                    "status": c.status.value,
+                    # 表示用の派生情報のみ。脱落者が当事者の未履行義務は
+                    # engine/elimination.py:expire_obligations_for_player() で失効済みだが
+                    # status は active のままなので、素で出すと「死んだ相手との契約が
+                    # まだ生きている」と誤読される（D4）。
+                    "eliminated_parties": [
+                        pid for pid in c.parties
+                        if pid in self.players and not self.players[pid].is_alive
+                    ],
+                }
                 for c in self.contracts
                 if c.status.value in ("active", "completed")
             ],
@@ -1291,6 +1747,17 @@ class Game:
                 and not ob.is_expired
                 and ob.round_num >= round_num  # 過去ラウンドの義務は除外
             ]
+
+            # 当事者向け: 当該ラウンドで不成立になった自分のアクション（私的情報）
+            # §2.5により不成立でも枠を消費するため、理由が返らないと同じ失敗の反復で
+            # アクション枠を自滅的に使い切る。engine判定には一切影響しない。
+            state["my_failed_actions"] = [
+                dict(f) for f in self._action_failures.get(for_player_id, [])
+            ]
+            state["my_action_budget"] = {
+                "used": self._action_counts.get(for_player_id, 0),
+                "max": self.config.negotiation_max_actions,
+            }
 
             # カードトレード提案（当事者のみ可視, v0.7.1: 受信者に他宛先非公開）
             pending_trades = []

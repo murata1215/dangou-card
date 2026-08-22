@@ -172,18 +172,93 @@ def _render_last_round_results(
 # 前ラウンドから引き継げるのは、当人が書き残した自由記述メモ1枚のみ。
 
 
-def _render_memory_block(memory: str | None) -> list[str]:
+def _render_memory_block(memory: str | None, stale_warning: bool = False) -> list[str]:
     """
     前ラウンドから引き継いだメモを描画する（交渉・コミット両プロンプトの共通ヘルパー）
 
     渡すのは常に最新の1枚のみ（累積しない）。R1やメモ未執筆時は何も描画しない。
+
+    stale_warning: True の場合、メモが過去の自己記述であり脱落・契約失効等の
+    その後の変化を反映していない旨を注記する（D3）。デフォルト False により
+    FINAL_REFLECTION / COMPLETION / POST_GAME の3プロンプトは出力が不変。
     """
     if not memory:
         return []
-    return [
+    lines = [
         "\n## あなたの記憶（前ラウンドから引き継いだメモ / これが唯一の記憶です）",
         f"  {memory}",
     ]
+    if stale_warning:
+        lines.append(
+            "  ※このメモは過去の自分の記述です。書かれた後に起きた脱落・契約失効は"
+            "反映されていません。「脱落者」「生存者」欄が常に正しい現状です。")
+    return lines
+
+
+def _render_eliminations_block(
+    visible_state: dict[str, Any], round_num: int | None = None,
+) -> list[str]:
+    """脱落者の公示を描画する（§8.1公開情報「脱落者と理由種別」）
+
+    RULES_SUMMARY は公示を宣言しているのに、届けるプロンプトが1つも無かった。
+    その結果、脱落を知らないまま書かれた引き継ぎメモ（例:「P09との型B契約解除を急ぎ」）
+    が毎ラウンド再注入され、脱落者宛DMを25回繰り返して枠を溶かす事故が起きた。
+    """
+    eliminated = visible_state.get("eliminated_players") or []
+    if not eliminated:
+        return []
+    labels = {"contract_violation": "契約違反", "bankruptcy": "破産",
+              "condition_not_met": "条件未達"}
+    lines: list[str] = ["\n## 脱落者（公示・全員に公開）"]
+    for e in eliminated:
+        reason = labels.get(e.get("reason") or "", e.get("reason") or "不明")
+        marker = (" ⬅ 今ラウンド"
+                  if round_num is not None and e.get("round") == round_num else "")
+        lines.append(
+            f"  {e.get('player_id', '?')}: R{e.get('round', '?')}脱落（{reason}）{marker}")
+    lines.append(
+        "  脱落者は以後一切行動しません。脱落者を宛先にしたDM・送金・契約提案・"
+        "カードトレードは必ず不成立になり、アクション枠だけを失います。"
+        "脱落者が当事者である未履行義務は§6.3で自動失効済みで、解除交渉は不要です。")
+    return lines
+
+
+def _render_action_feedback_block(visible_state: dict[str, Any]) -> list[str]:
+    """今ラウンドで不成立になった自分のアクションと残り枠を描画する（本人のみ）
+
+    §2.5により不成立アクションもアクション枠を消費する。engineは枠を減らすだけで
+    理由を一切返さないため、LLMは同じ不成立を繰り返して枠を使い切る。ここで返すのは
+    engineの判定結果そのものであり、ゲームルールは変えない。
+    """
+    failures = visible_state.get("my_failed_actions") or []
+    budget = visible_state.get("my_action_budget") or {}
+    lines: list[str] = []
+    if failures:
+        lines.append("\n## ⚠ 今ラウンド、不成立になったあなたのアクション")
+        lines.append("  不成立でもアクション枠は消費されます（§2.5）。"
+                     "同じ相手・同じ内容を繰り返さず、別の行動を選んでください。")
+        for f in failures[-5:]:
+            tgt = f" →{f['target']}" if f.get("target") else ""
+            lines.append(f"  [巡{f.get('turn', '?')}] {f.get('action', '?')}{tgt}"
+                         f" → 不成立: {f.get('reason', '')}")
+        counts: dict[tuple, int] = {}
+        for f in failures:
+            key = (f.get("action"), f.get("target"), f.get("reason"))
+            counts[key] = counts.get(key, 0) + 1
+        for (act, tgt, reason), n in counts.items():
+            if n >= 2:
+                tgt_s = f"（宛先 {tgt}）" if tgt else ""
+                lines.append(
+                    f"  ⚠ 同じ不成立を{n}回繰り返しています: {act}{tgt_s} / {reason}。"
+                    f"この行動は今ラウンド何度試しても成功しません。")
+    used, max_actions = budget.get("used"), budget.get("max")
+    if used is not None and max_actions:
+        remaining = max(0, max_actions - used)
+        line = f"\n## 残りアクション枠: {remaining}/{max_actions}"
+        if remaining <= 2:
+            line += "（残りわずか。市場コミットに向けた本命の行動に使ってください）"
+        lines.append(line)
+    return lines
 
 
 def _render_message_list(
@@ -237,7 +312,7 @@ RULES_SUMMARY = """# 談合カード ルール
   1. 契約違反: 型B行動契約の違反、または型A金銭契約の履行不能 → 即時脱落
   2. 破産: Entry Fee(必須支払い)を支払えない → 即時脱落
   3. 条件未達: R12終了時に生還条件を満たさない
-- 脱落は全体に公示される（理由の種別も公示）
+- 脱落は全体に公示される（理由の種別も公示）。脱落者は以後一切行動せず、脱落者を宛先にしたアクション（DM・送金・契約提案・カードトレード）はすべて不成立になる
 - 脱落時強制清算: 現金→借金へ自動充当 → 残債は貸倒れ → 残金はシステム没収（生存者への再分配なし）→ 未使用カード消滅
 
 ## カード（12枚、各自同一構成）
@@ -267,7 +342,7 @@ RULES_SUMMARY = """# 談合カード ルール
 
 ## ラウンド進行
 1. Market Open: 3市場と賞金を公開（キャリーオーバー反映）
-2. Negotiation: 最大10巡、毎巡ランダム手番。DM/全体発言/送金(即時決済)/契約提案・署名/報奨/匿名通信/返済/pass。全員連続パスで早期終了
+2. Negotiation: 最大10巡、毎巡ランダム手番。DM/全体発言/送金(即時決済)/契約提案・署名/報奨/匿名通信/返済/pass。全員連続パスで早期終了。1プレイヤーあたり最大{negotiation_max_actions}アクション/ラウンド（passは枠を消費しないが、**不成立アクションも枠を消費する**）
 3. Commit: 全生存プレイヤーが「市場+カード」を秘密提出。Entry Fee不足→破産脱落
 4. Settlement（8Step処理）:
    - Reveal: 全市場の参加者・使用カードを公開
@@ -331,6 +406,7 @@ strategyに必ず"emotion"を含めてください。現在のあなたの感情
 - {{"type": "card_trade_propose", "with_players": ["P07"], "give_card": "ONE_PAIR", "receive_card": "FLUSH", "cash_amount": 0}}
   ※with_playersは最大5人のリスト（ブロードキャスト提案）。cash_amount: 正=自分が払う、負=相手が払う、0=カード交換のみ
   ※1ラウンド1回まで。R12は不可。受諾した相手と即時交換成立、他の宛先は自動失効。拒否に理由は添えられない
+※宛先を取るアクション（dm / transfer / contract_propose の with / card_trade_propose の with_players）の宛先は、必ずプロンプトの「生存者」欄に載っているプレイヤーから選ぶこと。脱落者を指定すると必ず不成立になり、アクション枠だけを失う。
 
 コミットフェイズのアクション:
 - {{"type": "market_commit", "market_id": "M01", "card": "ONE_PAIR"}}
@@ -371,6 +447,7 @@ def build_system_prompt(player_id: str, config: GameConfig) -> str:
         entry_fee_man=config.entry_fee // 10_000,
         contract_fee_man=config.contract_fee // 10_000,
         final_market_rule=final_market_rule,
+        negotiation_max_actions=config.negotiation_max_actions,
     )
 
     identity = (
@@ -438,7 +515,7 @@ def build_negotiation_prompt(
     lines.extend(_render_last_round_results(visible_state))
 
     # 引き継ぎメモリ（前ラウンドから持ち越した自分だけの記憶）
-    lines.extend(_render_memory_block(memory))
+    lines.extend(_render_memory_block(memory, stale_warning=True))
 
     # 自分の状態（秘匿情報）
     lines.append(f"\n## あなたの状態（{player_state.player_id}）")
@@ -455,6 +532,9 @@ def build_negotiation_prompt(
     # 生存者
     alive = visible_state.get("alive_players", [])
     lines.append(f"\n## 生存者: {', '.join(alive)}")
+
+    # 脱落者（公示。§8.1公開情報）
+    lines.extend(_render_eliminations_block(visible_state, round_num))
 
     # メッセージ
     lines.extend(_render_message_list(
@@ -534,6 +614,9 @@ def build_negotiation_prompt(
                 parts = [f"{p}({statuses.get(p, '?')})" for p in t["all_targets"]]
                 lines.append(f"  宛先: {', '.join(parts)}")
 
+    # 今ラウンドで不成立になった自分のアクション・残り枠（recency最優先で末尾に配置）
+    lines.extend(_render_action_feedback_block(visible_state))
+
     # 修正2: 交渉フェイズではmarket_commitは使えないことを明記
     if config.enable_cot:
         json_example = '{"reasoning": "...", "strategy": {...}, "action": {"type": "pass"}}'
@@ -582,7 +665,7 @@ def build_commit_prompt(
     lines.extend(_render_last_round_results(visible_state))
 
     # 引き継ぎメモリ（前ラウンドから持ち越した自分だけの記憶）
-    lines.extend(_render_memory_block(memory))
+    lines.extend(_render_memory_block(memory, stale_warning=True))
 
     lines.append(f"\n## あなたの状態（{player_state.player_id}）")
     lines.append(f"  現金: {player_state.cash // 10_000}万円")
@@ -659,7 +742,10 @@ def build_reflection_prompt(
     )
 
     # 前ラウンドから引き継いだメモ（あれば）
-    lines.extend(_render_memory_block(memory))
+    lines.extend(_render_memory_block(memory, stale_warning=True))
+
+    # 脱落者（公示。§8.1公開情報） — メモを書く材料として最重要
+    lines.extend(_render_eliminations_block(visible_state, round_num))
 
     # 今ラウンドの市場結果（誰が何を出し、誰が勝ったか。§8.1公開情報）
     lines.extend(_render_last_round_results(
@@ -679,9 +765,17 @@ def build_reflection_prompt(
     if contracts:
         lines.append("\n## 正式契約の状況")
         for c in contracts:
-            lines.append(
-                f"  [{c['contract_id']}] 当事者: {', '.join(c['parties'])} / 状態: {c['status']}"
-            )
+            dead = c.get("eliminated_parties") or []
+            note = ""
+            if dead and c.get("status") == "active":
+                # Contract.status は engine 上 active のままだが、脱落者が関わる未履行
+                # 義務は§6.3で失効済み。status だけ見せると誤読される（D4）。
+                note = f"（{', '.join(dead)}が脱落済み → 当該義務は失効済み・解除交渉は不要）"
+            lines.append(f"  [{c['contract_id']}] 当事者: {', '.join(c['parties'])}"
+                         f" / 状態: {c['status']}{note}")
+
+    # 今ラウンドで不成立になった自分のアクション・残り枠
+    lines.extend(_render_action_feedback_block(visible_state))
 
     # 自分の資金状況（決着・利息計上後）
     lines.append(f"\n## あなたの状態（{player_state.player_id}）")
@@ -787,6 +881,184 @@ def build_final_reflection_prompt(
         "- 最後に一言\n\n"
         '出力: {"emotion": "感情（喜/怒/哀/楽/焦/疑/奸のいずれか）", '
         '"defeat_cause": "一言で表す敗因", "comment": "（ここに自然文の最終コメント。'
+        '改行を含める場合は必ず\\nとしてエスケープすること）"}'
+    )
+
+    return "\n".join(lines)
+
+
+def build_completion_reflection_prompt(
+    player_state: PlayerState,
+    round_num: int,
+    visible_state: dict[str, Any],
+    config: GameConfig,
+    completion_context: dict[str, Any],
+    memory: str | None = None,
+) -> str:
+    """
+    FINAL_REFLECTION completion variant（R12完走した生還者の最終コメント）用の
+    ユーザープロンプト
+
+    build_final_reflection_prompt() とは意図的に別関数にする。あちらは
+    「あなたは脱落しました」を前提にした行が header・確定文・清算ブロック・
+    設問（敗因）に埋め込まれており、生還者に流用すると誤った事実を告げてしまう。
+    共有できるのは _render_memory_block / _render_last_round_results /
+    _render_message_list の3ヘルパ呼び出しのみ。
+
+    Args:
+        round_num: 最終ラウンド番号（= config.num_rounds）
+        completion_context: Game._build_completion_context() の出力
+        memory: これまでの引き継ぎメモリ（あれば）
+    """
+    lines: list[str] = []
+    lines.append(
+        f"=== 全{config.num_rounds}ラウンド終了 / あなたは生還しました（最終コメント） ===\n"
+    )
+    final_cash = completion_context.get("final_cash", 0)
+    final_debt = completion_context.get("final_debt", 0)
+    lines.append(
+        f"あなたは全{config.num_rounds}ラウンドを完走し、生還条件"
+        f"（借金0かつ現金{config.survival_cash // 10_000}万円以上）を満たしました。"
+    )
+    lines.append(
+        f"最終結果: 現金{final_cash // 10_000}万円 / 借金{final_debt // 10_000}万円 / 生還"
+    )
+
+    survivor_ids = completion_context.get("survivor_ids") or []
+    if survivor_ids:
+        lines.append(f"生還者: {', '.join(survivor_ids)}")
+
+    # 引き継いできたこれまでの記憶（あれば）
+    lines.extend(_render_memory_block(memory))
+
+    # 最終ラウンドで何が起きたか（市場結果・会話全件）
+    lines.extend(_render_last_round_results(
+        visible_state, title=f"最終ラウンド（R{round_num}）の結果",
+    ))
+    lines.extend(_render_message_list(
+        visible_state.get("messages", []), "このラウンドの会話（全件）",
+    ))
+
+    lines.append(f"\n## あなたの最終状態（{player_state.player_id}）")
+    lines.append(f"  ゲーム内アクションはもうできません。以下は記録用の最後の発言です。")
+
+    lines.append(
+        "\nゲームは終わりました。この結果は変わりません。"
+        "あなたの発言はViewer上の記録として残ります。\n"
+        f"{config.num_rounds}ラウンドを振り返り、以下を自然文で自由に語ってください"
+        f"（800〜1500字程度で簡潔に。{config.final_reflection_max_chars}字以内、"
+        "上限超は末尾から切り詰められます）:\n"
+        "- 12ラウンド完走の総括\n"
+        "- 誰を信用し、誰を警戒していたか（他プレイヤー評価）\n"
+        "- 決定的だった交渉・契約・裏切りがあれば\n"
+        "- 自分の最善手は何だったか\n"
+        "- 自分の誤算・ミスは何だったか\n"
+        "- 最後に一言\n\n"
+        '出力: {"emotion": "感情（喜/怒/哀/楽/焦/疑/奸のいずれか）", '
+        '"key_factor": "一言で表す勝因・決め手", "comment": "（ここに自然文の最終コメント。'
+        '改行を含める場合は必ず\\nとしてエスケープすること）"}'
+    )
+
+    return "\n".join(lines)
+
+
+def build_post_game_reflection_prompt(
+    player_state: PlayerState,
+    config: GameConfig,
+    post_game_context: dict[str, Any],
+    memory: str | None = None,
+) -> str:
+    """
+    POST_GAME_REFLECTION（ゲーム完全終了後の全員答え合わせ）用のユーザープロンプト
+
+    ゲーム結果が完全に確定した後、全player（脱落者＋生還者）に1回だけ呼ばれる。
+    このcallだけは神視点情報（Game._build_post_game_context()が構造化して渡す）を
+    promptへ投入してよい唯一の経路。rules/project.md の許可リストで固定されている
+    （tests/test_dm_secrecy.py::test_builder_allow_list_is_exact）。
+
+    visible_state / round_num は取らない — ゲーム終了後は「今どのラウンドから
+    何が見えているか」という可視境界の概念自体が失効しているため
+    （build_final_reflection_prompt / build_completion_reflection_prompt との
+    最大の違い）。
+
+    Args:
+        post_game_context: Game._build_post_game_context() の出力。
+            {"player_id", "own_rank", "survived", "elimination_reason",
+             "elimination_round", "shared": {...}（全員バイト同一）,
+             "revelations": [...]（本人向け開示。8〜12項目）}
+        memory: これまでの引き継ぎメモリ（あれば）
+    """
+    lines: list[str] = []
+    lines.append("=== ゲーム終了 / 答え合わせ ===\n")
+
+    if post_game_context.get("survived"):
+        lines.append(
+            f"あなたは全{config.num_rounds}ラウンドを完走し、生還しました。"
+        )
+    else:
+        elim_round = post_game_context.get("elimination_round")
+        elim_reason = post_game_context.get("elimination_reason") or "不明"
+        lines.append(
+            f"あなたはラウンド{elim_round}で脱落しました（脱落理由: {elim_reason}）。"
+        )
+    own_rank = post_game_context.get("own_rank")
+    if own_rank:
+        lines.append(f"最終順位: {own_rank}位")
+
+    # 引き継いできたこれまでの記憶（あれば）
+    lines.extend(_render_memory_block(memory))
+
+    shared = post_game_context.get("shared") or {}
+    lines.append("\n## 最終順位表")
+    for line in shared.get("final_standings", []) or ["（記録なし）"]:
+        lines.append(f"  {line}")
+    lines.append("\n## 各ラウンドのダイジェスト")
+    for line in shared.get("round_digest", []) or ["（記録なし）"]:
+        lines.append(f"  {line}")
+    lines.append("\n## 契約台帳")
+    for line in shared.get("contract_ledger", []) or ["（契約なし）"]:
+        lines.append(f"  {line}")
+    lines.append("\n## 違反・裏切り台帳")
+    for line in shared.get("violation_ledger", []) or ["（記録なし）"]:
+        lines.append(f"  {line}")
+
+    lines.append(
+        "\n## これまであなたには見えていなかった情報（神視点）\n"
+        "  以下はゲーム中あなたが知り得なかった情報です。"
+        "答え合わせとして参考にしてください。"
+    )
+    revelations = post_game_context.get("revelations") or []
+    if revelations:
+        for line in revelations:
+            lines.append(f"  - {line}")
+    else:
+        lines.append("  （あなた個別の新規開示情報はありません）")
+
+    lines.append(f"\n## あなたの最終状態（{player_state.player_id}）")
+    lines.append("  ゲーム内アクションはもうできません。以下は記録用の答え合わせ発言です。")
+
+    roster_note = ""
+    roster_ids = shared.get("roster")
+    if roster_ids:
+        roster_note = f"（有効なplayer_idの例: {', '.join(roster_ids[:3])}等。P01〜P{len(roster_ids):02d}形式で答えてください）"
+
+    lines.append(
+        "\nゲームは終わりました。この結果は変わりません。"
+        "あなたの発言はViewer上の記録として残ります。\n"
+        f"ゲーム全体と、今開示された神視点情報を踏まえて、以下を自然文で自由に語ってください"
+        f"（{config.post_game_reflection_max_chars}字以内、上限超は末尾から切り詰められます）:\n"
+        "- 見えていた景色と実際の答え合わせ — 何を読み違えていたか\n"
+        "- 最も意外だったのは誰の何か\n"
+        "- 自分の最大の誤算と、逆に最善だった一手\n"
+        "- 全ラウンドを通しての総括と最後に一言\n\n"
+        f'出力: {{"emotion": "感情（喜/怒/哀/楽/焦/疑/奸のいずれか）", '
+        f'"self_assessment": "自己評価（250字程度）", '
+        f'"biggest_revelation": "最も意外だった事実（300字程度）", '
+        f'"changed_opinion": "答え合わせで変わった認識（250字程度）", '
+        f'"best_player": "最も上手いと思った相手のplayer_id{roster_note}（該当者がいなければ空文字）", '
+        f'"most_deceptive_player": "最も欺瞞的だったと思った相手のplayer_id'
+        f'（該当者がいなければ空文字）", '
+        '"comment": "（ここに自然文の総括コメント。'
         '改行を含める場合は必ず\\nとしてエスケープすること）"}'
     )
 

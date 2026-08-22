@@ -658,8 +658,14 @@ def _safe_round_result(
         # （status=empty/rejected_no_comment/error等のdegradedケース）。
         if not (fr.get("emotion") or fr.get("defeat_cause") or fr.get("comment")):
             break
+        # variant無しの旧イベント（本変更以前は脱落者しかFINAL_REFLECTIONを
+        # 出さなかった）には既定値 "elimination" を当てる。この既定は
+        # 変更前ログに対して厳密に正しい。脱落有無自体は rd["eliminated"] /
+        # SURVIVAL_CHECK 経由で既に公開情報なので、variant区分をpublicに
+        # 出しても秘匿情報の新規開示にはならない。
         final_reflection = {
             "round": round_num,
+            "variant": fr.get("variant") or "elimination",
             "emotion": fr.get("emotion"),
             "has_comment": bool(fr.get("comment")),
             "truncated": bool(fr.get("truncated")),
@@ -785,9 +791,44 @@ def get_player_round_detail(
     }
     if view == "god":
         round_data = round_states.get("rounds", {}).get(str(round_num), {})
+        round_messages = [m for m in round_data.get("messages", []) if m.get("visibility") == "secret"]
+        round_contracts = [c for c in round_data.get("contracts", []) if c.get("terms") is not None]
+
+        def _dm_involves_player(message: dict[str, Any]) -> bool:
+            # senderはplayer別ログのファイル名由来なので常に確定している（_collect_round_messages）。
+            if message.get("sender") == pid:
+                return True
+            recipient = message.get("to")
+            # 旧ログ/壊れた応答ではtoがlistやNoneになり得るため型で分岐する。
+            if isinstance(recipient, list):
+                return pid in recipient
+            return recipient == pid
+
+        def _contract_involves_player(contract: dict[str, Any]) -> bool:
+            # _safe_round_result()はparties単独だが、ここはproposer未署名ケースも本人の行為として拾う。
+            return contract.get("proposer") == pid or pid in (contract.get("parties") or [])
+
+        player_messages = [m for m in round_messages if _dm_involves_player(m)]
+        player_contracts = [c for c in round_contracts if _contract_involves_player(c)]
         result["secret_events"] = {
-            "messages": [m for m in round_data.get("messages", []) if m.get("visibility") == "secret"],
-            "contracts": [c for c in round_data.get("contracts", []) if c.get("terms") is not None],
+            "scope": "player",
+            "messages": player_messages,
+            "contracts": player_contracts,
+            # 「このRにはまだある」ことを神視点利用者へ伝える件数のみ。本文は一切含めない。
+            "round_totals": {
+                "messages": len(round_messages),
+                "contracts": len(round_contracts),
+                "messages_hidden": len(round_messages) - len(player_messages),
+                "contracts_hidden": len(round_contracts) - len(player_contracts),
+                # D5: LLMログ（本文）とEngineイベント（成否）のjoin結果。
+                # 不成立DMが「送れた」ように見えるViewer側の誤表示を防ぐ。
+                "messages_rejected": sum(
+                    1 for m in round_messages if m.get("delivery") == "rejected"
+                ),
+                "messages_rejected_shown": sum(
+                    1 for m in player_messages if m.get("delivery") == "rejected"
+                ),
+            },
         }
     return result
 
@@ -841,20 +882,130 @@ FULL_DECK = [
 ]
 
 
+def _index_negotiation_outcomes(
+    events: list[dict[str, Any]],
+) -> dict[tuple[str, int, int], list[dict[str, Any]]]:
+    """NEGOTIATION_ACTION を (player_id, round_num, turn) で索引する。
+
+    LLMログ（本文）とEngineイベント（成否）をjoinするための下準備。
+    同一キーに複数件あり得る（同一turn内で複数アクション種別の記録等）ため
+    リストで保持する。
+    """
+    index: dict[tuple[str, int, int], list[dict[str, Any]]] = {}
+    for e in events:
+        if e.get("event_type") != "NEGOTIATION_ACTION":
+            continue
+        data = e.get("data")
+        if not isinstance(data, dict):
+            continue
+        pid = data.get("player_id")
+        turn = data.get("turn")
+        round_num = e.get("round_num")
+        if not pid or not isinstance(turn, int) or not isinstance(round_num, int):
+            continue
+        index.setdefault((pid, round_num, turn), []).append(data)
+    return index
+
+
+def _match_delivery(
+    index: dict[tuple[str, int, int], list[dict[str, Any]]],
+    pid: str,
+    round_num: Any,
+    turn: Any,
+    action_type: str,
+) -> tuple[str, str | None]:
+    """LLMログ1件を NEGOTIATION_ACTION と突き合わせ (delivery, reject_reason) を返す。
+
+    delivery は "delivered" / "rejected" / "unverified" の3値。
+    「不明」を「不成立」と混同しないこと（それが今回の元バグと同種の誤情報になる）。
+    """
+    if not isinstance(turn, int) or not isinstance(round_num, int):
+        return "unverified", None
+    candidates = index.get((pid, round_num, turn))
+    if not candidates:
+        return "unverified", None
+    matched = [d for d in candidates if d.get("action") == action_type]
+    if not matched:
+        return "unverified", None
+    success = matched[-1].get("success")
+    if success is True:
+        return "delivered", None
+    if success is False:
+        reason = matched[-1].get("reason")
+        return "rejected", (str(reason) if reason else None)
+    return "unverified", None
+
+
+def _project_message(message: dict[str, Any], view: str) -> dict[str, Any]:
+    """交渉メッセージ1件を可視性ルールに従って投影する。
+
+    delivery/reject_reason は god view でのみ付与する。reject_reason は
+    宛先PID等を含みうるため（例: "Target P09 is not alive"）、public に
+    出すと§8.2のDM秘匿境界を破る。
+    """
+    msg_type = message.get("type", "")
+    delivery = message.get("delivery")
+
+    def _with_delivery(item: dict[str, Any]) -> dict[str, Any]:
+        if delivery:
+            item["delivery"] = delivery
+            if delivery == "rejected":
+                item["reject_reason"] = message.get("reject_reason")
+        return item
+
+    if msg_type == "broadcast":
+        item = {
+            "sender": message.get("sender"), "type": msg_type,
+            "message": message.get("message", ""), "turn": message.get("turn"),
+            "round": message.get("round"), "visibility": "public",
+            "display": _visibility_display("public", msg_type),
+        }
+        return _with_delivery(item) if view == "god" else item
+    if msg_type == "anonymous_broadcast":
+        item = {
+            "sender": None, "type": msg_type, "message": message.get("message", ""),
+            "turn": message.get("turn"), "round": message.get("round"), "anonymous": True,
+            "visibility": "public", "display": _visibility_display("public", msg_type),
+        }
+        if view == "god":
+            item["actual_sender"] = message.get("actual_sender")
+            item = _with_delivery(item)
+        return item
+    if view == "god":
+        item = {
+            "sender": message.get("sender"), "to": message.get("to"), "type": "dm",
+            "message": message.get("message", ""), "turn": message.get("turn"),
+            "round": message.get("round"), "visibility": "secret",
+            "display": _visibility_display("secret", "dm"),
+        }
+        return _with_delivery(item)
+    return {
+        "type": "dm", "turn": message.get("turn"), "round": message.get("round"),
+        "visibility": "secret", "display": _visibility_display("secret", "dm"),
+        "label": "DM送信（本文・宛先は非公開）",
+    }
+
+
 def _collect_round_messages(
-    trial_dir: Path, game_id: str,
+    trial_dir: Path, game_id: str, events: list[dict[str, Any]] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """
     LLMログから交渉メッセージをラウンド別に収集する。
     eventsのNEGOTIATION_ACTIONは本文/宛先を持たないため、LLMログを使う。
 
+    events を渡すと、各メッセージへ delivery（delivered/rejected/unverified）
+    と reject_reason（rejected時のみ）を付与する。省略時（後方互換。turn無し
+    の旧ログ/旧呼び出しを含む）は付与しない。
+
     Returns:
-        {"1": [{sender, to?, type, message, turn, round}, ...], ...}
+        {"1": [{sender, to?, type, message, turn, round, delivery?, reject_reason?}, ...], ...}
     """
     llm_logs_dir = trial_dir / "llm_logs"
     by_round: dict[str, list[dict[str, Any]]] = {}
     if not llm_logs_dir.exists():
         return by_round
+
+    outcome_index = _index_negotiation_outcomes(events) if events else {}
 
     for lf in sorted(llm_logs_dir.glob(f"{game_id}_*_llm_calls.jsonl")):
         pid = lf.stem.split("_")[1] if "_" in lf.stem else "?"
@@ -880,6 +1031,13 @@ def _collect_round_messages(
                 rec["anonymous"] = True
             if at == "dm":
                 rec["to"] = a.get("to", "")
+            if outcome_index:
+                delivery, reject_reason = _match_delivery(
+                    outcome_index, pid, e.get("round_num"), e.get("turn"), at,
+                )
+                rec["delivery"] = delivery
+                if reject_reason is not None:
+                    rec["reject_reason"] = reject_reason
             by_round.setdefault(rn, []).append(rec)
 
     # ラウンド内は turn 順に並べる（turn 無しは末尾）
@@ -926,7 +1084,13 @@ def get_round_states(
     trial_dir = logs_dir / trial_dir_name
     seat_map = _load_seat_map(trial_dir, game_id)
     events_file = trial_dir / f"{game_id}_events.jsonl"
-    messages_by_round = _collect_round_messages(trial_dir, game_id)
+    events_exist = events_file.exists()
+    # events を先にロードし、_collect_round_messages に渡すことで
+    # LLMログ（本文）とEngineイベント（成否）のjoinを行う（D5）。
+    events: list[dict[str, Any]] = _cache.get_entries(events_file) if events_exist else []
+    messages_by_round = _collect_round_messages(
+        trial_dir, game_id, events=events if events_exist else None,
+    )
     terms_by_key = _collect_contract_terms(trial_dir, game_id)
 
     result: dict[str, Any] = {
@@ -936,40 +1100,16 @@ def get_round_states(
         "rounds": {},
     }
 
-    if not events_file.exists():
+    if not events_exist:
         # eventsが無くてもメッセージだけは見せられる
         for rn, msgs in messages_by_round.items():
-            visible_messages = []
-            for message in msgs:
-                msg_type = message.get("type")
-                if msg_type == "broadcast":
-                    visible_messages.append({"sender": message.get("sender"), "type": msg_type,
-                        "message": message.get("message", ""), "turn": message.get("turn"),
-                        "round": message.get("round"), "visibility": "public",
-                        "display": _visibility_display("public", msg_type)})
-                elif msg_type == "anonymous_broadcast":
-                    item = {"sender": None, "type": msg_type, "message": message.get("message", ""),
-                        "turn": message.get("turn"), "round": message.get("round"), "anonymous": True,
-                        "visibility": "public", "display": _visibility_display("public", msg_type)}
-                    if view == "god": item["actual_sender"] = message.get("actual_sender")
-                    visible_messages.append(item)
-                elif view == "god":
-                    visible_messages.append({"sender": message.get("sender"), "to": message.get("to"),
-                        "type": "dm", "message": message.get("message", ""), "turn": message.get("turn"),
-                        "round": message.get("round"), "visibility": "secret",
-                        "display": _visibility_display("secret", "dm")})
-                else:
-                    visible_messages.append({"type": "dm", "turn": message.get("turn"), "round": message.get("round"),
-                        "visibility": "secret", "display": _visibility_display("secret", "dm"),
-                        "label": "DM送信（本文・宛先は非公開）"})
+            visible_messages = [_project_message(m, view) for m in msgs]
             result["rounds"][rn] = {
                 "markets": [], "commits": [], "cash": {}, "holdings": {},
                 "contracts": [], "messages": visible_messages, "eliminated": [],
                 "final_reflections": [],
             }
         return result
-
-    events = _cache.get_entries(events_file)
 
     def rnd(r: Any) -> dict[str, Any]:
         rn = str(r)
@@ -1022,6 +1162,7 @@ def get_round_states(
         defeat_cause = data.get("defeat_cause") or None
         rd["final_reflections"].append({
             "player_id": player_id,
+            "variant": data.get("variant") or "elimination",
             "emotion": emotion,
             "defeat_cause": defeat_cause,
             "comment": comment,
@@ -1213,38 +1354,7 @@ def get_round_states(
         }
         # メッセージ
         raw_messages = messages_by_round.get(rn, [])
-        rd["messages"] = []
-        for message in raw_messages:
-            msg_type = message.get("type", "")
-            if msg_type == "broadcast":
-                rd["messages"].append({
-                    "sender": message.get("sender"), "type": msg_type,
-                    "message": message.get("message", ""), "turn": message.get("turn"),
-                    "round": message.get("round"), "visibility": "public",
-                    "display": _visibility_display("public", msg_type),
-                })
-            elif msg_type == "anonymous_broadcast":
-                public_message = {
-                    "sender": None, "type": msg_type, "message": message.get("message", ""),
-                    "turn": message.get("turn"), "round": message.get("round"), "anonymous": True,
-                    "visibility": "public", "display": _visibility_display("public", msg_type),
-                }
-                if view == "god":
-                    public_message["actual_sender"] = message.get("actual_sender")
-                rd["messages"].append(public_message)
-            elif view == "god":
-                rd["messages"].append({
-                    "sender": message.get("sender"), "to": message.get("to"), "type": "dm",
-                    "message": message.get("message", ""), "turn": message.get("turn"),
-                    "round": message.get("round"), "visibility": "secret",
-                    "display": _visibility_display("secret", "dm"),
-                })
-            else:
-                rd["messages"].append({
-                    "type": "dm", "turn": message.get("turn"), "round": message.get("round"),
-                    "visibility": "secret", "display": _visibility_display("secret", "dm"),
-                    "label": "DM送信（本文・宛先は非公開）",
-                })
+        rd["messages"] = [_project_message(m, view) for m in raw_messages]
         # 契約の「このラウンド時点」スナップショット（round_created ≤ R）
         rd["contracts"] = [
             {

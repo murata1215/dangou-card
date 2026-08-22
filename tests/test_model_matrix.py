@@ -1457,7 +1457,10 @@ def test_phase2_core18_reservations_cover_model_overrides_and_flag_h4_cap_gap():
     assert reservations["H4"] > defaults["max_cost_per_model"]
     assert all(cost <= defaults["max_cost_per_model"] for key, cost in reservations.items() if key != "H4")
     # H1/M3/H3はStructured Outputs schemaの入力reserveを含む。
-    assert reservations["H1"] == pytest.approx(0.0268, abs=1e-12)
+    # 2026-08-22サイクル「脱落済みplayer宛DM問題」でRULES_SUMMARYへ脱落公示/アクション枠
+    # フィードバックの文言を追加し、system prompt長が変化したため期待値を更新（意図的な
+    # 一度きりの変更。このコミットを跨ぐキャッシュ率・コスト予約値は比較不可）。
+    assert reservations["H1"] == pytest.approx(0.027485, abs=1e-12)
     for key in ("H1", "H2", "H4"):
         assert reservations[key] > 0.02
         if key != "H4":

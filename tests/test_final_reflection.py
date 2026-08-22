@@ -37,7 +37,7 @@ from engine.game import Game
 from engine.negotiation import StubAgent
 from engine.models import MarketCommit
 
-from llm.prompt_builder import build_final_reflection_prompt
+from llm.prompt_builder import build_final_reflection_prompt, build_completion_reflection_prompt
 from llm.response_parser import parse_final_reflection, VALID_EMOTIONS
 
 from tests.conftest import make_player, make_market
@@ -782,3 +782,164 @@ class TestR12OfflineCrossCheck:
         assert survivor_ids == expected_survivors
         for pid in expected_survivors:
             assert pid not in derived_map, f"survivor {pid} incorrectly derived"
+
+
+class RecordingBothVariantsAgent(StubAgent):
+    """final_reflect() / completion_reflect() 両方の呼び出しを記録するテスト用エージェント"""
+
+    def __init__(self):
+        self.final_reflect_calls: list[tuple[str, int, dict]] = []
+        self.completion_reflect_calls: list[tuple[str, int, dict]] = []
+
+    def final_reflect(self, player_state, round_num, visible_state, elimination_context):
+        self.final_reflect_calls.append(
+            (player_state.player_id, round_num, elimination_context)
+        )
+        return {
+            "status": "ok", "comment": "負けた", "emotion": "哀",
+            "defeat_cause": "資金不足", "chars": 3, "truncated": False,
+        }
+
+    def completion_reflect(self, player_state, round_num, visible_state, completion_context):
+        self.completion_reflect_calls.append(
+            (player_state.player_id, round_num, completion_context)
+        )
+        return {
+            "status": "ok", "comment": "生き残った", "emotion": "楽",
+            "defeat_cause": "慎重な立ち回り", "chars": 5, "truncated": False,
+        }
+
+
+class TestFinalReflectionFiringMatrix:
+    """FINAL_REFLECTIONのelimination/completion variant発火マトリクス"""
+
+    def test_r3_elimination_fires_once_then_never(self):
+        config = GameConfig.baseline_v1_s2(8).model_copy(update={"num_rounds": 12})
+        game, agents = _make_game(config, agent_factory=RecordingBothVariantsAgent)
+        _settle_round(game, 3)
+        _eliminate(game, "P02", 3)
+        game._phase_final_reflection(3)
+        for r in range(4, 13):
+            game._phase_final_reflection(r)
+
+        assert len(agents["P02"].final_reflect_calls) == 1
+        assert agents["P02"].completion_reflect_calls == []
+
+    def test_r12_condition_not_met_gets_elimination_variant_once(self):
+        config = GameConfig.baseline_v1_s2(8).model_copy(update={"num_rounds": 12})
+        game, agents = _make_game(config, agent_factory=RecordingBothVariantsAgent)
+        _settle_round(game, 12)
+        _eliminate(game, "P02", 12, reason="condition_not_met")
+        game._phase_final_reflection(12)
+
+        assert len(agents["P02"].final_reflect_calls) == 1
+        assert agents["P02"].completion_reflect_calls == []
+        events = [
+            e for e in game.logger.events
+            if e.event_type == "FINAL_REFLECTION" and e.data["player_id"] == "P02"
+        ]
+        assert len(events) == 1
+        assert events[0].data["variant"] == "elimination"
+
+    def test_r12_survivor_gets_completion_variant_once(self):
+        config = GameConfig.baseline_v1_s2(8).model_copy(update={"num_rounds": 12})
+        game, agents = _make_game(config, agent_factory=RecordingBothVariantsAgent)
+        # 実際の資金蓄積を経由せず、生還条件（借金0・現金≧survival_cash）を
+        # state直接操作で満たす（_eliminate()と同じ先例。_phase_finance(12)の
+        # 実処理を経由せず、_phase_final_reflection(12)単体のpass2ロジックを検証する）
+        for pid, p in list(game.players.items()):
+            game.players[pid] = p.model_copy(update={
+                "cash": config.survival_cash, "debt_balance": 0,
+            })
+        game._phase_final_reflection(12)
+
+        for agent in agents.values():
+            assert len(agent.completion_reflect_calls) == 1
+            assert agent.final_reflect_calls == []
+        events = [e for e in game.logger.events if e.event_type == "FINAL_REFLECTION"]
+        assert len(events) == 8
+        assert all(e.data["variant"] == "completion" for e in events)
+
+    def test_game_wide_total_is_exactly_twelve(self):
+        """7脱落＋5生還（trial_C_l12_r12_20260822の形）でFINAL_REFLECTIONが12件、
+        pid集合が全ロスターと一致すること"""
+        config = GameConfig.baseline_v1_s2(12).model_copy(update={"num_rounds": 12})
+        game, agents = _make_game(
+            config, agent_factory=RecordingBothVariantsAgent, num_players=12,
+        )
+        _settle_round(game, 1)
+        eliminated_map = {
+            "P11": 3, "P02": 5, "P09": 6, "P06": 9, "P01": 11, "P07": 11, "P12": 12,
+        }
+        for pid, r in eliminated_map.items():
+            _eliminate(game, pid, r)
+        for r in range(1, 13):
+            game._phase_final_reflection(r)
+
+        events = [e for e in game.logger.events if e.event_type == "FINAL_REFLECTION"]
+        assert len(events) == 12
+        assert {e.data["player_id"] for e in events} == set(agents)
+        eliminated_events = {
+            e.data["player_id"] for e in events if e.data["variant"] == "elimination"
+        }
+        completion_events = {
+            e.data["player_id"] for e in events if e.data["variant"] == "completion"
+        }
+        assert eliminated_events == set(eliminated_map)
+        assert completion_events == set(agents) - set(eliminated_map)
+
+    def test_duplicate_elimination_events_do_not_double_fire(self):
+        config = GameConfig.baseline_v1_s2(8).model_copy(update={"num_rounds": 12})
+        game, agents = _make_game(config, agent_factory=RecordingBothVariantsAgent)
+        _settle_round(game, 3)
+        _eliminate(game, "P02", 3, "contract_violation")
+        game.logger.log("ELIMINATION", 3, "settlement", step=7, data={
+            "player_id": "P02", "reason": "contract_violation",
+        })
+        game._phase_final_reflection(3)
+        game.logger.log("ELIMINATION", 3, "settlement", step=7, data={
+            "player_id": "P02", "reason": "contract_violation",
+        })
+        game._phase_final_reflection(3)  # 再invoke
+
+        assert len(agents["P02"].final_reflect_calls) == 1
+
+    def test_completion_prompt_never_says_eliminated(self):
+        config = GameConfig.baseline_v1_s2(4).model_copy(update={"num_rounds": 3})
+        agents = {f"P{i+1:02d}": StubAgent() for i in range(4)}
+        game = Game(config=config, agents=agents, seed=42, logger=EventLogger())
+        game._setup()
+        ctx = game._build_completion_context("P01", 3)
+        visible_state = game._build_visible_state(3, for_player_id="P01")
+
+        prompt = build_completion_reflection_prompt(
+            game.players["P01"], 3, visible_state, config, ctx,
+        )
+
+        assert "脱落" not in prompt
+
+    def test_stop_after_round_produces_zero_completion_events(self):
+        config = GameConfig.baseline_v1_s2(1).model_copy(update={"num_rounds": 12})
+        agent = RecordingBothVariantsAgent()
+        logger = EventLogger(fixed_timestamp="t")
+        result = Game(config, {"P01": agent}, logger=logger, stop_after_round=3).run()
+
+        assert result.round_count == 3
+        assert agent.completion_reflect_calls == []
+        events = [e for e in logger.events if e.event_type == "FINAL_REFLECTION"]
+        assert all(e.data.get("variant") != "completion" for e in events)
+
+    def test_state_and_memory_unmutated(self):
+        config = GameConfig.baseline_v1_s2(4).model_copy(update={"num_rounds": 3})
+        game, agents = _make_game(
+            config, agent_factory=RecordingBothVariantsAgent, num_players=4,
+        )
+        _settle_round(game, 3)
+        players_before = {pid: p.model_copy() for pid, p in game.players.items()}
+        contracts_before = list(game.contracts)
+
+        game._phase_final_reflection(3)
+
+        for pid, p in game.players.items():
+            assert p == players_before[pid]
+        assert game.contracts == contracts_before

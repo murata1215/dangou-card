@@ -157,6 +157,28 @@ class GameConfig(BaseModel):
     疎通試験で旧値1000だとL1(claude-haiku-4-5)がfinish_reason=max_tokens
     で出力途中切断されることを実測したため引き上げた。"""
 
+    # --- ゲーム終了後の全員答え合わせ（POST_GAME_REFLECTION） ---
+    post_game_reflection_enabled: bool = False
+    """
+    True: ゲーム完全終了後（結果確定・GAME_END後）、全player（脱落者＋生還者）に
+    1回だけ神視点の答え合わせ振り返りを書かせる。匿名通信の真の掲載者・DM本文・
+    秘密契約条項などゲーム中は秘匿されていた情報をpromptに投入する唯一のcall。
+    ゲーム結果・勝敗・資産・契約・生存判定には一切影響しない演出/記録専用。
+    既定Falseで旧挙動保持。本サイクルではプリセット（default_8_s2/baseline_v1_s2）
+    でもFalseのまま据え置き、smokeで実入力トークンを実測してから別コミットで有効化する。
+    """
+
+    post_game_reflection_max_chars: int = 1000
+    """POST_GAME_REFLECTIONの散文フィールド1つあたりの保存上限目安。
+    comment単独の上限であり、他の任意フィールドを含めた合計上限は
+    parse_post_game_reflection()側で別途1,800字に制御する。"""
+
+    post_game_reflection_max_tokens: int = 3000
+    """post_game_reflection callだけに適用するmax_output_tokens。
+    final_reflection_max_tokensと同じ3000を据え置く。FINAL_REFLECTION実測
+    （L1 687 / L6 571 tok、上限の19〜23%）はフィールド数がPOST_GAMEの
+    7キーの半分程度であり、それでも上限に対して十分な余裕がある。"""
+
     # --- 本戦LLMコスト上限（GameCostBudgetを明示注入した試合だけで有効） ---
     per_player_game_cost_cap_usd: float = 5.0
     """本戦1試合におけるplayer単位のLLMコスト上限（USD）"""

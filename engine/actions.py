@@ -106,6 +106,16 @@ def validate_action(
         # 発行料はFreeCash非適用（システム向け支払い、§2.4）
         if player.cash < config.contract_fee:
             return ActionResult(False, "Insufficient cash for contract fee")
+        # 相手方は全員生存していること。脱落者は署名できず§6.3で当該義務は失効するため、
+        # 成立しえない契約に発行料10万を払わせない。
+        # NOTE: 資金チェックより後に置くこと（test_acceptance.py::test_15 が
+        #       相手をplayers dictに含めずに "insufficient cash" を期待する）。
+        for target_pid in action.with_players:
+            if target_pid == action.player_id:
+                continue
+            target = players.get(target_pid)
+            if target is None or not target.is_alive:
+                return ActionResult(False, f"Counterparty {target_pid} is not alive")
         return ActionResult(True)
 
     if isinstance(action, ContractSignAction):
@@ -171,6 +181,13 @@ def validate_action(
             return ActionResult(False, f"Invalid card rank: {action.receive_card}")
         if action.cash_amount > 0 and action.cash_amount > player.free_cash:
             return ActionResult(False, "Insufficient free cash for trade payment")
+        # 生存宛先が1人もいなければ不成立。1人でも生きていれば提案は成立させ、
+        # 脱落宛先は engine/game.py:536-539 の既存スキップに委ねる。
+        if not any(
+            (t := players.get(p)) is not None and t.is_alive
+            for p in action.with_players
+        ):
+            return ActionResult(False, "No living target for card trade")
         return ActionResult(True)
 
     if isinstance(action, CardTradeAcceptAction):
