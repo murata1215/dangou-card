@@ -27,6 +27,22 @@ ELIMINATION_EVENT_TYPES = (
 )
 
 
+def _elimination_round(event: dict[str, Any]) -> int | None:
+    """脱落イベントから表示用のラウンド番号を取り出す。
+
+    表示側は「不明なら何も出さない」方針なので、確信が持てない値は
+    すべて None（不明）に倒す:
+      - round_num が無い / None（旧runのログ）
+      - int 以外（"5" のような文字列や float）
+      - 0以下（setupフェーズのイベントは round_num=0。R0脱落は存在しない）
+    bool は Python では int のサブクラスなので明示的に除外する。
+    """
+    r = event.get("round_num")
+    if isinstance(r, bool) or not isinstance(r, int):
+        return None
+    return r if r >= 1 else None
+
+
 class LogCache:
     """ファイル差分キャッシュ（mtime+sizeベース）"""
 
@@ -305,6 +321,7 @@ def get_game_state(logs_dir: Path, trial_dir_name: str, game_id: str) -> dict[st
             "model_id": model_id,
             "model_name": model_label,
             "status": "alive",
+            "elimination_round": None,  # 脱落ラウンド。生存中・不明は None
             "latest_phase": latest_phase,
             "latest_round": latest_round,
             "strategy_summary": _truncate_strategy(strategy_summary),
@@ -332,10 +349,31 @@ def get_game_state(logs_dir: Path, trial_dir_name: str, game_id: str) -> dict[st
     # イベントログから脱落情報を取得
     events_file = trial_dir / f"{game_id}_events.jsonl"
     eliminated: list[str] = []
+    elim_round_by_pid: dict[str, int] = {}
     cash_by_pid: dict[str, int] = {}
     debt_by_pid: dict[str, int] = {}
     loan_by_pid: dict[str, int] = {}
     game_config: dict[str, Any] = {}
+
+    def mark_eliminated(pid: str, event: dict[str, Any]) -> None:
+        """脱落者を先勝ちで記録する（rules/project.md の「先勝ち」規則）。
+
+        Engineは1回の脱落に対し複数イベントを出す（SURVIVAL_CHECK+
+        FORCED_LIQUIDATION 等）。名簿への登録は従来どおり先勝ちのまま。
+        ラウンドだけは「最初に判明した値」を採用する: 先着イベントの
+        round_num が欠落/不正だった場合に後続イベントで補完できるようにし、
+        表示が不必要に「不明」へ倒れるのを防ぐ。実ログでは重複イベントの
+        round_num は一致するため、通常は先着イベントの値がそのまま入る。
+        """
+        if not pid:
+            return
+        if pid not in eliminated:
+            eliminated.append(pid)
+        if elim_round_by_pid.get(pid) is None:
+            r = _elimination_round(event)
+            if r is not None:
+                elim_round_by_pid[pid] = r
+
     if events_file.exists():
         events = _cache.get_entries(events_file)
         for e in events:
@@ -348,15 +386,11 @@ def get_game_state(logs_dir: Path, trial_dir_name: str, game_id: str) -> dict[st
                 if pid:
                     loan_by_pid[pid] = data.get("loan_amount", 0)
             elif et in ELIMINATION_EVENT_TYPES:
-                pid = e.get("data", {}).get("player_id", "")
-                if pid and pid not in eliminated:
-                    eliminated.append(pid)
+                mark_eliminated(e.get("data", {}).get("player_id", ""), e)
             elif et == "SURVIVAL_CHECK":
                 data = e.get("data", {})
                 if data.get("result") == "eliminated":
-                    pid = data.get("player_id", "")
-                    if pid and pid not in eliminated:
-                        eliminated.append(pid)
+                    mark_eliminated(data.get("player_id", ""), e)
             elif et == "SNAPSHOT":
                 # SNAPSHOTから各プレイヤーの所持金・借金を取得
                 # debt = cash - free_cash（free_cash > 0 のとき正確）
@@ -381,6 +415,7 @@ def get_game_state(logs_dir: Path, trial_dir_name: str, game_id: str) -> dict[st
             pid = p["player_id"]
             if pid in eliminated:
                 p["status"] = "eliminated"
+                p["elimination_round"] = elim_round_by_pid.get(pid)
             if pid in cash_by_pid:
                 p["cash"] = cash_by_pid[pid]
             if pid in debt_by_pid:
@@ -414,17 +449,23 @@ def _truncate_strategy(s: dict | None) -> dict | None:
 
 
 def _extract_emotion(entry: dict[str, Any]) -> str:
-    """ログエントリからemotionを抽出する。なければ平静を返す"""
+    """ログエントリからemotionを抽出する。なければ平静を返す
+
+    許容値は llm.response_parser.VALID_EMOTIONS（正典・7値）に委譲する。
+    以前はここに6値をハードコードしており "奸" が抜けていたため、
+    実run約15%の感情が誤って "平静" に化けていた（smirk画像も到達不能だった）。
+    正典と二重管理しないこと。
+    """
     # まずログエントリのemotionフィールドを確認
     em = entry.get("emotion")
-    if em and em in {"喜", "怒", "哀", "楽", "焦", "疑"}:
+    if em in VALID_EMOTIONS:
         return em
     # strategyから抽出
     resp = entry.get("response_text", "")
     s = _extract_strategy(resp)
     if s and isinstance(s, dict):
         em = s.get("emotion", "")
-        if em in {"喜", "怒", "哀", "楽", "焦", "疑"}:
+        if em in VALID_EMOTIONS:
             return em
     return "平静"
 
@@ -437,6 +478,7 @@ def _visibility_display(visibility: str, kind: str) -> dict[str, str]:
         "anonymous_broadcast": ("🎭", "匿名発言"),
         "contract_propose": ("📜 🔒", "秘匿契約"),
         "contract_sign": ("📜", "契約署名"),
+        "contract_cancel": ("📜🚫", "契約解除"),
     }
     icon, label = labels.get(kind, ("🌐" if visibility == "public" else "🔒", "公開" if visibility == "public" else "秘匿"))
     return {"icon": icon, "label": label}
@@ -483,7 +525,7 @@ def get_player_timeline(
             item["type"] = "action"
             item["action_type"] = action.get("type", "?")
             action_type = action.get("type")
-            secret_action = action_type in {"dm", "anonymous_broadcast", "contract_propose", "contract_sign"}
+            secret_action = action_type in {"dm", "anonymous_broadcast", "contract_propose", "contract_sign", "contract_cancel"}
             item["visibility"] = "secret" if secret_action else "public"
             item["display"] = _visibility_display(item["visibility"], str(action_type))
             if action_type == "broadcast":
@@ -500,6 +542,8 @@ def get_player_timeline(
                 item["content"] = f"{action.get('market_id','?')} / {action.get('card','?')}"
             elif action_type == "contract_sign" and view == "god":
                 item["contract_id"] = action.get("contract_id")
+            elif action_type == "contract_cancel" and view == "god":
+                item["contract_id"] = action.get("contract_id")
             elif action_type == "contract_propose" and view == "god":
                 item["terms"] = action.get("terms", [])
             if action_type == "dm" and view == "god":
@@ -515,7 +559,7 @@ def get_player_timeline(
 
         # reasoning（折りたたみ用）：response_textの先頭200文字
         # 構造化された秘匿actionの応答プレビューはpublicで返さない。
-        if resp and len(resp) > 50 and not (action and action.get("type") in {"dm", "anonymous_broadcast", "contract_propose", "contract_sign"} and view == "public"):
+        if resp and len(resp) > 50 and not (action and action.get("type") in {"dm", "anonymous_broadcast", "contract_propose", "contract_sign", "contract_cancel"} and view == "public"):
             item["reasoning_preview"] = resp[:200]
 
         timeline.append(item)
@@ -577,7 +621,7 @@ def _safe_action(action: dict[str, Any] | None, view: str = "public") -> dict[st
         return None
     action_type = str(action.get("type", "unknown"))
     view = _validate_view(view)
-    secret = action_type in {"dm", "anonymous_broadcast", "contract_propose", "contract_sign"}
+    secret = action_type in {"dm", "anonymous_broadcast", "contract_propose", "contract_sign", "contract_cancel"}
     result: dict[str, Any] = {
         "type": action_type,
         "visibility": "secret" if secret else "public",
@@ -598,9 +642,9 @@ def _safe_action(action: dict[str, Any] | None, view: str = "public") -> dict[st
     elif action_type == "market_commit":
         result["market_id"] = action.get("market_id")
         result["card"] = action.get("card")
-    elif action_type in {"contract_propose", "contract_sign"}:
-        # 契約条項は非公開。IDは契約署名の追跡に必要な公開識別子だけを残す。
-        if action_type == "contract_sign" and action.get("contract_id"):
+    elif action_type in {"contract_propose", "contract_sign", "contract_cancel"}:
+        # 契約条項は非公開。IDは契約署名・解除の追跡に必要な公開識別子だけを残す。
+        if action_type in {"contract_sign", "contract_cancel"} and action.get("contract_id"):
             result["contract_id"] = action["contract_id"]
         if view == "god" and action_type == "contract_propose":
             result["terms"] = action.get("terms", [])
@@ -629,7 +673,10 @@ def _safe_round_result(
             })
 
     # get_round_states()は内部利用の契約termsを含むため、ここでは公開フィールドだけに縮退する。
-    contract_keys = ("contract_id", "proposer", "parties", "signed_by", "round_created")
+    contract_keys = (
+        "contract_id", "proposer", "parties", "signed_by", "round_created",
+        "cancelled", "cancelled_round", "cancel_requested_by",
+    )
     if view == "god":
         contract_keys += ("terms", "outcomes")
     contracts = [
@@ -751,7 +798,7 @@ def get_player_round_detail(
         if not isinstance(reasoning, str) and data and isinstance(data.get("reasoning"), str):
             reasoning = data["reasoning"]
         thinking_tokens = entry.get("reasoning_tokens", 0) or 0
-        sensitive_action = action and action.get("type") in {"dm", "anonymous_broadcast", "contract_propose", "contract_sign"}
+        sensitive_action = action and action.get("type") in {"dm", "anonymous_broadcast", "contract_propose", "contract_sign", "contract_cancel"}
         safe_action = _safe_action(action, view=view)
         if view == "god" and safe_action and safe_action.get("type") in {"dm", "anonymous_broadcast"}:
             # player別ログのファイル名が送信者を確定する。生応答には混ぜない。
@@ -762,6 +809,14 @@ def get_player_round_detail(
             "timestamp": entry.get("timestamp", ""),
             "action": safe_action,
             "reasoning": reasoning if isinstance(reasoning, str) and not (view == "public" and sensitive_action) else None,
+            # 発言カードに感情を出すための派生値（entry由来・秘匿情報を含まない）。
+            # publicでは sensitive_action（dm/匿名/契約）について抑制する。emotionは
+            # 匿名発言の発信者を選手パネルのemotionと突き合わせて推定する
+            # 側面路になりうるため、reasoning と同じ境界に揃える。
+            "emotion": (
+                None if (view == "public" and sensitive_action)
+                else _extract_emotion(entry)
+            ),
             "native_thinking": {"tokens": thinking_tokens, "source": "usage" if thinking_tokens else "unavailable"},
             "usage": {"input_tokens": entry.get("input_tokens", 0) or 0,
                       "output_tokens": entry.get("output_tokens", 0) or 0},
@@ -959,6 +1014,8 @@ def _project_message(message: dict[str, Any], view: str) -> dict[str, Any]:
             "message": message.get("message", ""), "turn": message.get("turn"),
             "round": message.get("round"), "visibility": "public",
             "display": _visibility_display("public", msg_type),
+            # 発信者が公開されている発言なので emotion も public でよい。
+            "emotion": message.get("emotion"),
         }
         return _with_delivery(item) if view == "god" else item
     if msg_type == "anonymous_broadcast":
@@ -969,6 +1026,9 @@ def _project_message(message: dict[str, Any], view: str) -> dict[str, Any]:
         }
         if view == "god":
             item["actual_sender"] = message.get("actual_sender")
+            # emotionは発信者の指紋になりうる（選手パネル/他カードのemotionと
+            # 突き合わせると匿名発信者を絞り込める）ため god 限定。
+            item["emotion"] = message.get("emotion")
             item = _with_delivery(item)
         return item
     if view == "god":
@@ -977,6 +1037,7 @@ def _project_message(message: dict[str, Any], view: str) -> dict[str, Any]:
             "message": message.get("message", ""), "turn": message.get("turn"),
             "round": message.get("round"), "visibility": "secret",
             "display": _visibility_display("secret", "dm"),
+            "emotion": message.get("emotion"),
         }
         return _with_delivery(item)
     return {
@@ -998,7 +1059,7 @@ def _collect_round_messages(
     の旧ログ/旧呼び出しを含む）は付与しない。
 
     Returns:
-        {"1": [{sender, to?, type, message, turn, round, delivery?, reject_reason?}, ...], ...}
+        {"1": [{sender, to?, type, message, turn, round, emotion, delivery?, reject_reason?}, ...], ...}
     """
     llm_logs_dir = trial_dir / "llm_logs"
     by_round: dict[str, list[dict[str, Any]]] = {}
@@ -1022,6 +1083,7 @@ def _collect_round_messages(
                 "message": str(a.get("message", "")),
                 "turn": e.get("turn"),
                 "round": e.get("round_num", 0),
+                "emotion": _extract_emotion(e),
             }
             if at != "anonymous_broadcast":
                 rec["sender"] = pid
@@ -1044,6 +1106,29 @@ def _collect_round_messages(
     for rn in by_round:
         by_round[rn].sort(key=lambda r: (r["turn"] is None, r["turn"] or 0))
     return by_round
+
+
+_OBLIGATION_ID_RE = re.compile(r"^(C_[0-9a-fA-F]{8})_OB\d+$")
+
+
+def _contract_id_of_outcome(data: dict[str, Any]) -> str | None:
+    """履行/違反イベントから契約IDを取り出す。
+
+    engine側イベントは contract_id を直接持たないことが多い（実ログ全24trialで
+    TYPE_A_EXECUTION/TYPE_A_FAILURE/TYPE_B_VIOLATION/AUTO_COMMIT/
+    AUTO_COMMIT_FAILUREいずれも0件）ため、obligation_id
+    (`{contract_id}_OB{nn}`; engine/models.py の採番規則) から復元する。
+    形式に合致しないものは推測せず None を返す。TYPE_A_FAILURE / AUTO_COMMIT /
+    AUTO_COMMIT_FAILURE は obligation_id を持たないため自然に None になる。
+    """
+    cid = data.get("contract_id")
+    if isinstance(cid, str) and cid:
+        return cid
+    ob = data.get("obligation_id")
+    if not isinstance(ob, str):
+        return None
+    m = _OBLIGATION_ID_RE.match(ob)
+    return m.group(1) if m else None
 
 
 def _collect_contract_terms(
@@ -1288,6 +1373,8 @@ def get_round_states(
                         "signed_by": [proposer],
                         "round_created": r,
                         "terms": terms,
+                        "cancel_requested_by": [],
+                        "cancelled_round": None,
                     }
             elif act == "contract_sign":
                 cid = data.get("contract_id")
@@ -1295,11 +1382,30 @@ def get_round_states(
                 c = contracts.get(cid)
                 if c and signer and signer not in c["signed_by"]:
                     c["signed_by"].append(signer)
+            elif act == "contract_cancel":
+                cid = data.get("contract_id")
+                requester = data.get("player_id", "")
+                c = contracts.get(cid)
+                if c and requester and requester not in c["cancel_requested_by"]:
+                    c["cancel_requested_by"].append(requester)
+
+        elif et == "CONTRACT_CANCELLED":
+            rnd(r)
+            cid = data.get("contract_id")
+            c = contracts.get(cid)
+            if c is not None:
+                c["cancelled_round"] = r
+                c["cancelled_turn"] = data.get("turn")
+                for pid in data.get("cancel_requested_by", []):
+                    if pid not in c["cancel_requested_by"]:
+                        c["cancel_requested_by"].append(pid)
 
         elif et in {"TYPE_A_EXECUTION", "TYPE_A_FAILURE", "TYPE_B_VIOLATION", "AUTO_COMMIT", "AUTO_COMMIT_FAILURE"}:
             rd = rnd(r)
-            # すべての履行イベントにcontract_idがあるとは限らない。ある場合だけ契約に紐付ける。
-            cid = data.get("contract_id")
+            # すべての履行イベントにcontract_idがあるとは限らない。
+            # obligation_id からの復元も含め、判明した場合だけ契約に紐付ける
+            # （_contract_id_of_outcome）。
+            cid = _contract_id_of_outcome(data)
             if cid in contracts:
                 contracts[cid].setdefault("outcomes", []).append({
                     "event_type": et, "round": r, "data": dict(data),
@@ -1367,6 +1473,11 @@ def get_round_states(
                 "outcomes": c.get("outcomes", []) if view == "god" else [],
                 "visibility": "secret" if view == "god" and c["terms"] is not None else "public",
                 "display": _visibility_display("secret", "contract_propose") if c["terms"] is not None else _visibility_display("public", "contract_sign"),
+                # 解除の事実は既存の契約ID・当事者・statusと同粒度の情報のため、
+                # public/god の両方に出す（terms/outcomesは従来どおりgod限定）。
+                "cancelled": bool(c.get("cancelled_round")) and c["cancelled_round"] <= r_int,
+                "cancelled_round": c.get("cancelled_round") if c.get("cancelled_round") and c["cancelled_round"] <= r_int else None,
+                "cancel_requested_by": list(c.get("cancel_requested_by", [])),
             }
             for c in contracts.values()
             if c["round_created"] <= r_int

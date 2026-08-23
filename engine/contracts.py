@@ -358,3 +358,95 @@ def get_all_type_b_for_player(
                     )):
                 result.append(ob)
     return result
+
+
+def can_cancel_contract(
+    contract: Contract,
+    round_num: int,
+) -> tuple[bool, str | None]:
+    """
+    全当事者合意による契約解除（§6）の可否を導出する
+
+    永続的な「ロック済み」状態は持たず、義務のフラグと round_num から毎回導出する。
+    型B義務は正常履行でも is_fulfilled が立たない（audit_type_b は違反者のみを返す
+    仕様のため）。したがって「一度でも履行/監査済み」を捕捉するには
+    ob.round_num < round_num（=当該義務の期限Settlementを通過済み）も見る必要がある。
+
+    Negotiationは当該ラウンドのCommit/Settlementより前に走るため、
+    round_num == 現在R の義務はまだ未判定であり解除可能。
+
+    Args:
+        contract: 対象契約
+        round_num: 現在のラウンド番号
+
+    Returns:
+        (解除可能か, 不可の場合の理由)
+    """
+    if contract.status != ContractStatus.ACTIVE:
+        return False, f"Contract {contract.contract_id} is not active"
+    for ob in contract.obligations:
+        if ob.is_fulfilled:
+            return False, f"Contract {contract.contract_id} has a fulfilled obligation"
+        if ob.is_expired:
+            return False, f"Contract {contract.contract_id} has an expired obligation"
+        if ob.round_num < round_num:
+            return False, (
+                f"Contract {contract.contract_id} has an audited obligation "
+                f"(R{ob.round_num})"
+            )
+    return True, None
+
+
+def request_cancel(
+    contract: Contract,
+    requester: str,
+    alive_parties: set[str],
+    round_num: int,
+    turn: int,
+) -> tuple[Contract, bool]:
+    """
+    契約解除への同意を1件記録し、生存する全当事者が揃えば CANCELLED へ遷移させる
+
+    可否判定（can_cancel_contract）は呼び出し元（engine/actions.py の validate_action）
+    で propose時・最終同意時の両方に対して事前に行う。ここでは同意の集約と、
+    最終同意で成立する瞬間に未処理義務を失効させる処理のみを行う。
+
+    Args:
+        contract: 対象契約
+        requester: 今回同意したプレイヤーID
+        alive_parties: 生存しているプレイヤーIDの集合（脱落者の同意は不要）
+        round_num: 現在のラウンド番号
+        turn: 現在の巡
+
+    Returns:
+        (更新された契約, 今回の同意で解除が成立したか)
+
+    Raises:
+        ValueError: requesterが当事者でない、または既に同意済みの場合
+    """
+    if requester not in contract.parties:
+        raise ValueError(f"{requester} is not a party of contract {contract.contract_id}")
+    if requester in contract.cancel_requested_by:
+        raise ValueError(
+            f"{requester} already requested cancel of contract {contract.contract_id}"
+        )
+
+    new_requested = list(contract.cancel_requested_by) + [requester]
+    required = {p for p in contract.parties if p in alive_parties}
+
+    if required and required <= set(new_requested):
+        # 生存する全当事者の同意が揃った → 解除成立
+        new_obligations = [
+            ob if (ob.is_fulfilled or ob.is_expired)
+            else ob.model_copy(update={"is_expired": True})
+            for ob in contract.obligations
+        ]
+        return contract.model_copy(update={
+            "cancel_requested_by": new_requested,
+            "status": ContractStatus.CANCELLED,
+            "cancelled_round": round_num,
+            "cancelled_turn": turn,
+            "obligations": new_obligations,
+        }), True
+
+    return contract.model_copy(update={"cancel_requested_by": new_requested}), False

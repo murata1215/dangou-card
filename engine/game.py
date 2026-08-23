@@ -12,9 +12,9 @@ from typing import Any
 from engine.config import GameConfig
 from engine.models import (
     PlayerState, Market, MarketCommit, MarketResult, Contract, ContractStatus, Bounty,
-    ObligationType,
+    Obligation, ObligationType,
     CardRank, Card, Action, PassAction, TransferAction, RepayAction,
-    ContractProposeAction, ContractSignAction, AnonymousBroadcastAction,
+    ContractProposeAction, ContractSignAction, ContractCancelAction, AnonymousBroadcastAction,
     BountyPostAction, BountyCancelAction, MarketCommitAction,
     DoubleUpDeposit,
     CardTradeProposal, CardTradeStatus,
@@ -67,6 +67,25 @@ class GameResult:
             f"GameResult(survivors={len(self.survivors)}, "
             f"eliminated={len(self.eliminated)})"
         )
+
+
+def _obligation_status(ob: Obligation, round_num: int) -> str:
+    """義務1件の表示用ステータスを導出する（表示専用・engine判定には非使用）
+
+    engine には義務レベルの status フィールドが無く、is_fulfilled / is_expired /
+    round_num の3つから読み手が組み立てる必要がある。優先順は
+    履行済 > 失効 > 期限経過 > 今R期限 > 未到来。
+    LLMプロンプト（my_contracts）向けの派生情報のみで、判定ロジックには影響しない。
+    """
+    if ob.is_fulfilled:
+        return "fulfilled"   # 履行済
+    if ob.is_expired:
+        return "expired"     # 失効（当事者脱落 §6.3 等）
+    if ob.round_num < round_num:
+        return "past"        # 期限経過（監査済み・もう発火しない）
+    if ob.round_num == round_num:
+        return "due"         # 今ラウンドが期限
+    return "upcoming"        # 未到来
 
 
 class Game:
@@ -125,6 +144,13 @@ class Game:
         # 当該ラウンドで不成立になった自分のアクション記録（player_id → list）。
         # 本人の visible_state にだけ返す私的情報。他プレイヤーには渡さない。
         self._action_failures: dict[str, list[dict]] = {}
+
+        # 当該ラウンドで自分が当事者の契約に起きた解除関連の状態変化（player_id → list）。
+        # 本人の visible_state にだけ返す私的情報。_round_messages / _god_transcript には
+        # 積まない（§8.2の秘匿境界を壊さないため。contract_cancel はメッセージを生成しないが、
+        # 相手当事者がそれに気づく手段が無いと AUTO_PASS_ON_NO_NEWS により起床せず、
+        # 全会一致に到達しない — この通知はその起床トリガ専用）。
+        self._contract_notices: dict[str, list[dict]] = {}
 
         # POST_GAME_REFLECTION専用の神視点transcript。ラウンド跨ぎで消さない。
         # 【絶対条件】_visible_messages() / _build_visible_state() から一切参照しない。
@@ -318,6 +344,7 @@ class Game:
         self._trade_counts = {pid: 0 for pid in self.players}
         self._round_messages = []  # ラウンド開始時にクリア
         self._action_failures = {pid: [] for pid in self.players}
+        self._contract_notices = {pid: [] for pid in self.players}
 
         alive_ids = [pid for pid, p in self.players.items() if p.is_alive]
 
@@ -344,6 +371,7 @@ class Game:
                 result = action_ops.validate_action(
                     action, p, self.config, self.players,
                     round_num, self._anon_broadcast_counts.get(pid, 0),
+                    contracts=self.contracts,
                 )
 
                 if isinstance(action, PassAction):
@@ -391,6 +419,9 @@ class Game:
 
     _ACTION_FAILURE_MEMO_MAX = 12
     """本人へ返す不成立記録の保持上限（1ラウンド最大10アクション＋余裕）"""
+
+    _CONTRACT_NOTICE_MAX = 12
+    """本人へ返す契約解除通知の保持上限（_ACTION_FAILURE_MEMO_MAX と同じ作法）"""
 
     def _record_action_failure(
         self, pid: str, action: Action, reason: str | None,
@@ -506,6 +537,63 @@ class Game:
                         "contract_id": action.contract_id,
                         "success": True, "turn": turn,
                     })
+                    break
+
+        elif isinstance(action, ContractCancelAction):
+            # 契約解除（全当事者合意・§6）。可否は validate_action で検証済みだが、
+            # 生存当事者の集合はここ（実行時点）で確定させる。
+            alive_parties = {pid_ for pid_, pl in self.players.items() if pl.is_alive}
+            for i, c in enumerate(self.contracts):
+                if c.contract_id == action.contract_id:
+                    updated, cancelled = contract_ops.request_cancel(
+                        c, pid, alive_parties, round_num, turn,
+                    )
+                    self.contracts[i] = updated
+
+                    # 解除は _round_messages を生成しないため、相手LLMが AUTO_PASS で
+                    # 起床せず全会一致に到達しない（llm/llm_agent.py の空回り削減機構との
+                    # 相互作用）。当事者だけに届く内部通知で起床させる。発言枠・アクション
+                    # 枠は消費せず、engine の判定ロジック（contract_ops）には一切影響しない
+                    # ——表示・起床専用の私的情報。
+                    notice: dict[str, Any] = {
+                        "turn": turn,
+                        "kind": "cancel_completed" if cancelled else "cancel_requested",
+                        "contract_id": updated.contract_id,
+                        "by": pid,
+                        "cancel_requested_by": list(updated.cancel_requested_by),
+                        "pending": [
+                            p for p in updated.parties
+                            if p in self.players and self.players[p].is_alive
+                            and p not in updated.cancel_requested_by
+                        ],
+                    }
+                    # 送信先は「自分以外の生存当事者」。成立(cancelled)・部分同意
+                    # (未成立)のどちらも同じ規則で届く——要求者自身はイベントを直接
+                    # 見ているため対象外、脱落者は届けても読めないため対象外。
+                    recipients = [
+                        p for p in updated.parties
+                        if p != pid and p in self.players and self.players[p].is_alive
+                    ]
+                    for p in recipients:
+                        bucket = self._contract_notices.setdefault(p, [])
+                        bucket.append(dict(notice))
+                        if len(bucket) > self._CONTRACT_NOTICE_MAX:
+                            del bucket[: -self._CONTRACT_NOTICE_MAX]
+
+                    self.logger.log("NEGOTIATION_ACTION", round_num, "negotiation", data={
+                        "player_id": pid, "action": "contract_cancel",
+                        "contract_id": action.contract_id,
+                        "cancel_requested_by": list(updated.cancel_requested_by),
+                        "parties": list(updated.parties),
+                        "cancelled": cancelled, "success": True, "turn": turn,
+                    })
+                    if cancelled:
+                        self.logger.log("CONTRACT_CANCELLED", round_num, "negotiation", data={
+                            "contract_id": action.contract_id,
+                            "parties": list(updated.parties),
+                            "cancel_requested_by": list(updated.cancel_requested_by),
+                            "turn": turn,
+                        })
                     break
 
         elif isinstance(action, AnonymousBroadcastAction):
@@ -1377,6 +1465,11 @@ class Game:
         contract_ledger: list[str] = []
         violation_ledger: list[str] = []
         for contract in self.contracts:
+            # 解除済み契約（§6・全当事者合意）の義務は「－解除」で表示し、
+            # ✓履行/✗違反のいずれにも混入させない（request_cancel が未処理義務を
+            # is_expired=True にするだけで消しはしないため、区別しないと"✓履行"と
+            # 誤表示される）。
+            cancelled = contract.status == ContractStatus.CANCELLED
             for ob in contract.obligations:
                 label = ob_type_labels.get(ob.ob_type, str(ob.ob_type))
                 if ob.ob_type == ObligationType.TYPE_A_PAYMENT:
@@ -1389,7 +1482,9 @@ class Game:
                 else:
                     detail_label = str(ob.details.get("market_id", "?"))
 
-                if ob.round_num > result.round_count:
+                if cancelled:
+                    status = f"－解除(R{contract.cancelled_round})"
+                elif ob.round_num > result.round_count:
                     status = "－未到達"
                 elif ob.ob_type == ObligationType.TYPE_A_PAYMENT:
                     status = "✗不履行" if (ob.round_num, ob.obligor) in type_a_failed_pairs else "✓履行"
@@ -1630,6 +1725,13 @@ class Game:
                 out.append(dict(m))
         return out
 
+    def _eliminated_parties(self, parties: list[str]) -> list[str]:
+        """契約当事者のうち脱落済みの者を返す（contracts_public / my_contracts で共有）"""
+        return [
+            pid for pid in parties
+            if pid in self.players and not self.players[pid].is_alive
+        ]
+
     def _build_visible_state(self, round_num: int, for_player_id: str | None = None) -> dict:
         """
         公開情報の辞書を構築する（§8）
@@ -1678,13 +1780,14 @@ class Game:
                     # engine/elimination.py:expire_obligations_for_player() で失効済みだが
                     # status は active のままなので、素で出すと「死んだ相手との契約が
                     # まだ生きている」と誤読される（D4）。
-                    "eliminated_parties": [
-                        pid for pid in c.parties
-                        if pid in self.players and not self.players[pid].is_alive
-                    ],
+                    "eliminated_parties": self._eliminated_parties(c.parties),
+                    # 全当事者合意による解除（§6）の履歴。契約ID・当事者・statusは
+                    # 元々全員に公開されている情報のため、解除ラウンドの追加公開は
+                    # 新たな秘匿情報の漏洩ではない（terms/outcomesは引き続きgod限定）。
+                    "cancelled_round": c.cancelled_round,
                 }
                 for c in self.contracts
-                if c.status.value in ("active", "completed")
+                if c.status.value in ("active", "completed", "cancelled")
             ],
             "bounties_public": [
                 {"bounty_id": b.bounty_id, "amount": b.amount,
@@ -1727,6 +1830,50 @@ class Game:
                 and for_player_id in c.parties
             ]
 
+            # 当事者向け: 自分が当事者である成立済み契約の全容（毎ラウンド再提示用）
+            # LLMは1-shot呼出しで会話履歴を持たず、契約の中身を保持する手段が
+            # 自由記述メモしかない。my_obligations は「今R以降に自分が履行すべき
+            # TODO」であり (a) 受益者側(counterparty)には何も出ない (b) 過去Rの
+            # 義務は消える。そのため「自分の契約が何だったか」を照会する経路が
+            # 存在せず、メモが劣化すると「activeだが内容不明の契約」に化けた
+            # （実run trial_C_l12_r12_20260822 の P03/C_90159021）。
+            # 秘匿性: contracts_pending と同じく for_player_id in c.parties で制限。
+            # engine判定ロジックには影響しない — プロンプトへの情報提示のみ。
+            #
+            # ACTIVE に加え CANCELLED も含める（§6・全当事者合意による契約解除）。
+            # 解除済み契約を落とすと「解除できたのか自分では確認できない」状態になる
+            # （authoritative ledgerから確認できることが要件）。解除済み契約の義務は
+            # ob_status を "cancelled" で一律上書きする（違反判定には影響しない・表示専用）。
+            state["my_contracts"] = [
+                {
+                    "contract_id": c.contract_id,
+                    "parties": list(c.parties),
+                    "round_created": c.round_created,
+                    "status": c.status.value,
+                    "eliminated_parties": self._eliminated_parties(c.parties),
+                    "cancelled_round": c.cancelled_round,
+                    "cancel_requested_by": list(c.cancel_requested_by),
+                    "obligations": [
+                        {
+                            "obligation_id": ob.obligation_id,
+                            "obligor": ob.obligor,
+                            "counterparty": ob.counterparty,
+                            "ob_type": ob.ob_type.value,
+                            "round_num": ob.round_num,
+                            "details": dict(ob.details),
+                            "ob_status": (
+                                "cancelled" if c.status == ContractStatus.CANCELLED
+                                else _obligation_status(ob, round_num)
+                            ),
+                        }
+                        for ob in c.obligations
+                    ],
+                }
+                for c in self.contracts
+                if c.status in (ContractStatus.ACTIVE, ContractStatus.CANCELLED)
+                and for_player_id in c.parties
+            ]
+
             # 当事者向け: 署名済み契約の未履行義務一覧（自分が obligor のもの）
             # 帳簿ミス起因の契約違反脱落を防ぐための情報提示（§7.3の思想を契約に適用）
             # engine判定ロジックには影響しない — プロンプトへの情報提示のみ
@@ -1753,6 +1900,14 @@ class Game:
             # アクション枠を自滅的に使い切る。engine判定には一切影響しない。
             state["my_failed_actions"] = [
                 dict(f) for f in self._action_failures.get(for_player_id, [])
+            ]
+
+            # 当事者向け: 自分が当事者の契約に起きた解除関連の状態変化（私的情報）。
+            # contract_cancel はメッセージを生成しないため、相手が読める手段が
+            # これしか無い。AUTO_PASS_ON_NO_NEWS の第3の起床トリガとして
+            # llm/llm_agent.py が件数の増分を見る。engine判定には影響しない。
+            state["my_contract_notices"] = [
+                dict(n) for n in self._contract_notices.get(for_player_id, [])
             ]
             state["my_action_budget"] = {
                 "used": self._action_counts.get(for_player_id, 0),

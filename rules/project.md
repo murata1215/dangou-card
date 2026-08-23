@@ -205,6 +205,145 @@ parse correction仕様を変更してはならない。担保テスト: `tests/t
 `get_game_state()`は元々 `if pid not in eliminated:` ガードで先勝ちだったため、
 `get_round_states()`側も同じ規則の `add_elimination()` ヘルパに揃える。
 
+`get_game_state()`の`players[].elimination_round`（player一覧カードの「R5脱落」表示用）も
+同じ先勝ち規則に従う（`mark_eliminated()`ヘルパ）。ただしラウンド番号だけは「最初に判明した
+値」を採用し、先着イベントの`round_num`が欠落/不正だった場合に後続イベントで補完できるように
+する。`round_num`が欠落・0以下・非int（旧runログ等）の場合は推測せず`None`のまま表示側で
+非表示にフォールバックする。
+
+## Viewerの秘密契約terms/outcomesは「engine正規化前のLLM生JSON」
+
+`get_round_states()`が返す契約`terms`は、engineが正規化した`Contract`/`Obligation`
+オブジェクトではなく、`_collect_contract_terms()`が`llm_logs/*_llm_calls.jsonl`の
+`contract_propose`アクションから直接拾った**LLM生出力**である。
+`engine/contracts.py`の`create_contract()`が行う`card`/`rank`→`card_rank`正規化や
+不正ランクの拒否は、Viewerのtermsには一切かかっていない。そのため`details`の
+キー形状はLLM次第で揺れる（実データでは`type_b_card`の77%が`details.card_rank`
+ではなく`details.card`）。表示側（`fmtObligation()`, `viewer/static/index.html`）は
+`ob_type`・`details`のキーを一切信用せず、既知4種（`type_a_payment`/
+`type_b_market`/`type_b_no_market`/`type_b_card`）以外は「未対応の契約条項:
+<type>」に、キー欠落は`?`にフォールバックする。**推測して意味を捏造しない。**
+
+契約`outcomes`（履行/違反イベント）は、engineイベント自体が`contract_id`を
+持たないことが多い（`TYPE_A_EXECUTION`/`TYPE_A_FAILURE`/`TYPE_B_VIOLATION`/
+`AUTO_COMMIT`/`AUTO_COMMIT_FAILURE`）。`_contract_id_of_outcome()`が
+`obligation_id`（`{contract_id}_OB{nn}`; `engine/models.py`の採番規則）から
+contract_idを復元する。`obligation_id`を持たない`TYPE_A_FAILURE`/
+`AUTO_COMMIT`/`AUTO_COMMIT_FAILURE`は紐付けない（推測しない）。
+`view=public`では従来どおり`terms: None`, `outcomes: []`でマスクされる
+（`_contract_involves_player()`によるgod側の本人契約スコープも含め、
+このマスクロジック自体は変更していない）。
+
+## 契約の中身はHandover Memoryではなく毎ラウンドstateから再提示する（my_contracts）
+
+LLMは1-shot呼出しで会話履歴を持たず、契約内容を保持する手段が自由記述の
+Handover Memoryしか無かった。実run `trial_C_l12_r12_20260822` では、P03/P09間の
+契約`C_90159021`（義務: P09がR6にM02へ参加してはいけない、義務者=P09のみ）が
+R6で成立→P09がR6 commitで契約違反脱落したにもかかわらず、P03のnegotiation/commit
+プロンプトには契約の中身を再提示する経路が一切なかった。原因は`_build_visible_state()`
+の`my_obligations`が (a) `ob.obligor == for_player_id`のみを対象とする（受益者=
+counterpartyには何も出ない）(b) `ob.round_num >= round_num`のみを対象とする（過去
+ラウンドの義務は消える）という二重フィルタを持つ「今後のTODO」専用リストだった
+ため。一方reflectionの`contracts_public`は毎R「[C_90159021] 状態: active」を
+条項なしで出し続け、P03のメモは「契約はactiveだが内容は忘れた」へと劣化した
+（R6→R11で6回反復注入された結果、R12メモで「R12で何か義務があるかもしれない」
+という誤った警戒に増幅）。
+
+修正: `_build_visible_state()`に`state["my_contracts"]`を追加（`for_player_id`が
+当事者である`ACTIVE`契約の全容。義務ごとに`ob_status`
+= fulfilled/expired/past/due/upcoming を付与）。`llm/prompt_builder.py`の
+`_render_my_contracts_block()`がnegotiation/commit/reflection/double_upの
+4プロンプトに「## あなたが当事者の正式契約（現在の状態・これが正本です）」を
+毎ラウンド描画する。`my_obligations`（今R以降のTODO）とは役割を分離し、無変更で
+残す。`contracts_public`（全員向け・条項なし）も無変更。`my_contracts`は
+`contracts_pending`と同じ`for_player_id in c.parties`条件で当事者限定、
+`for_player_id=None`（観戦用呼び出し）では`my_contracts`キー自体が生えない。
+
+なお`engine/contracts.py`の`ContractStatus.COMPLETED`/`EXPIRED`はenumとして
+定義されているが、代入箇所がコードベース全体でゼロ（`sign_contract()`が
+`PROPOSED→ACTIVE`にするのみ）。`contracts_public`/`my_contracts`が「義務が全部消化済みでも
+契約自体はactiveと表示される」のはこの仕様どおりであり、`ob_status`（義務単位）
+を見て判断する必要がある。義務レベルの状態を持たないのは意図的な設計（契約自体の
+COMPLETED/EXPIRED遷移を実装するとエンジン判定ロジック側の`status != ACTIVE`
+continueに影響するため見送った）。
+
+### `ACTIVE`からの唯一の実遷移: 全当事者合意による`CANCELLED`（§6・contract_cancel）
+
+上記の「ACTIVEは変化しない」という前提には、**全当事者合意による解除**という
+唯一の例外がある。同一R・同一市場に両立不能な条件（例: TWO_PAIR要求とONE_PAIR要求）の
+契約が二重に成立すると、1ラウンドに出せるカードは1枚しかないためどちらかが必ず
+型B違反で脱落する。これを「旧契約を全員合意で解除→新条件で`contract_propose`」の
+2ステップで解消できるようにしたのが`contract_cancel`アクション（単一アクション、
+提案/署名の2段構成にはしない。合意対象が`contract_id`だけで完全に決まるため）。
+
+**可否判定は永続フラグを持たず、既存の義務フラグから毎回導出する**
+（`engine/contracts.py:can_cancel_contract()`）:
+
+```
+解除可能 ⟺ contract.status == ACTIVE かつ、全 obligation について
+    not ob.is_fulfilled          # 型A履行済みでない
+  かつ not ob.is_expired          # 脱落による失効でない
+  かつ ob.round_num >= 現在R      # 未来Rが期限（今Rが期限までは解除可）
+```
+
+型B義務は正常に守っても`is_fulfilled`が立たない（`audit_type_b()`は違反者だけを
+返す仕様）ため、`ob.round_num < round_num`を「既に監査済み＝実績あり」の代理指標として
+使う。これにより「一部当事者だけが履行/違反した後にこっそり解除して証拠を消す」ことを防ぐ。
+
+生存する全当事者が同じ`contract_cancel`を出した時点で`CANCELLED`に遷移する
+（`request_cancel()`）。1人でも出していなければ元の契約は`ACTIVE`のまま
+（`cancel_requested_by`にPIDが積まれるだけ）。脱落者の同意は不要（行動できないため）。
+
+`CANCELLED`は既存の全ての`contract.status != ContractStatus.ACTIVE`継続チェック
+（`get_active_type_b_obligations`/`get_active_type_a_obligations`/
+`get_all_type_b_for_player`/`my_contracts`/`my_obligations`）に自動的に乗るため、
+Settlement/監査/自動代行Commitのロジックは一切変更していない。解除の事実（`cancelled_round`）は
+契約ID・当事者・statusと同じ公開粒度で`contracts_public`/Viewerに残り続ける
+（条項`terms`は従来どおりgod限定のまま）。
+
+### `contract_cancel`はAUTO_PASSの起床条件から独立している（第3の起床トリガ）
+
+`llm/llm_agent.py`の`negotiate()`は空回り削減のため`turn>=2`かつ新規`messages`が
+無ければ自動pass（`AUTO_PASS_ON_NO_NEWS`）する設計だが、`contract_cancel`アクションは
+`_round_messages`を一切生成しない（会話ではなく状態遷移のため）。そのため片側が解除を
+打診しても、相手のプロンプトに変化が起きず`messages`件数の起床条件に一度も引っかからず、
+永久にAUTO_PASSし続けて全会一致に到達できないという実装ミスがあった
+（`scripts/contract_cancel_smoke.py --repro`で再現・回帰防止）。
+
+`my_failed_actions`（不成立アクションのフィードバック）が既に同じ形の第2の起床トリガ
+として存在していたのに倣い、`my_contract_notices`（自分が当事者の契約への解除打診・
+解除成立の通知）の**件数増分**を第3の起床トリガとして追加した。新しい起床経路を
+追加するたびに、それが`_round_messages`を経由しない状態変化である場合はAUTO_PASSの
+対象外に落ちていないかをまず疑うこと（`messages`件数だけを信用しない）。
+
+### 実APIスモークは allowlist + run-id + 多層capで守る
+
+実LLM APIを叩くスモークテスト（`scripts/contract_cancel_smoke.py --real`ほか同系統の
+ハーネス）は、コマンドライン誤操作1つで想定外の課金・想定外モデルへの送信が起き得る。
+これを防ぐため以下を標準パターンとする:
+
+- **`REAL_MODEL_ALLOWLIST`**（モジュール定数のset）: allowlist外の`--model`指定は
+  実APIアダプタを作る**前**にexit 1で拒否する。allowlistへの追記自体をコードレビュー
+  対象にすることで、「うっかり別モデルに実行が進む」をコード変更なしには不可能にする。
+- **`--run-id`必須 + 出力先ディレクトリを`exist_ok=False`で作成**: 既存run-idの
+  再実行（＝二重送信）を`FileExistsError`で機械的に弾く。
+- **`HARD_MAX_CALLS`**: `--max-calls`自体の上限をコード側に固定し、引数だけでは
+  超えられないようにする。
+- **プリフライト必須通過**: 実APIへ進む前に既存のAPI-freeモード（`--repro`/
+  `--dry-run`/`--mock`/`--scripted`等）を内部で自動実行し、1つでも失敗したら実APIを
+  一切呼ばない。
+- **実API前の`worst_case_cost`事前突合**: 実際に送信するプロンプトを本物のbuilder関数
+  で構築した上で`worst_case_cost`を計算し、`--max-cost`/`--max-cost-per-call`と比較して
+  超過なら送信前に中断する（見積だけでなく実プロンプトを使うことで、システムプロンプト
+  肥大化等の実害を反映できる）。
+- 実行後は`BudgetedAdapter`（アダプタ単位のcap）と`GameCostBudget(abort_on_block=True)`
+  （ゲーム単位のcap、`llm/game_cost_budget.py`）の二重のランタイムcapが効く。
+  `BudgetBlockedError`は`llm/llm_agent.py`の8箇所で捕捉済みのため、cap到達時も
+  クラッシュせず`PassAction`等へ安全に退避する。
+
+（Stage D-0/D-1の実測: L6での実行は実call4・$0.00137で完走し、上記いずれのcapにも
+一度も抵触しなかった。詳細は`doc/devlog/2026-08-23_212143.md`・`2026-08-23_213502.md`）
+
 ## FINAL_REFLECTION（脱落者の一人称振り返り）は自由記述部分をgod限定にする
 
 「本人の一人称コメントだから公開して良い」という直感は、FINAL_REFLECTIONには適用できない。

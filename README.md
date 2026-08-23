@@ -15,6 +15,22 @@ uv sync
 uv run pytest tests/ -v
 ```
 
+### スモークテスト（実API 0コール）
+
+`scripts/contract_cancel_smoke.py`は`contract_cancel`機能の経路をAPI-freeで確認する
+4モードを持つ（いずれも実ネットワークAPIへ0コール）。
+
+```bash
+uv run python scripts/contract_cancel_smoke.py --repro     # Phase A: AUTO_PASS問題の再現/修正確認
+uv run python scripts/contract_cancel_smoke.py --dry-run   # 0 API-equivalent call の証明
+uv run python scripts/contract_cancel_smoke.py --mock      # ScriptAdapter経由の全経路疎通確認
+uv run python scripts/contract_cancel_smoke.py --scripted  # 4席本番経路スモーク（10項目チェック）
+```
+
+`--real --model L6 --run-id <id> --max-calls N --max-cost X --max-cost-per-call Y`は
+実API（DeepSeek V4 Flash限定・`REAL_MODEL_ALLOWLIST`で機械的に制限）を叩くモードで、
+人間の明示承認後にのみ実行する。
+
 ## ドライラン
 
 ```bash
@@ -66,6 +82,18 @@ DMの本文は送信者・宛先の当事者にしか見えない。非当事者
 メタデータのみが表示され、本文は`visible_state`の段階でキーごと削除される（reasoning・memoryと
 同じ構造的秘匿）。broadcastは全員に本文が公開され、匿名通信（`anonymous_broadcast`）は本文は
 全員公開だが掲載者は秘匿される。詳細は仕様書§8.2・`rules/project.md`の該当節を参照。
+
+### 全当事者合意による契約解除（contract_cancel）
+
+同一R・同一市場に両立不能な条件の契約が二重に成立すると、1ラウンドに出せるカードは1枚しか
+ないためどちらかが必ず型B違反で脱落する。これを解消するため、生存する全当事者が
+`contract_cancel`アクション（`{"type": "contract_cancel", "contract_id": "..."}`）を出すと
+契約が`ACTIVE`から`CANCELLED`へ遷移する。解除可否は永続フラグを持たず、義務が
+（型Aなら）未履行かつ（型Bなら）未監査かつ期限が現在R以降であることから毎回導出される。
+片側だけが同意した状態では契約台帳に`⏳ 解除同意 1/2`のように表示され、全員揃うまで
+`ACTIVE`のまま。解除された契約の以後の義務は、Settlement・型B監査・型A執行・脱落判定の
+既存ロジック（`status != ACTIVE`で弾く）にそのまま乗るため対象外になる。詳細は
+`rules/project.md`「§ACTIVEからの唯一の実遷移」を参照。
 
 ## LLMトライアル実行（本番API）
 
@@ -216,6 +244,6 @@ delivery badgeを表示する。脱落済みプレイヤー宛のDM等、engine�
 engine/           # ルールエンジン本体（16モジュール）
 viewer/           # 観戦ビューア（FastAPI）+ LP（static/lp.html）
 tests/            # テスト（受け入れ16件 + 追加テスト）
-scripts/          # ドライランスクリプト
+scripts/          # ドライラン・シミュレーション・LLM試験・スモークスクリプト
 doc/              # 仕様書・ドキュメント
 ```

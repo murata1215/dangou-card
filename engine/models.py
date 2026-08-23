@@ -329,10 +329,15 @@ class ContractStatus(str, Enum):
     """成立・有効"""
 
     COMPLETED = "completed"
-    """全義務履行済み"""
+    """全義務履行済み（未使用: 代入箇所なし。rules/project.md参照）"""
 
     EXPIRED = "expired"
-    """全義務失効済み"""
+    """全義務失効済み（未使用: 代入箇所なし。rules/project.md参照）"""
+
+    CANCELLED = "cancelled"
+    """全当事者合意による解除済み（§6・contract_cancel）。ACTIVEからの唯一の実遷移先。
+    義務が1件でも履行/違反/監査済み（round_num < 現在R）になった契約は解除できない
+    （engine/contracts.py の can_cancel_contract() が導出、永続フラグは持たない）。"""
 
 
 class Contract(BaseModel):
@@ -361,6 +366,17 @@ class Contract(BaseModel):
 
     status: ContractStatus = ContractStatus.PROPOSED
     """契約ステータス"""
+
+    cancel_requested_by: list[str] = Field(default_factory=list)
+    """解除に同意した当事者のプレイヤーID（順序保持）。全当事者合意による契約解除（§6）。
+    status が CANCELLED になった時点のスナップショットとして残す（誰の合意で解除に
+    至ったかを台帳・Viewerで確認できるようにするため、消さない）。"""
+
+    cancelled_round: int | None = None
+    """解除が成立したラウンド番号（未解除ならNone）"""
+
+    cancelled_turn: int | None = None
+    """解除が成立した巡（未解除ならNone）"""
 
 
 # =============================================================================
@@ -495,6 +511,19 @@ class ContractSignAction(BaseModel):
     contract_id: str
 
 
+class ContractCancelAction(BaseModel):
+    """
+    契約解除アクション（§6・全当事者合意による解除）
+
+    条項の提示が不要で合意対象は contract_id だけで決まるため、propose/sign のような
+    2段構成を取らない。生存する全当事者が同じ contract_cancel を出した時点で解除成立。
+    手数料なし（新たな証書を発行しないため）。
+    """
+    type: Literal["contract_cancel"] = "contract_cancel"
+    player_id: str
+    contract_id: str
+
+
 class AnonymousBroadcastAction(BaseModel):
     """匿名通信アクション（§7.1）"""
     type: Literal["anonymous_broadcast"] = "anonymous_broadcast"
@@ -617,7 +646,7 @@ class CardTradeRejectAction(BaseModel):
 # アクションのUnion型（discriminated union）
 Action = Annotated[
     DmAction | BroadcastAction | MarketCommitAction |
-    ContractProposeAction | ContractSignAction |
+    ContractProposeAction | ContractSignAction | ContractCancelAction |
     AnonymousBroadcastAction | BountyPostAction | BountyCancelAction |
     TransferAction | RepayAction | PassAction |
     CardTradeProposeAction | CardTradeAcceptAction | CardTradeRejectAction,

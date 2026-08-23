@@ -15,6 +15,33 @@ from engine.config import GameConfig
 # 署名済み未履行義務を毎プロンプトで提示し、帳簿ミス起因の自爆を防ぐ。
 # engine判定ロジック（settlement/autocommit/contracts）には一切影響しない。
 
+_OB_TYPE_LABELS = {
+    "type_a_payment": "型A金銭支払い",
+    "type_b_market": "型B市場指定",
+    "type_b_card": "型Bカード指定",
+    "type_b_no_market": "型B不参加指定",
+}
+
+
+def _format_obligation_detail(ob: dict[str, Any]) -> tuple[str, str]:
+    """義務dictから (種別ラベル, 詳細文字列) を返す（描画箇所の共通化）
+
+    以前は _render_obligations_block() と contracts_pending 描画の2箇所に
+    全く同じロジックがコピペされており、card/card_rankフォールバックの片方
+    だけ直す事故が起きうる形になっていた。1箇所に集約する。
+    """
+    label = _OB_TYPE_LABELS.get(ob["ob_type"], ob["ob_type"])
+    d = ob.get("details") or {}
+    if "amount" in d:
+        return label, f'{d["amount"] // 10_000}万円'
+    if "market_id" in d:
+        return label, d["market_id"]
+    if "card_rank" in d:
+        return label, d["card_rank"]
+    if "card" in d:
+        return label, d["card"]  # フォールバック: 正規化前の古いデータとの互換
+    return label, ""
+
 
 def _render_obligations_block(
     player_id: str,
@@ -60,24 +87,7 @@ def _render_obligations_block(
         # 各義務の描画
         card_obs_count = 0
         for ob in obs:
-            # 義務種別のラベル変換
-            ob_type_label = {
-                "type_a_payment": "型A金銭支払い",
-                "type_b_market": "型B市場指定",
-                "type_b_card": "型Bカード指定",
-                "type_b_no_market": "型B不参加指定",
-            }.get(ob["ob_type"], ob["ob_type"])
-            # 詳細情報の描画（金額 / 市場ID / カードrank）
-            details_str = ""
-            if "amount" in ob["details"]:
-                details_str = f'{ob["details"]["amount"] // 10_000}万円'
-            elif "market_id" in ob["details"]:
-                details_str = ob["details"]["market_id"]
-            elif "card_rank" in ob["details"]:
-                details_str = ob["details"]["card_rank"]
-            elif "card" in ob["details"]:
-                # フォールバック: 正規化前の古いデータとの互換
-                details_str = ob["details"]["card"]
+            ob_type_label, details_str = _format_obligation_detail(ob)
             lines.append(
                 f'    - [{ob["contract_id"]}] {ob_type_label} {details_str}'
                 f' （相手: {ob["counterparty"]}）'
@@ -94,6 +104,97 @@ def _render_obligations_block(
                 f"（1ラウンドに出せるのは1枚 → 必ず違反で脱落）"
             )
 
+    return lines
+
+
+# --- 自分が当事者の契約の可視化ヘルパー（台帳） ---
+# LLMは1-shot呼出しで会話履歴を持たず、契約の内容を保持する手段が自由記述メモしか
+# 無い。メモが劣化すると「activeだが内容不明の契約」が生まれ、存在しない義務への
+# 警戒でアクション枠を浪費し、逆に本物の義務を忘れれば型B違反=即脱落する
+# （実run trial_C_l12_r12_20260822: P03がC_90159021を「内容は忘れたが違反しない
+# よう注意」とR12まで警戒し続けたが、実際は R6限定・義務者はP09のみでP09は
+# R6に脱落済みだった）。
+# _render_obligations_block（TODO: 今R以降に自分が履行すべき義務）とは役割が違う:
+# こちらは「台帳」＝過去分・受益者側も含め、自分が当事者の契約すべての現況を出す。
+# engine判定ロジックには一切影響しない — プロンプトへの情報提示のみ。
+
+_OB_STATUS_LABELS = {
+    "fulfilled": "履行済",
+    "expired": "失効",
+    "past": "期限経過（監査済み・発火しません）",
+    "due": "**今ラウンドが期限** ⬅",
+    "upcoming": "未到来",
+    "cancelled": "解除により消滅（発火しません）",
+}
+
+
+def _render_my_contracts_block(
+    visible_state: dict[str, Any], round_num: int,
+) -> list[str]:
+    """自分が当事者である成立済み契約の全容を描画する（毎プロンプト注入）
+
+    Args:
+        visible_state: _build_visible_state() の出力（my_contracts キーを参照）
+        round_num: 現在のラウンド番号（現時点では未使用、シグネチャ統一のため保持）
+
+    Returns:
+        プロンプトに追加する行のリスト（契約ゼロなら空リスト）
+    """
+    contracts = visible_state.get("my_contracts") or []
+    if not contracts:
+        return []
+
+    lines: list[str] = ["\n## あなたが当事者の正式契約（現在の状態・これが正本です）"]
+    for c in contracts:
+        dead = c.get("eliminated_parties") or []
+        cancelled_round = c.get("cancelled_round")
+        head = (f"\n### [{c['contract_id']}] 当事者: {', '.join(c['parties'])}"
+                f"（R{c['round_created']}成立）")
+        if cancelled_round is not None:
+            head += f" 🚫 解除済み（R{cancelled_round}）"
+        if dead:
+            head += f" ⚠ {', '.join(dead)}が脱落済み"
+        lines.append(head)
+        live = 0
+        for ob in c["obligations"]:
+            label, detail = _format_obligation_detail(ob)
+            st = ob["ob_status"]
+            lines.append(
+                f'  - {ob["obligor"]} → {ob["counterparty"]}: {label}'
+                f'{" " + detail if detail else ""} / R{ob["round_num"]}期限'
+                f' … {_OB_STATUS_LABELS.get(st, st)}'
+            )
+            if st in ("due", "upcoming"):
+                live += 1
+        if cancelled_round is not None:
+            lines.append(
+                f"  → この契約はR{cancelled_round}に全当事者合意で解除されました"
+                "（残義務は発火しません）"
+            )
+        elif live == 0:
+            lines.append(
+                "  → この契約に残っている義務はありません"
+                "（消化・失効済み。解除交渉も警戒も不要です）"
+            )
+        else:
+            requested = c.get("cancel_requested_by") or []
+            if requested:
+                alive_parties = [p for p in c["parties"] if p not in dead]
+                pending = [p for p in alive_parties if p not in requested]
+                if pending:
+                    cancel_example = (
+                        '{"type": "contract_cancel", "contract_id": "'
+                        f'{c["contract_id"]}"}}'
+                    )
+                    lines.append(
+                        f'  ⏳ 解除同意 {len(requested)}/{len(alive_parties)}'
+                        f'（{", ".join(pending)} が未同意。全員が {cancel_example}'
+                        ' を出すまで契約は有効です）'
+                    )
+    lines.append(
+        "\n  ※上の一覧が契約に関する唯一の正しい現状です。"
+        "あなたのメモの記述と食い違う場合は必ずこちらを優先してください。"
+    )
     return lines
 
 
@@ -191,7 +292,8 @@ def _render_memory_block(memory: str | None, stale_warning: bool = False) -> lis
     if stale_warning:
         lines.append(
             "  ※このメモは過去の自分の記述です。書かれた後に起きた脱落・契約失効は"
-            "反映されていません。「脱落者」「生存者」欄が常に正しい現状です。")
+            "反映されていません。「脱落者」「生存者」「あなたが当事者の正式契約」欄が"
+            "常に正しい現状です。")
     return lines
 
 
@@ -220,6 +322,40 @@ def _render_eliminations_block(
         "  脱落者は以後一切行動しません。脱落者を宛先にしたDM・送金・契約提案・"
         "カードトレードは必ず不成立になり、アクション枠だけを失います。"
         "脱落者が当事者である未履行義務は§6.3で自動失効済みで、解除交渉は不要です。")
+    return lines
+
+
+def _render_contract_notice_block(visible_state: dict[str, Any]) -> list[str]:
+    """自分が当事者の契約に起きた解除関連の状態変化を描画する（本人のみ・私的情報）
+
+    contract_cancel はメッセージを生成しないため、AUTO_PASS_ON_NO_NEWS（空回り削減）が
+    働くと相手当事者は解除要求/成立に一度も気づかずAPIを呼ばれないまま自動passし続け、
+    全会一致に永久に到達しない（2026-08-23 AUTO_PASS問題）。this block はその起床トリガ
+    が読む唯一の情報源。第三者には配られない（my_contract_notices はfor_player_id限定）。
+    """
+    notices = visible_state.get("my_contract_notices") or []
+    if not notices:
+        return []
+    lines: list[str] = ["\n## 📩 あなたが当事者の契約に関する通知"]
+    for n in notices:
+        cid = n.get("contract_id", "?")
+        by = n.get("by", "?")
+        turn = n.get("turn", "?")
+        if n.get("kind") == "cancel_completed":
+            lines.append(
+                f'  [巡{turn}] {cid} は生存する全当事者の合意で解除されました'
+                '（残義務は発火しません）。'
+            )
+        else:
+            requested = n.get("cancel_requested_by") or []
+            pending = n.get("pending") or []
+            cancel_example = f'{{"type": "contract_cancel", "contract_id": "{cid}"}}'
+            lines.append(
+                f'  [巡{turn}] {by} が {cid} の解除に同意しました'
+                f'（解除同意 {len(requested)}人・{", ".join(pending) if pending else "―"} が未同意）。'
+                f' あなたも {cancel_example} を出せば解除が進みます。'
+                '出さなければ契約は有効なままで、義務違反は従来どおり判定されます。'
+            )
     return lines
 
 
@@ -402,6 +538,12 @@ strategyに必ず"emotion"を含めてください。現在のあなたの感情
   ]}}
   ※ob_type: type_a_payment(金銭支払) / type_b_market(市場指定) / type_b_card(カード指定) / type_b_no_market(不参加指定)
 - {{"type": "contract_sign", "contract_id": "..."}}
+- {{"type": "contract_cancel", "contract_id": "..."}}
+  ※成立済み契約の解除。**生存する全当事者が同じ contract_cancel を出した時点で解除成立**。
+    1人でも出していなければ元の契約は有効なまま。
+    **義務が1件でも履行/違反/監査済みになった契約は解除できません**（今Rが期限の義務までは解除可）。
+    契約内容を変えたいときは「旧契約を全員で解除 → 新条件で contract_propose」の順で行う。
+    同じ相手と両立しない契約を二重に結ぶと必ず型B違反で脱落します。
 - {{"type": "bounty_post", "amount": 500000, "bounty_type": "achievement", "condition_type": "market_win_against", "condition": {{"target_player": "P07"}}, "round_num": 5}}
 - {{"type": "card_trade_propose", "with_players": ["P07"], "give_card": "ONE_PAIR", "receive_card": "FLUSH", "cash_amount": 0}}
   ※with_playersは最大5人のリスト（ブロードキャスト提案）。cash_amount: 正=自分が払う、負=相手が払う、0=カード交換のみ
@@ -529,6 +671,9 @@ def build_negotiation_prompt(
     ob_lines = _render_obligations_block(player_state.player_id, visible_state, round_num)
     lines.extend(ob_lines)
 
+    # 自分が当事者の正式契約の全容（台帳。Handover Memory依存の解消）
+    lines.extend(_render_my_contracts_block(visible_state, round_num))
+
     # 生存者
     alive = visible_state.get("alive_players", [])
     lines.append(f"\n## 生存者: {', '.join(alive)}")
@@ -558,22 +703,7 @@ def build_negotiation_prompt(
             lines.append(f"  未署名: {', '.join(unsigned)}")
             lines.append("  義務:")
             for ob in c["obligations"]:
-                ob_type_label = {
-                    "type_a_payment": "型A金銭支払い",
-                    "type_b_market": "型B市場指定",
-                    "type_b_card": "型Bカード指定",
-                    "type_b_no_market": "型B不参加指定",
-                }.get(ob["ob_type"], ob["ob_type"])
-                details_str = ""
-                if "amount" in ob["details"]:
-                    details_str = f'{ob["details"]["amount"] // 10_000}万円'
-                elif "market_id" in ob["details"]:
-                    details_str = ob["details"]["market_id"]
-                elif "card_rank" in ob["details"]:
-                    details_str = ob["details"]["card_rank"]
-                elif "card" in ob["details"]:
-                    # フォールバック: 正規化前の古いデータとの互換
-                    details_str = ob["details"]["card"]
+                ob_type_label, details_str = _format_obligation_detail(ob)
                 lines.append(
                     f'    - {ob["obligor"]} → {ob["counterparty"]}: '
                     f'{ob_type_label} R{ob["round_num"]} {details_str}'
@@ -613,6 +743,9 @@ def build_negotiation_prompt(
                 statuses = t.get("target_statuses", {})
                 parts = [f"{p}({statuses.get(p, '?')})" for p in t["all_targets"]]
                 lines.append(f"  宛先: {', '.join(parts)}")
+
+    # あなたが当事者の契約に関する通知（解除要求/成立。AUTO_PASSの起床トリガでもある）
+    lines.extend(_render_contract_notice_block(visible_state))
 
     # 今ラウンドで不成立になった自分のアクション・残り枠（recency最優先で末尾に配置）
     lines.extend(_render_action_feedback_block(visible_state))
@@ -678,6 +811,9 @@ def build_commit_prompt(
     # コミットフェイズは最重要: ここで市場・カード選択が確定し違反が決まる
     ob_lines = _render_obligations_block(player_state.player_id, visible_state, round_num)
     lines.extend(ob_lines)
+
+    # 自分が当事者の正式契約の全容（台帳。Handover Memory依存の解消）
+    lines.extend(_render_my_contracts_block(visible_state, round_num))
 
     # 使用済みカード情報
     used = visible_state.get("used_cards", {})
@@ -760,6 +896,9 @@ def build_reflection_prompt(
     # 契約義務（署名済み・未履行）
     lines.extend(_render_obligations_block(player_state.player_id, visible_state, round_num))
 
+    # 自分が当事者の正式契約の全容（台帳。Handover Memory依存の解消）
+    lines.extend(_render_my_contracts_block(visible_state, round_num))
+
     # 契約の存在と当事者（§8.1公開情報）
     contracts = visible_state.get("contracts_public", [])
     if contracts:
@@ -791,10 +930,12 @@ def build_reflection_prompt(
         "形式は自由（箇条書き・散文・表、何でも構いません）。何を書き、何を書かないかもあなたの判断です。\n"
         "例えば: 誰と何を約束したか、誰が守り誰が破ったか、次に何をするつもりか、など。\n"
         "上限を超えた分は末尾から切り詰められます。重要なものから順に書いてください\n"
-        "（例: 次ラウンドの方針 → 有効な契約・未履行の約束 → 誰が守り誰が破ったか → "
+        "（例: 次ラウンドの方針 → 誰が守り誰が破ったか → "
         "資産/借金/手札の認識 → 重要なDMのやり取り）。\n"
         "古い情報を現在の事実として書かないでください（例: 「R3時点ではP04と同盟していた」"
         "のように、いつの情報かを明記する）。\n"
+        "正式契約の内容は毎ラウンド「あなたが当事者の正式契約」欄で必ず再提示されます。"
+        "契約IDや条項をメモに書き写す必要はありません（曖昧な転記はむしろ誤解の元です）。\n"
         '出力: {"memory": "（ここにメモを書く）"}'
     )
 
@@ -1105,6 +1246,9 @@ def build_double_up_prompt(
     # 署名済み未履行の契約義務一覧（帳簿ミス起因の自爆防止）
     ob_lines = _render_obligations_block(player_state.player_id, visible_state, round_num)
     lines.extend(ob_lines)
+
+    # 自分が当事者の正式契約の全容（台帳。Handover Memory依存の解消）
+    lines.extend(_render_my_contracts_block(visible_state, round_num))
 
     # 他プレイヤーの倍掛け状況
     double_ups = visible_state.get("double_ups", [])

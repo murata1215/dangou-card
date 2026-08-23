@@ -80,6 +80,11 @@ class LLMAgent(PlayerAgent):
         # 不成立アクションは _round_messages に入らず message count が動かないため、
         # フィードバックを一度も読まないまま自動passして枠だけ溶ける事故が実測された。
         self._last_failure_count: int = 0
+        # AUTO_PASS修正: 前回の契約解除通知件数を追跡（起床トリガの第3経路）。
+        # contract_cancel も _round_messages に入らず message count が動かないため、
+        # 相手当事者がAPIを一度も呼ばれないまま自動passし続け、全会一致に永久に
+        # 到達しない事故が実測された（2026-08-23 AUTO_PASS問題）。
+        self._last_notice_count: int = 0
         # 修正1: 当該ラウンドの交渉メッセージを保持
         self._current_round_messages: list[dict[str, Any]] = []
         self._current_round: int = 0
@@ -310,6 +315,7 @@ class LLMAgent(PlayerAgent):
             self._current_round_messages = []
             self._last_message_count = 0
             self._last_failure_count = 0
+            self._last_notice_count = 0
 
         # 不成立アクションは _round_messages に入らず message count が動かないため、
         # フィードバックを一度も読まないまま自動passして枠だけ溶ける（D2との相互作用）。
@@ -317,8 +323,15 @@ class LLMAgent(PlayerAgent):
         has_new_failure = failure_count > self._last_failure_count
         self._last_failure_count = failure_count
 
-        # 修正4: 空回り削減 — 新規メッセージがなくturn>=2なら自動pass
-        if AUTO_PASS_ON_NO_NEWS and turn >= 2 and not has_new_failure:
+        # AUTO_PASS修正: contract_cancel も _round_messages に入らず message count が
+        # 動かないため、相手当事者への解除要求/成立を一度も読まないまま自動passし続け、
+        # 全会一致に永久に到達しない（D2の失敗記録と同じ形の第3の起床トリガ）。
+        notice_count = len(visible_state.get("my_contract_notices") or [])
+        has_new_notice = notice_count > self._last_notice_count
+        self._last_notice_count = notice_count
+
+        # 修正4: 空回り削減 — 新規メッセージ/新規失敗/新規契約通知が無くturn>=2なら自動pass
+        if AUTO_PASS_ON_NO_NEWS and turn >= 2 and not has_new_failure and not has_new_notice:
             current_msg_count = len(visible_state.get("messages", []))
             if current_msg_count <= self._last_message_count:
                 return PassAction(player_id=self.player_id)

@@ -96,6 +96,7 @@ body {
 .panel .badge {
   display: inline-block; padding: 2px 8px; border-radius: 10px;
   font-size: 11px; font-weight: bold; margin-left: 8px;
+  white-space: nowrap;
 }
 .badge.alive { background: #1b5e20; color: #a5d6a7; }
 .badge.eliminated { background: #b71c1c; color: #ef9a9a; }
@@ -203,6 +204,10 @@ body > .god-banner { margin: 0; border-radius: 0; text-align: center; }
 .delivery-badge.delivery-delivered { background: #2f7d4f; color: #fff; }
 .delivery-badge.delivery-rejected { background: #b5482a; color: #fff; }
 .delivery-badge.delivery-unverified { background: #6b6b6b; color: #fff; }
+/* 受信DM（選手詳細モーダルでその選手が受け取ったDM）。
+   送信=緑 / 受信=青。青は .visibility-public .visibility-label と同じ #345f87 を
+   再利用してテーマから浮かないようにする。 */
+.delivery-badge.delivery-received { background: #345f87; color: #fff; }
 .sit-msg.msg-rejected { opacity: 0.85; border-left: 3px solid #b5482a; padding-left: 4px; }
 .sit-msg.msg-unverified { opacity: 0.85; border-left: 3px solid #6b6b6b; padding-left: 4px; }
 .detail-call.msg-rejected { border-left: 3px solid #b5482a; }
@@ -368,6 +373,13 @@ body > .god-banner { margin: 0; border-radius: 0; text-align: center; }
 .emotion-badge { font-size: 1.1em; margin-right: 2px; }
 .emotion-badge .emotion-img { width: 20px; height: 20px; vertical-align: middle; }
 
+/* 発言カードの感情（本文より先に目に入るサイズ）。色は付けず、
+   visibility-* / msg-rejected / msg-unverified の既存配色を優先する */
+.emotion-lead { display: inline-flex; align-items: center; gap: 4px;
+                vertical-align: middle; margin-right: 6px; }
+.emotion-lead .emotion-img { width: 44px; height: 44px; border-radius: 8px; }
+.emotion-lead .emotion-word { font-size: 1.25em; font-weight: bold; line-height: 1; }
+
 /* パネル改善: 大きい感情画像・モデル名・純資産・内訳・最終発言 */
 .panel-top { display: flex; gap: 10px; align-items: flex-start; margin-bottom: 6px; }
 .emotion-big { flex: 0 0 88px; line-height: 1; }
@@ -469,6 +481,16 @@ body > .god-banner { margin: 0; border-radius: 0; text-align: center; }
 .ob-b { color: var(--action-type); border-color: var(--action-type); } /* 型B=行動 */
 .ob-round { color: var(--text-muted); font-size: 11px; margin-left: 4px; }
 .ob-none { font-size: 12px; padding: 2px 0; }
+.ob-unknown { color: #b0763a; font-style: italic; }
+.oc-ok { color: #4caf50; }
+.oc-ng { color: #e05a5a; }
+.ct-meta { font-size: 12px; opacity: .8; margin: 4px 0; }
+.ct-label { font-size: 11px; font-weight: bold; opacity: .7; margin-top: 6px; }
+.ct-active { color: #4caf50; }
+.ct-pending { color: #999; }
+.ct-cancelled { color: #b5482a; font-weight: bold; }
+.ct-card-cancelled { opacity: 0.7; }
+.ct-raw > summary { cursor: pointer; font-size: 11px; opacity: .6; margin-top: 6px; }
 
 /* コスト内訳モーダル */
 .cost-modal { max-width: 850px; }

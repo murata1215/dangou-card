@@ -1,5 +1,63 @@
 # Changelog
 
+## 2026-08-23: 全当事者合意による契約解除（contract_cancel）
+
+実runでP11/P06の間に同一R・同一市場に両立不能な条件（TWO_PAIR要求とONE_PAIR要求）の契約が
+二重に成立し、1ラウンドに出せるカードは1枚しかないためどちらかが必ず型B違反で脱落する事故が
+発生した。旧契約を無効化する手段が一切なかった（`ContractStatus.COMPLETED`/`EXPIRED`は
+enum定義のみで代入箇所ゼロ、`PROPOSED→ACTIVE`の一方向遷移のみ）ため、**生存する全当事者の
+合意でACTIVE契約をCANCELLEDへ遷移させる**機能を追加した。
+
+- **`engine/models.py`**: `ContractStatus.CANCELLED`を追加。`Contract`に
+  `cancel_requested_by`/`cancelled_round`/`cancelled_turn`（全てdefault付き、既存データと
+  後方互換）を追加。新規`ContractCancelAction`（`{"type": "contract_cancel", "contract_id": "..."}`、
+  提案/署名の2段構成にはしない）を`Action`Unionへ追加。
+- **`engine/contracts.py`**: `can_cancel_contract()`（可否を義務フラグと`round_num`から毎回導出、
+  新しい永続状態は持たない）と`request_cancel()`（同意を1件集約、生存全当事者が揃った瞬間に
+  `CANCELLED`へ遷移）を新規追加。既存6関数は無変更。
+- **`engine/actions.py`/`engine/game.py`**: `validate_action()`に`contracts`引数
+  （既存呼び出しはデフォルト`None`で無変更）と`ContractCancelAction`検証を追加。実行分岐、
+  `contracts_public`/`my_contracts`のcancelled表示、post-game`contract_ledger`の「－解除」表示を追加。
+- **`llm/response_parser.py`/`llm/prompt_builder.py`/`llm/phase2_schema.py`**: パーサ分岐、
+  アクションカタログ・契約台帳ブロックへの解除表示（`🚫 解除済み`/`⏳ 解除同意 n/m`）、
+  H1 light schemaのenum合計上限（27→28）・直列化バイト上限（1280→1320、実測1298バイト）を更新。
+- **`viewer/`**: ラベル・秘匿判定・契約再構成に`contract_cancel`/`CONTRACT_CANCELLED`を追加、
+  秘匿契約カードと公正証書パネルに解除済み/一部同意中の表示を追加（`.ct-cancelled`/
+  `.ct-card-cancelled`）。Public/God情報境界は無変更（解除の事実は契約ID・当事者・statusと
+  同じ既存の公開粒度）。
+
+**Settlement 8Step・型B監査・型A Atomic執行・脱落判定・§6.3の義務失効は無変更**
+（全ての義務選択関数が既に`status != ACTIVE`で弾いており、`CANCELLED`遷移だけで自動的に
+判定対象外になる）。
+
+### AUTO_PASS修正 + 実APIハーネス（Stage A〜D-1）
+
+上記の実装直後、`contract_cancel`は`_round_messages`を生成しないため、相手が
+`messages`件数の変化のみを起床トリガとするAUTO_PASS（空回り削減）の対象外に一度も
+入らず、片側が解除を打診しても相手が永久にAUTO_PASSし続け全会一致に到達不能という
+第2のバグが判明した（Phase A・`scripts/contract_cancel_smoke.py --repro`で再現）。
+`llm/llm_agent.py`の`negotiate()`に`my_contract_notices`の件数増分を**第3の起床
+トリガ**として追加し修正（`AUTO_PASS_ON_NO_NEWS`本体は無変更、起床条件のOR分岐が
+1つ増えるのみ）。Phase Cで4席・10項目の本番経路スモーク（実API 0コール）が全通過。
+
+続けて `scripts/contract_cancel_smoke.py` に `--real` モード（Stage D-0）を追加し、
+実APIへ進む前に4層の機械的安全弁を設けた: `REAL_MODEL_ALLOWLIST={"L6"}`（許可外の
+`--model`指定は実API 0コールで拒否）、`--run-id`必須+出力先`exist_ok=False`（二重
+送信防止）、`HARD_MAX_CALLS=6`、実プロンプトを構築した`worst_case_cost`事前見積と
+`--max-cost`/`--max-cost-per-call`の突合。API-freeな4モード（`--repro`/`--dry-run`/
+`--mock`/`--scripted`）はすべて実API 0コールのまま継続green。
+
+Stage D-1でL6（DeepSeek V4 Flash）による実APIトライアルを1回実行し**GO判定**:
+P01=実`LLMAgent`(L6)、P02=`ScriptedCancelAgent`（R1から解除打診）、seed契約
+CX（解除対象）+CK（デコイ）で本番経路（`validate_action → contract_ops.request_cancel
+→ settlement`）を通した。実call数4（choose_loan 1 + negotiation turn1/turn2 各1 +
+commit 1、turn3は通知なしで想定どおりAUTO_PASS）、総コスト$0.0013694、ParseError
+0件。L6はturn2で通知により起床し正しい`contract_id:"CX"`（デコイCKとの取り違えなし）
+で`contract_cancel`を発行、全会一致で`CANCELLED`到達、`CONTRACT_CANCELLED`はちょうど
+1回、旧CX義務はsettlement/audit対象外（`TYPE_A_EXECUTION`/`TYPE_B_VIOLATION`とも
+0件）、デコイCKはACTIVE維持、脱落0、budget block 0件。L1へは進まず停止
+（詳細: `doc/devlog/2026-08-23_212143.md`・`2026-08-23_213502.md`）。
+
 ## 2026-08-23: 脱落済みplayer宛DM問題の根本修正（Engine D1-D4 + Viewer D5）
 
 Viewer God ViewでP06@R9に脱落済みP09宛の秘密DMが多数、通常DMと見分けがつかない形で表示されていた

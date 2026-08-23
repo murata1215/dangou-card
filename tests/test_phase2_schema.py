@@ -113,8 +113,8 @@ def test_h1_light_schema_has_fixed_flat_complexity_and_no_prompt_alias():
     assert len(schema["properties"]) == 19
     enum_fields = [value for value in schema["properties"].values() if "enum" in value]
     assert len(enum_fields) == 4
-    assert sum(len(value["enum"]) for value in enum_fields) == 27
-    assert len(json.dumps(schema, ensure_ascii=False, separators=(",", ":")).encode()) <= 1280
+    assert sum(len(value["enum"]) for value in enum_fields) == 28
+    assert len(json.dumps(schema, ensure_ascii=False, separators=(",", ":")).encode()) <= 1320
     assert mm._phase2_user_content(MODEL_REGISTRY["H1"]) != mm.GAME2_USER
     assert '"strategy"' not in mm._phase2_user_content(MODEL_REGISTRY["H1"])
     assert '"action"' not in mm._phase2_user_content(MODEL_REGISTRY["H1"])
@@ -195,11 +195,11 @@ def test_gemini_phase2_overrides_and_reserves_are_model_specific():
 
     assert mm._phase2_effective_max_tokens(MODEL_REGISTRY["M3"], 400) == 512
     assert mm._phase2_effective_max_tokens(MODEL_REGISTRY["H3"], 400) == 912
-    # 2026-08-22サイクル「脱落済みplayer宛DM問題」でRULES_SUMMARYへ脱落公示/アクション枠
-    # フィードバックの文言を追加し、system prompt長が変化したため期待値を更新（意図的な
+    # 2026-08-23サイクル「全当事者合意による契約解除（contract_cancel）」でアクションカタログに
+    # contract_cancel の説明文を追加し、system prompt長が変化したため期待値を更新（意図的な
     # 一度きりの変更。このコミットを跨ぐキャッシュ率・コスト予約値は比較不可）。
-    assert mm._phase2_worst_case_cost(MODEL_REGISTRY["M3"], system, 512) == pytest.approx(0.014568)
-    assert mm._phase2_worst_case_cost(MODEL_REGISTRY["H3"], system, 912) == pytest.approx(0.024224)
+    assert mm._phase2_worst_case_cost(MODEL_REGISTRY["M3"], system, 512) == pytest.approx(0.0147945)
+    assert mm._phase2_worst_case_cost(MODEL_REGISTRY["H3"], system, 912) == pytest.approx(0.024526)
     assert mm._phase2_worst_case_cost(MODEL_REGISTRY["M3"], system, 512) < 0.03
     assert mm._phase2_worst_case_cost(MODEL_REGISTRY["H3"], system, 912) < 0.03
 
@@ -289,6 +289,7 @@ def test_h1_phase2_client_uses_300_seconds_and_timeout_does_not_retry(monkeypatc
             ]),
         }, {"type", "with", "terms"}, "ContractProposeAction"),
         ("contract_sign", {"contract_id": "C_abc"}, {"type", "contract_id"}, "ContractSignAction"),
+        ("contract_cancel", {"contract_id": "C_abc"}, {"type", "contract_id"}, "ContractCancelAction"),
         ("anonymous_broadcast", {"message": "匿名"}, {"type", "message"}, "AnonymousBroadcastAction"),
         ("bounty_post", {
             "amount": 100, "bounty_type": "achievement", "condition_type": "same_market",

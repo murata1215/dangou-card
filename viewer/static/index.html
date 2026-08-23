@@ -197,6 +197,14 @@ function emotionDisplay(emotion, vendor) {
   }
   return `<img src="${vendorSrc}" alt="${emotion}" title="${emotion}" class="emotion-img" onerror="this.onerror=function(){this.replaceWith(document.createTextNode('${emoji}'))};this.src='${commonSrc}'">`;
 }
+// 発言カード先頭に置く「大きい絵＋感情文言」。
+// emotionが未取得(null/undefined)なら何も描かない
+// ＝ '平静' を勝手に捏造せず、取れていないことを取れていないまま示す。
+function emotionLead(emotion, vendor) {
+  if (!emotion) return '';
+  return `<span class="emotion-lead">${emotionDisplay(emotion, vendor)}`
+       + `<span class="emotion-word">${escapeHtml(emotion)}</span></span>`;
+}
 
 // --- 試合一覧の取得 ---
 async function loadGames() {
@@ -257,7 +265,7 @@ function computeStateSig(state) {
   state.players.forEach(p => {
     const isThinking = p.stats.last_active_sec_ago !== null && p.stats.last_active_sec_ago < 30;
     const s = p.strategy_summary || {};
-    parts.push(p.player_id, p.status, p.model_name || p.model_id,
+    parts.push(p.player_id, p.status, p.elimination_round, p.model_name || p.model_id,
       s.target_market, s.current_goal, s.card_plan,
       p.emotion, p.cash, p.debt, p.last_message, p.latest_round,
       p.stats.valid_json, p.stats.calls, p.stats.dm_count, p.stats.broadcast_count,
@@ -318,7 +326,11 @@ function renderState(state) {
     // 思考中判定（30秒以内にアクティブ）
     const isThinking = p.stats.last_active_sec_ago !== null && p.stats.last_active_sec_ago < 30;
     const badgeClass = p.status === 'eliminated' ? 'eliminated' : (isThinking ? 'thinking' : 'alive');
-    const badgeText = p.status === 'eliminated' ? '脱落' : (isThinking ? '思考中' : '生存');
+    // 脱落ラウンドが判明していればバッジ文言に含める（不明・旧runは従来どおり「脱落」）
+    const elimR = Number.isInteger(p.elimination_round) ? p.elimination_round : null;
+    const badgeText = p.status === 'eliminated'
+      ? (elimR !== null ? `R${elimR}脱落` : '脱落')
+      : (isThinking ? '思考中' : '生存');
 
     let strategyText = '';
     if (p.strategy_summary) {
@@ -530,6 +542,7 @@ function renderRoundDetail(detail) {
   const startFallback = r === 1 ? 'R1開始時は引き継ぎMemoryなし' : 'このtrialには開始時Memoryの記録がありません';
   const endFallback = r === total ? '最終RのためReflectionなし（次Rなし）' : 'このRの終了後Memoryは記録されていません';
   let calls = '';
+  const callsVendor = guessVendor(detailPlayer.modelName || '');
   (detail.calls || []).forEach(call => {
     const action = call.action || {};
     const actionText = action.content || action.label || (action.market_id ? `${action.market_id} / ${action.card || '?'}` : action.type || 'LLM call');
@@ -541,7 +554,7 @@ function renderRoundDetail(detail) {
       ? `Think ${call.native_thinking.tokens.toLocaleString()} tokens`
       : 'Native Thinking: 本文・token記録なし';
     calls += `<article class="detail-call visibility-${escapeHtml(action.visibility || 'public')}">
-      <div><span class="visibility-label">${escapeHtml(display.icon)} ${escapeHtml(display.label)}</span> <span class="phase-badge">${escapeHtml(call.phase)}${call.turn ? ` T${call.turn}` : ''}</span> <strong>${escapeHtml(actionText)}</strong></div>
+      <div>${emotionLead(call.emotion, callsVendor)}<span class="visibility-label">${escapeHtml(display.icon)} ${escapeHtml(display.label)}</span> <span class="phase-badge">${escapeHtml(call.phase)}${call.turn ? ` T${call.turn}` : ''}</span> <strong>${escapeHtml(actionText)}</strong></div>
       <div class="detail-meta">$${Number(call.cost || 0).toFixed(4)} | ${Math.round(call.latency_ms || 0)}ms | in:${call.usage.input_tokens} out:${call.usage.output_tokens} | retry:${call.retry_count}</div>
       <div class="detail-thinking">${escapeHtml(think)}</div>
       ${call.error ? `<div class="detail-error">⚠ ${escapeHtml(call.error)}</div>` : ''}
@@ -554,11 +567,44 @@ function renderRoundDetail(detail) {
   const contracts = (result.contracts || []).map(c => escapeHtml(`${c.contract_id}（${(c.parties || []).join(', ')}）`)).join('<br>') || '公開契約状態なし';
   const eliminated = (result.eliminated || []).map(e => e.reason || 'eliminated').join(', ') || 'なし';
   const secretEvents = detail.secret_events || {};
+  const secretVendor = guessVendor(detailPlayer.modelName || '');
   const secretMessages = (secretEvents.messages || []).map(m => {
     const rowClass = m.delivery === 'rejected' ? ' msg-rejected' : (m.delivery === 'unverified' ? ' msg-unverified' : '');
-    return `<article class="detail-call visibility-secret${rowClass}"><span class="visibility-label">🔒 秘匿DM</span> ${deliveryBadge(m)}<br><b>${escapeHtml(m.sender || '?')} → ${escapeHtml(m.to || '?')}</b><pre class="detail-full-text">${escapeHtml(m.message || '')}</pre></article>`;
+    return `<article class="detail-call visibility-secret${rowClass}">${emotionLead(m.emotion, secretVendor)}<span class="visibility-label">🔒 秘匿DM</span> ${deliveryBadge(m, detail.player_id)}<br><b>${escapeHtml(m.sender || '?')} → ${escapeHtml(m.to || '?')}</b><pre class="detail-full-text">${escapeHtml(m.message || '')}</pre></article>`;
   }).join('');
-  const secretContracts = (secretEvents.contracts || []).map(c => `<article class="detail-call visibility-secret"><span class="visibility-label">📜 🔒 秘匿契約</span><br><b>${escapeHtml(c.contract_id || '?')}</b> / ${(c.parties || []).map(escapeHtml).join(', ')}<pre class="detail-full-text">${escapeHtml(JSON.stringify({terms: c.terms, outcomes: c.outcomes || []}, null, 2))}</pre></article>`).join('');
+  const secretContracts = (secretEvents.contracts || []).map(c => {
+    const parties = (c.parties || []).map(p => escapeHtml(pidLabel(p))).join(' / ');
+    const signedN = (c.signed_by || []).length, partyN = (c.parties || []).length;
+    const cancelled = !!c.cancelled;
+    let status;
+    if (cancelled) {
+      status = `<span class="ct-cancelled">🚫 解除済み${Number.isInteger(c.cancelled_round) ? `（R${c.cancelled_round}）` : ''}</span>`;
+    } else if (partyN > 0 && signedN >= partyN) {
+      status = '<span class="ct-active">✅ 成立</span>';
+      const requestedN = (c.cancel_requested_by || []).length;
+      if (requestedN > 0) {
+        status += ` <span class="ct-pending">⏳解除同意 ${requestedN}/${partyN}</span>`;
+      }
+    } else {
+      status = `<span class="ct-pending">…署名待ち (${signedN}/${partyN})</span>`;
+    }
+    const terms = Array.isArray(c.terms) && c.terms.length
+      ? '<ul class="ob-list">' + c.terms.map(t => `<li>${fmtObligation(t)}</li>`).join('') + '</ul>'
+      : '<div class="ob-none">条項データなし</div>';
+    const oc = Array.isArray(c.outcomes) && c.outcomes.length
+      ? '<ul class="ob-list">' + c.outcomes.map(o => `<li>${fmtOutcome(o)}</li>`).join('') + '</ul>'
+      : '';
+    return `<article class="detail-call visibility-secret${cancelled ? ' ct-card-cancelled' : ''}">`
+      + `<span class="visibility-label">📜 🔒 秘匿契約</span><br>`
+      + `<b>${escapeHtml(c.contract_id || '?')}</b>`
+      + `<div class="ct-meta">当事者: ${parties}${parties ? ' ／ ' : ''}${status}`
+      + (Number.isInteger(c.round_created) ? ` ／ R${c.round_created}提案` : '') + `</div>`
+      + `<div class="ct-label">義務${cancelled ? '（解除済み・発火しません）' : ''}</div>${terms}`
+      + (oc ? `<div class="ct-label">結果</div>${oc}` : '')
+      + `<details class="ct-raw"><summary>生JSON</summary>`
+      + `<pre class="detail-full-text">${escapeHtml(JSON.stringify({terms: c.terms, outcomes: c.outcomes || []}, null, 2))}</pre>`
+      + `</details></article>`;
+  }).join('');
   const secretTotals = secretEvents.round_totals;
   const rejectedNote = secretTotals && secretTotals.messages_rejected
     ? ` / うち不成立${secretTotals.messages_rejected}件（表示中${secretTotals.messages_rejected_shown}件）<span class="detail-warn">⚠ 不成立分はEngineに拒否されたアクションです（枠は消費済み）</span>`
@@ -775,16 +821,42 @@ function escapeHtml(text) {
   return div.innerHTML;
 }
 
+// ==== DELIVERY_BADGE_START ====
 // D5: delivery（delivered/rejected/unverified）のバッジ表示。
 // god view専用フィールド。'unverified'（未検証）を'rejected'（不成立）と
 // 混同表示しないこと（脱落済みP09宛DMが「送れた」ように見えていた元バグの再発防止）。
+//
+// deliveredは「Engineがそのアクションを受理し、メッセージが相手に届いた」ことだけを
+// 意味し、交渉や契約が「成立」したことは一切意味しない。秘匿契約の ✅ 成立
+// （.ct-active / 公正証書の署名完了）と同じ語だと誤読されるため、
+// メッセージ送達は一律「送信済」と呼ぶ。「成立」は契約の成立に予約する。
 function deliveryClass(m) {
   if (!m || !m.delivery) return '';
   if (m.delivery === 'rejected') return 'delivery-rejected';
   if (m.delivery === 'unverified') return 'delivery-unverified';
   return 'delivery-delivered';
 }
-function deliveryBadge(m) {
+
+// m が viewerPid 宛の「受信DM」かどうか。viewer/log_parser.py の
+// _dm_involves_player() と同じ判定基準（型で分岐）を踏襲する。
+// - dm 以外（broadcast / anonymous_broadcast）は常に false（受信済にしない）
+// - sender が viewerPid 自身なら送信側（自分が主語の画面なので送信を優先）
+// - to は旧ログ/壊れた応答で list や 空文字 / null になり得るため型で分岐する
+function isIncomingDm(m, viewerPid) {
+  if (!m || !viewerPid) return false;
+  if (m.type !== 'dm') return false;
+  if (!m.sender || m.sender === viewerPid) return false;
+  const to = m.to;
+  if (Array.isArray(to)) return to.indexOf(viewerPid) !== -1;
+  return !!to && to === viewerPid;
+}
+
+// viewerPid を渡すと「その選手から見た向き」でdelivered表示を送信済/受信済に
+// 出し分ける（選手詳細モーダル専用）。省略した呼び出し（状況パネル等・
+// 特定選手基準ではない画面）は従来どおり一律「✅ 送信済」のまま。
+// rejected / unverified は方向より優先する（Engineが受理していないので
+// 「受信」自体が発生しておらず、向きに意味が無いため）。
+function deliveryBadge(m, viewerPid) {
   if (!m || !m.delivery) return '';
   if (m.delivery === 'rejected') {
     const reason = m.reject_reason ? `: ${escapeHtml(m.reject_reason)}` : '';
@@ -793,8 +865,12 @@ function deliveryBadge(m) {
   if (m.delivery === 'unverified') {
     return '<span class="delivery-badge delivery-unverified" title="対応するEngineイベントが見つからず成否未検証">❔ 未検証</span>';
   }
-  return '<span class="delivery-badge delivery-delivered" title="Engineイベントとの突合で成立を確認済み">✅ 成立</span>';
+  if (isIncomingDm(m, viewerPid)) {
+    return '<span class="delivery-badge delivery-received" title="この選手が受け取ったDM（Engineイベントとの突合で送達確認済み）">📥 受信済</span>';
+  }
+  return '<span class="delivery-badge delivery-delivered" title="Engineイベントとの突合で送信成功を確認済み（交渉成立の意味ではない）">✅ 送信済</span>';
 }
+// ==== DELIVERY_BADGE_END ====
 
 // --- 自動更新 ---
 function startAutoRefresh() {
@@ -965,6 +1041,7 @@ let situationRound = 1;
 let situationMaxRound = 0;
 let currentSurvivalCash = 2000000; // renderStateのconfigから更新
 
+// ==== CONTRACT_FORMATTER_START ====
 // カードランク情報（強さ順）
 const CARD_INFO = {
   ROYAL_FLUSH:   { l: 'ROYAL FLUSH',    v: 10 },
@@ -992,30 +1069,82 @@ function pidLabel(pid) {
   const mm = splitModelName(label);
   return mm.name ? `${pid}（${mm.name}）` : pid;
 }
+// pid → ベンダー推定（状況パネルのメッセージ発信者ごとの感情画像用）
+function vendorOf(pid) {
+  const label = (situationData && situationData.seat_map) ? situationData.seat_map[pid] : null;
+  if (!label) return '';
+  return guessVendor(splitModelName(label).name || '');
+}
 function yen(v) { return (v != null) ? '¥' + Number(v).toLocaleString() : '—'; }
 
-// 公正証書の義務(1件)を人間可読文に整形
+// 値を安全に文字列化する。bool/object/undefined等を"true"/"[object Object]"
+// のように誤表示しないため、string/finite numberのみ許可しそれ以外は''。
+function safeStr(v) {
+  if (typeof v === 'string') return v;
+  if (typeof v === 'number' && Number.isFinite(v)) return String(v);
+  return '';
+}
+
+// 契約義務(1件)を人間可読文に整形。
+// tはengine正規化前のLLM生JSON（viewer/log_parser.pyの_collect_contract_terms
+// 参照）。ob_type/detailsのキー形状は一切信用しない。
 function fmtObligation(t) {
-  if (!t) return '';
-  const ob = escapeHtml(pidLabel(t.obligor || '?'));
-  const cp = escapeHtml(pidLabel(t.counterparty || '?'));
-  const d = t.details || {};
-  const r = (t.round_num != null) ? ` <span class="ob-round">R${t.round_num}履行</span>` : '';
+  if (!t || typeof t !== 'object') return '<span class="ob-unknown">（不正な条項）</span>';
+  const ob = escapeHtml(pidLabel(safeStr(t.obligor) || '?'));
+  const cp = escapeHtml(pidLabel(safeStr(t.counterparty) || '?'));
+  const d = (t.details && typeof t.details === 'object' && !Array.isArray(t.details)) ? t.details : {};
+  // round_num はint(>=1)のみ信用。欠落/不正なら履行タイミングを捏造しない。
+  const r = Number.isInteger(t.round_num) && t.round_num >= 1
+    ? ` <span class="ob-round">R${t.round_num}履行</span>` : '';
+  const mkt = escapeHtml(safeStr(d.market_id) || '?');
   switch (t.ob_type) {
-    case 'type_a_payment':
-      return `<span class="ob-tag ob-a">型A</span> 💴 <b>${ob}</b>→<b>${cp}</b> ${yen(d.amount)} 支払${r}`;
+    case 'type_a_payment': {
+      const amt = Number.isFinite(Number(d.amount)) ? yen(d.amount) : '—';
+      return `<span class="ob-tag ob-a">型A</span> 💴 <b>${ob}</b> は <b>${cp}</b> に `
+           + `${amt} を支払う${r}`;
+    }
     case 'type_b_market':
-      return `<span class="ob-tag ob-b">型B</span> 🎯 <b>${ob}</b> は <b>${escapeHtml(d.market_id || '?')}</b> に参加${r}`;
+      return `<span class="ob-tag ob-b">型B</span> 🎯 <b>${ob}</b> は <b>${mkt}</b> に参加する${r}`;
     case 'type_b_no_market':
-      return `<span class="ob-tag ob-b">型B</span> 🚫 <b>${ob}</b> は <b>${escapeHtml(d.market_id || '?')}</b> に不参加${r}`;
+      return `<span class="ob-tag ob-b">型B</span> 🚫 <b>${ob}</b> は <b>${mkt}</b> に`
+           + `参加してはいけない${r}`;
     case 'type_b_card': {
-      const ci = CARD_INFO[d.card_rank] || { l: d.card_rank || '?' };
-      return `<span class="ob-tag ob-b">型B</span> 🃏 <b>${ob}</b> は <b>${escapeHtml(ci.l)}</b> を使用${r}`;
+      // 実データの大半はdetails.card（engineがcard→card_rankへ正規化する前の
+      // 生値）。card_rank / card / rank の順に見て、いずれも無ければ'?'。
+      const raw = safeStr(d.card_rank) || safeStr(d.card) || safeStr(d.rank);
+      const label = raw ? cardInfo(raw).l : '?';
+      return `<span class="ob-tag ob-b">型B</span> 🃏 <b>${ob}</b> は <b>${escapeHtml(label)}</b>`
+           + ` を使用する${r}`;
     }
     default:
-      return `<span class="card-chip">${escapeHtml(String(t.ob_type || '?'))}</span>`;
+      return `<span class="ob-unknown">未対応の契約条項: `
+           + `${escapeHtml(safeStr(t.ob_type) || '(種別不明)')}</span>`;
   }
 }
+
+// 契約の履行/違反イベント(1件)を人間可読文に整形。
+function fmtOutcome(o) {
+  if (!o || typeof o !== 'object') return '<span class="ob-unknown">（不正な結果）</span>';
+  const d = (o.data && typeof o.data === 'object' && !Array.isArray(o.data)) ? o.data : {};
+  const r = Number.isInteger(o.round) && o.round >= 1 ? `R${o.round}: ` : '';
+  const who = escapeHtml(pidLabel(safeStr(d.player_id) || safeStr(d.obligor) || '?'));
+  switch (o.event_type) {
+    case 'TYPE_A_EXECUTION':
+      return `${r}<span class="oc-ok">✅ 型A 履行完了</span>`;
+    case 'TYPE_A_FAILURE':
+      return `${r}<span class="oc-ng">❌ 型A 履行失敗（一括不成立）</span>`;
+    case 'TYPE_B_VIOLATION':
+      return `${r}<span class="oc-ng">⚠️ 型B 違反 — <b>${who}</b> 脱落</span>`;
+    case 'AUTO_COMMIT':
+      return `${r}<span class="oc-ok">🤖 自動履行</span>`;
+    case 'AUTO_COMMIT_FAILURE':
+      return `${r}<span class="oc-ng">🤖 自動履行失敗</span>`;
+    default:
+      return `${r}<span class="ob-unknown">未対応の結果: `
+           + `${escapeHtml(safeStr(o.event_type) || '(種別不明)')}</span>`;
+  }
+}
+// ==== CONTRACT_FORMATTER_END ====
 
 async function loadSituation() {
   if (!currentGame) return;
@@ -1144,7 +1273,17 @@ function renderSituation() {
       const parties = (ct.parties || []).map(pidLabel).map(escapeHtml).join(', ');
       const signedN = (ct.signed_by || []).length, partyN = (ct.parties || []).length;
       const active = (signedN >= partyN && partyN > 0);
-      const signed = `${signedN}/${partyN}署名${active ? ' ✅成立' : ' …署名待ち'}`;
+      const cancelled = !!ct.cancelled;
+      let signed;
+      if (cancelled) {
+        signed = `${signedN}/${partyN}署名 🚫解除済み${Number.isInteger(ct.cancelled_round) ? `(R${ct.cancelled_round})` : ''}`;
+      } else {
+        signed = `${signedN}/${partyN}署名${active ? ' ✅成立' : ' …署名待ち'}`;
+        const requestedN = (ct.cancel_requested_by || []).length;
+        if (active && requestedN > 0) {
+          signed += ` ⏳解除同意 ${requestedN}/${partyN}`;
+        }
+      }
       let terms;
       if (Array.isArray(ct.terms) && ct.terms.length) {
         terms = '<ul class="ob-list">'
@@ -1152,7 +1291,7 @@ function renderSituation() {
       } else {
         terms = '<div class="sit-muted ob-none">公開表示では締結条件は非公開です</div>';
       }
-      kHtml += `<div class="sit-row sit-contract"><b>${escapeHtml(pidLabel(ct.proposer))}</b>提案 → ${parties}`
+      kHtml += `<div class="sit-row sit-contract${cancelled ? ' ct-card-cancelled' : ''}"><b>${escapeHtml(pidLabel(ct.proposer))}</b>提案 → ${parties}`
         + ` <span class="sit-muted">(${signed}, R${ct.round_created}提案)</span>${terms}</div>`;
     });
   } else {
@@ -1174,10 +1313,11 @@ function renderSituation() {
         gHtml += `<div class="sit-msg dm visibility-secret${rowClass}"><span class="visibility-label">${escapeHtml(display.icon)} ${escapeHtml(display.label)}</span> ${escapeHtml(m.label || 'DM送信（本文・宛先は非公開）')}</div>`;
       } else if (isAnonymous) {
         const identity = godMode && m.actual_sender ? `<br><span class="visibility-label">🔒 神視点: 実発信者 ${escapeHtml(pidLabel(m.actual_sender))}</span>` : '';
-        gHtml += `<div class="sit-msg bc visibility-public${rowClass}"><span class="visibility-label">🎭 匿名発言</span> ${dBadge}<br>公開上の発信者: 匿名<br>${escapeHtml(m.message || '')}${identity}</div>`;
+        const anonVendor = godMode && m.actual_sender ? vendorOf(m.actual_sender) : '';
+        gHtml += `<div class="sit-msg bc visibility-public${rowClass}">${emotionLead(m.emotion, anonVendor)}<span class="visibility-label">🎭 匿名発言</span> ${dBadge}<br>公開上の発信者: 匿名<br>${escapeHtml(m.message || '')}${identity}</div>`;
       } else {
         const to = isDm ? pidLabel(m.to) : '全体';
-        gHtml += `<div class="sit-msg ${isDm ? 'dm visibility-secret' : 'bc visibility-public'}${rowClass}"><span class="visibility-label">${escapeHtml(display.icon)} ${escapeHtml(display.label)}</span> ${dBadge} `
+        gHtml += `<div class="sit-msg ${isDm ? 'dm visibility-secret' : 'bc visibility-public'}${rowClass}">${emotionLead(m.emotion, vendorOf(m.sender))}<span class="visibility-label">${escapeHtml(display.icon)} ${escapeHtml(display.label)}</span> ${dBadge} `
           + `<b>${escapeHtml(pidLabel(m.sender))}</b> <span class="arrow">→ ${escapeHtml(to)}</span>: ${escapeHtml(m.message || '')}</div>`;
       }
     });

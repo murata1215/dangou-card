@@ -10,7 +10,7 @@ from typing import Any
 _EMOTIONS = ["喜", "怒", "哀", "楽", "焦", "疑", "奸"]
 _ACTION_TYPES = [
     "pass", "dm", "broadcast", "transfer", "repay", "contract_propose",
-    "contract_sign", "anonymous_broadcast", "bounty_post", "bounty_cancel",
+    "contract_sign", "contract_cancel", "anonymous_broadcast", "bounty_post", "bounty_cancel",
     "card_trade_propose", "card_trade_accept", "card_trade_reject",
 ]
 _H1_LIGHT_FIELDS = (
@@ -175,9 +175,9 @@ def validate_h1_phase2_light_schema(schema: dict[str, Any]) -> dict[str, int]:
     if tuple(properties) != _H1_LIGHT_FIELDS or schema.get("required") != list(_H1_LIGHT_FIELDS):
         raise ValueError("H1 light schema properties or required fields do not match the transport contract")
     enum_fields = [value for value in properties.values() if "enum" in value]
-    if len(enum_fields) != 4 or sum(len(value["enum"]) for value in enum_fields) != 27:
+    if len(enum_fields) != 4 or sum(len(value["enum"]) for value in enum_fields) != 28:
         raise ValueError("H1 light schema enum regression limit exceeded")
-    if len(json.dumps(schema, ensure_ascii=False, separators=(",", ":")).encode()) > 1280:
+    if len(json.dumps(schema, ensure_ascii=False, separators=(",", ":")).encode()) > 1320:
         raise ValueError("H1 light schema serialized byte regression limit exceeded")
     return counts
 
@@ -253,6 +253,7 @@ def normalize_h1_phase2_transport(data: dict[str, Any]) -> dict[str, Any]:
         "repay": {"amount"},
         "contract_propose": {"with_players_json", "terms_json"},
         "contract_sign": {"contract_id"},
+        "contract_cancel": {"contract_id"},
         "anonymous_broadcast": {"message"},
         "bounty_post": {"amount", "bounty_type", "condition_type", "condition_target_player", "round_num", "anonymous", "beneficiary"},
         "bounty_cancel": {"bounty_id"},
@@ -290,6 +291,8 @@ def normalize_h1_phase2_transport(data: dict[str, Any]) -> dict[str, Any]:
     elif action_type == "contract_propose":
         action.update({"with": with_players, "terms": terms})
     elif action_type == "contract_sign":
+        action["contract_id"] = data["contract_id"]
+    elif action_type == "contract_cancel":
         action["contract_id"] = data["contract_id"]
     elif action_type == "bounty_post":
         action.update(

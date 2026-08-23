@@ -14,6 +14,7 @@ from typing import Any
 from engine.models import (
     Action, PassAction, DmAction, BroadcastAction, MarketCommitAction,
     TransferAction, RepayAction, ContractProposeAction, ContractSignAction,
+    ContractCancelAction,
     AnonymousBroadcastAction, BountyPostAction, BountyCancelAction,
     CardTradeProposeAction, CardTradeAcceptAction, CardTradeRejectAction,
     CardRank,
@@ -943,6 +944,21 @@ def _convert_action(
         return ContractSignAction(
             player_id=player_id,
             contract_id=str(data.get("contract_id", "")),
+        )
+
+    if action_type == "contract_cancel":
+        # 全当事者合意による契約解除（§6）。合意対象は contract_id だけで決まるため
+        # 提案/署名のような2段構成を取らない（旧契約を解除→新契約を提案、で
+        # 契約変更を表現する）。
+        contract_id = str(data.get("contract_id", ""))
+        if not contract_id:
+            raise ParseError(
+                "contract_cancelにcontract_idが必要です",
+                '例: {"type": "contract_cancel", "contract_id": "C_xxxxxxxx"}'
+            )
+        return ContractCancelAction(
+            player_id=player_id,
+            contract_id=contract_id,
         )
 
     if action_type == "anonymous_broadcast":

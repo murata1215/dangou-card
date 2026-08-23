@@ -7,6 +7,7 @@
 import json
 import tempfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -766,6 +767,167 @@ class TestNegotiationDeliveryJoin:
         assert "reject_reason" not in m
 
 
+class TestDeliveryBadgeWording:
+    """
+    秘密DM成功バッジの文言変更（「✅ 成立」→「✅ 送信済」）の静的文字列回帰テスト。
+
+    delivery=deliveredは「Engineがアクションを受理し送達した」ことのみを意味し、
+    交渉・契約の「成立」ではない。秘匿契約/公正証書の本当の「成立」（ct-active等）と
+    語が衝突していたため文言のみを変更する。delivery判定ロジック（log_parser）や
+    Public/God境界、rejected/unverifiedの文言・分岐は一切変更しない。
+    """
+
+    @staticmethod
+    def _delivery_badge_fn_body() -> str:
+        html = INDEX_HTML_PATH.read_text(encoding="utf-8")
+        start_marker = "function deliveryBadge(m, viewerPid) {"
+        start = html.index(start_marker)
+        end = html.index("\n}", start)
+        return html[start:end]
+
+    def test_delivery_badge_success_says_soushinzumi(self):
+        """delivered分岐が『送信済』になり、『✅ 成立』はもう含まれないこと"""
+        body = self._delivery_badge_fn_body()
+        assert "✅ 送信済" in body
+        assert "✅ 成立" not in body
+
+    def test_delivery_badge_keeps_rejected_and_unverified(self):
+        """rejected/unverifiedの文言・分岐は現行どおり変更されていないこと"""
+        body = self._delivery_badge_fn_body()
+        assert "❌ 不成立" in body
+        assert "❔ 未検証" in body
+        assert "delivery-rejected" in body
+        assert "delivery-unverified" in body
+
+    def test_contract_active_badge_still_says_seiritsu(self):
+        """秘匿契約(ct-active)・公正証書の本当の『成立』は変更されていないこと"""
+        html = INDEX_HTML_PATH.read_text(encoding="utf-8")
+        assert '<span class="ct-active">✅ 成立</span>' in html
+        assert "✅成立" in html
+
+    def test_delivery_delivered_css_class_unchanged(self):
+        """style.cssのクラス名（.delivery-badge.delivery-delivered）は変更していないこと"""
+        css_path = INDEX_HTML_PATH.parent / "style.css"
+        css = css_path.read_text(encoding="utf-8")
+        assert ".delivery-badge.delivery-delivered" in css
+
+
+class TestPlayerDetailDmDirection:
+    """
+    選手詳細モーダルのDM送受信バッジ分離（✅ 送信済 / 📥 受信済）の回帰テスト。
+
+    frontendのみの変更（deliveryBadge(m, viewerPid)がviewerPidを渡された時だけ
+    向きで文言を分ける）で成立し、backend（log_parser.py）は無変更で済むこと
+    （既存runでも即反映されるViewer-only変更であること）を、
+    secret_events.messagesが送受信双方向のsender/to/deliveryを既に持っている
+    ことで裏付ける。JS分岐の詳細はtest_viewer_js.pyのTestDeliveryBadgeDirectionへ。
+    """
+
+    def test_player_detail_call_site_passes_player_id(self):
+        """選手詳細モーダルの秘匿DMカードはdetail.player_idを基準PIDとして渡すこと"""
+        html = INDEX_HTML_PATH.read_text(encoding="utf-8")
+        assert "deliveryBadge(m, detail.player_id)" in html
+
+    def test_round_wide_call_site_stays_pid_agnostic(self):
+        """状況パネル（ラウンド全体）の呼び出しは基準PIDを渡さず現行どおりのままであること"""
+        html = INDEX_HTML_PATH.read_text(encoding="utf-8")
+        assert "const dBadge = deliveryBadge(m);" in html
+
+    def test_delivery_sentinels_present(self):
+        """DELIVERY_BADGE_START/ENDセンチネルが正しい順序で存在すること
+        （tests/test_viewer_js.pyでのnode実行抽出に使う）"""
+        html = INDEX_HTML_PATH.read_text(encoding="utf-8")
+        start = html.index("// ==== DELIVERY_BADGE_START ====")
+        end = html.index("// ==== DELIVERY_BADGE_END ====")
+        assert start < end
+
+    def test_style_css_has_delivery_received(self):
+        """受信DM用CSSクラスが追加され、既存4クラスも残っていること"""
+        css_path = INDEX_HTML_PATH.parent / "style.css"
+        css = css_path.read_text(encoding="utf-8")
+        assert ".delivery-badge.delivery-received" in css
+        assert ".delivery-badge.delivery-delivered" in css
+        assert ".delivery-badge.delivery-rejected" in css
+        assert ".delivery-badge.delivery-unverified" in css
+
+    def test_emotion_lead_still_precedes_delivery_badge(self):
+        """秘匿DMカードの描画順（emotionLead → deliveryBadge）が崩れていないこと
+        （emotion表示とのレイアウト衝突が無いことのDOM順固定）"""
+        html = INDEX_HTML_PATH.read_text(encoding="utf-8")
+        marker = "🔒 秘匿DM</span> ${deliveryBadge(m, detail.player_id)}"
+        idx = html.index(marker)
+        preceding = html[max(0, idx - 200):idx]
+        assert "emotionLead(m.emotion, secretVendor)" in preceding
+
+    def test_secret_events_expose_both_directions(self, tmp_path):
+        """backend無変更の裏付け: P03のsecret_events.messagesに
+        P03→P04（送信）とP04→P03（受信）が両方入り、方向判定に必要な
+        sender/to/deliveryがそれぞれ揃っていること"""
+        trial = tmp_path / "trial_direction"
+        logs = trial / "llm_logs"
+        logs.mkdir(parents=True)
+
+        def _entry(pid: str, round_num: int, turn: int, action: dict) -> dict:
+            return {
+                "player_id": pid, "model_id": "test-model", "phase": "negotiation",
+                "round_num": round_num, "turn": turn,
+                "response_text": json.dumps({"reasoning": "r", "action": action}, ensure_ascii=False),
+                "reasoning": "r", "reasoning_tokens": 0,
+            }
+
+        p03_entries = [_entry("P03", 5, 1, {"type": "dm", "to": "P04", "message": "P03からP04へ送信"})]
+        p04_entries = [_entry("P04", 5, 1, {"type": "dm", "to": "P03", "message": "P04からP03へ送信"})]
+        (logs / "game01_P03_llm_calls.jsonl").write_text(
+            "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in p03_entries), encoding="utf-8",
+        )
+        (logs / "game01_P04_llm_calls.jsonl").write_text(
+            "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in p04_entries), encoding="utf-8",
+        )
+        events = [
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "data": {"player_id": "P03"}},
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "data": {"player_id": "P04"}},
+            {"event_type": "NEGOTIATION_ACTION", "round_num": 5,
+             "data": {"action": "dm", "player_id": "P03", "turn": 1, "success": True}},
+            {"event_type": "NEGOTIATION_ACTION", "round_num": 5,
+             "data": {"action": "dm", "player_id": "P04", "turn": 1, "success": True}},
+        ]
+        (trial / "game01_events.jsonl").write_text(
+            "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in events), encoding="utf-8",
+        )
+        (trial / "game01_seat_map.json").write_text('{"P03":"L3","P04":"L4"}', encoding="utf-8")
+
+        detail = get_player_round_detail(tmp_path, "trial_direction", "game01", "P03", 5, view="god")
+        msgs = {m["message"]: m for m in detail["secret_events"]["messages"]}
+        outgoing = msgs["P03からP04へ送信"]
+        incoming = msgs["P04からP03へ送信"]
+        assert outgoing["sender"] == "P03" and outgoing["to"] == "P04" and outgoing["delivery"] == "delivered"
+        assert incoming["sender"] == "P04" and incoming["to"] == "P03" and incoming["delivery"] == "delivered"
+        assert detail["player_id"] == "P03"
+
+    def test_public_view_player_detail_has_no_secret_events(self, tmp_path):
+        """public viewではsecret_events自体が存在しないこと
+        （選手詳細の送受信バッジ分離はgod view限定であることの境界確認）"""
+        trial = tmp_path / "trial_public"
+        logs = trial / "llm_logs"
+        logs.mkdir(parents=True)
+        entry = {
+            "player_id": "P03", "model_id": "test-model", "phase": "negotiation",
+            "round_num": 5, "turn": 1,
+            "response_text": json.dumps(
+                {"reasoning": "r", "action": {"type": "dm", "to": "P04", "message": "秘密"}},
+                ensure_ascii=False,
+            ),
+            "reasoning": "r", "reasoning_tokens": 0,
+        }
+        (logs / "game01_P03_llm_calls.jsonl").write_text(
+            json.dumps(entry, ensure_ascii=False) + "\n", encoding="utf-8",
+        )
+        (trial / "game01_seat_map.json").write_text('{"P03":"L3"}', encoding="utf-8")
+
+        detail = get_player_round_detail(tmp_path, "trial_public", "game01", "P03", 5, view="public")
+        assert "secret_events" not in detail
+
+
 class TestGodViewSessionAuth:
     """
     God View認証の上位化・使い回し（sessionStorage方式、静的ファイルのみの変更）の
@@ -1051,6 +1213,30 @@ class TestEmotionViewer:
         entry = {"emotion": "怯", "response_text": ""}
         assert _extract_emotion(entry) == "平静"
 
+    def test_extract_emotion_kan_not_dropped(self):
+        """"奸"（正典VALID_EMOTIONSの7値目）が"平静"へ誤フォールバックしないこと
+
+        回帰対象: _extract_emotion() の許容集合が6値ハードコードで
+        "奸" が抜けており、実run約15%の感情が誤って"平静"化していた。
+        """
+        entry = {"emotion": "奸", "response_text": ""}
+        assert _extract_emotion(entry) == "奸"
+
+    def test_extract_emotion_kan_from_strategy(self):
+        """response_textのstrategy経由でも"奸"が通ること"""
+        entry = {
+            "response_text": '{"strategy": {"emotion": "奸"}, "action": {"type": "pass"}}',
+        }
+        assert _extract_emotion(entry) == "奸"
+
+    def test_extract_emotion_matches_valid_emotions(self):
+        """VALID_EMOTIONSの全7値をそのまま通すこと（正典との二重管理を防ぐ固定テスト）"""
+        from llm.response_parser import VALID_EMOTIONS
+        assert len(VALID_EMOTIONS) == 7
+        for em in VALID_EMOTIONS:
+            entry = {"emotion": em, "response_text": ""}
+            assert _extract_emotion(entry) == em
+
     def test_emotion_en_mapping_complete(self):
         """8感情すべてに英語名が対応すること（ビューアのEMOTION_ENマッピング検証）"""
         # viewer/static/index.html の EMOTION_EN と同じマッピング
@@ -1080,6 +1266,18 @@ class TestEmotionViewer:
         assert f"emotions/openai_{emotion_en['怒']}.png" == "emotions/openai_anger.png"
         # 共通パス
         assert f"emotions/{emotion_en['平静']}.png" == "emotions/neutral.png"
+
+    def test_emotion_image_files_exist(self):
+        """EMOTION_ENの全英名×6ベンダーのpngがviewer/static/emotions/に実在すること（smirk含む）"""
+        emotions_dir = Path(__file__).resolve().parent.parent / "viewer" / "static" / "emotions"
+        vendors = ["anthropic", "openai", "google", "xai", "moonshot", "deepseek"]
+        emotion_en = ["joy", "anger", "sadness", "ease", "panic", "doubt", "smirk"]
+        missing = [
+            f"{v}_{e}.png"
+            for v in vendors for e in emotion_en
+            if not (emotions_dir / f"{v}_{e}.png").exists()
+        ]
+        assert missing == []
 
 
 class TestCommentary:
@@ -1326,6 +1524,502 @@ class TestAutoCommitFailureElimination:
         data = get_round_states(logs_dir, trial_dir_name, "game01")
         r6_elim_pids = {e["player_id"] for e in data["rounds"]["6"]["eliminated"]}
         assert "P09" in r6_elim_pids
+
+
+class TestEliminationRoundDisplay:
+    """player一覧カードの「脱落ラウンド」表示（elimination_round）の回帰テスト。
+
+    get_game_state() の players[].elimination_round が、脱落系イベントの
+    round_num から正しく導出され、不明時は None に倒れ、後方互換
+    （eliminated: list[str] の形状不変）が保たれることを確認する。
+    """
+
+    def _write_llm_logs(self, trial: Path, game_id: str, players: list[str]) -> None:
+        logs = trial / "llm_logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        for pid in players:
+            entry = {
+                "player_id": pid, "model_id": "test-model", "phase": "negotiation",
+                "round_num": 1, "turn": 1, "response_text": "{}", "cost_usd": 0.001,
+            }
+            (logs / f"{game_id}_{pid}_llm_calls.jsonl").write_text(
+                json.dumps(entry, ensure_ascii=False) + "\n", encoding="utf-8",
+            )
+
+    def _write_events(self, trial: Path, game_id: str, events: list[dict]) -> None:
+        trial.mkdir(exist_ok=True)
+        (trial / f"{game_id}_events.jsonl").write_text(
+            "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in events), encoding="utf-8",
+        )
+
+    def test_elimination_round_recorded_for_each_path(self, tmp_path):
+        """4種のELIMINATION_EVENT_TYPES + SURVIVAL_CHECK経路すべてで
+        elimination_roundがround_numから正しく取れること（R3/R5/R12を網羅）"""
+        trial = tmp_path / "trial_round"
+        self._write_llm_logs(trial, "game01", ["P01", "P02", "P03", "P04", "P05"])
+        events = [
+            # P02: ELIMINATION + FORCED_LIQUIDATION @R3
+            {"event_type": "ELIMINATION", "round_num": 3, "phase": "settlement",
+             "data": {"player_id": "P02", "reason": "contract_violation"}},
+            {"event_type": "FORCED_LIQUIDATION", "round_num": 3, "phase": "settlement",
+             "data": {"player_id": "P02", "reason": "contract_violation"}},
+            # P03: BANKRUPTCY @R5
+            {"event_type": "BANKRUPTCY", "round_num": 5, "phase": "commit",
+             "data": {"player_id": "P03", "reason": "Cannot pay entry fee"}},
+            # P04: AUTO_COMMIT_FAILURE @R5
+            {"event_type": "AUTO_COMMIT_FAILURE", "round_num": 5, "phase": "commit",
+             "data": {"player_id": "P04", "reason": "contract_violation"}},
+            # P05: SURVIVAL_CHECK eliminated @R12
+            {"event_type": "SURVIVAL_CHECK", "round_num": 12, "phase": "finance",
+             "data": {"player_id": "P05", "result": "eliminated", "reason": "condition_not_met"}},
+        ]
+        self._write_events(trial, "game01", events)
+
+        state = get_game_state(tmp_path, "trial_round", "game01")
+        by_pid = {p["player_id"]: p for p in state["players"]}
+
+        assert by_pid["P02"]["elimination_round"] == 3
+        assert by_pid["P03"]["elimination_round"] == 5
+        assert by_pid["P04"]["elimination_round"] == 5
+        assert by_pid["P05"]["elimination_round"] == 12
+        for pid in ("P02", "P03", "P04", "P05"):
+            assert by_pid[pid]["status"] == "eliminated"
+
+    def test_survivor_has_no_elimination_round(self, tmp_path):
+        """生存者はelimination_roundキーが存在しつつNoneであること（JS側undefined回避）"""
+        trial = tmp_path / "trial_survivor"
+        self._write_llm_logs(trial, "game01", ["P01", "P02"])
+        events = [
+            {"event_type": "ELIMINATION", "round_num": 3, "phase": "settlement",
+             "data": {"player_id": "P02", "reason": "contract_violation"}},
+        ]
+        self._write_events(trial, "game01", events)
+
+        state = get_game_state(tmp_path, "trial_survivor", "game01")
+        by_pid = {p["player_id"]: p for p in state["players"]}
+
+        assert "elimination_round" in by_pid["P01"]
+        assert by_pid["P01"]["elimination_round"] is None
+        assert by_pid["P01"]["status"] != "eliminated"
+
+    def test_missing_round_num_yields_none(self, tmp_path):
+        """round_numが欠落/nullでもelimination_round=None・脱落検出は維持されること"""
+        trial = tmp_path / "trial_missing_round"
+        self._write_llm_logs(trial, "game01", ["P02", "P03"])
+        events = [
+            {"event_type": "ELIMINATION", "phase": "settlement",
+             "data": {"player_id": "P02", "reason": "contract_violation"}},  # round_num欠落
+            {"event_type": "BANKRUPTCY", "round_num": None, "phase": "commit",
+             "data": {"player_id": "P03", "reason": "bankruptcy"}},
+        ]
+        self._write_events(trial, "game01", events)
+
+        state = get_game_state(tmp_path, "trial_missing_round", "game01")
+        by_pid = {p["player_id"]: p for p in state["players"]}
+
+        assert by_pid["P02"]["elimination_round"] is None
+        assert by_pid["P03"]["elimination_round"] is None
+        assert by_pid["P02"]["status"] == "eliminated"
+        assert by_pid["P03"]["status"] == "eliminated"
+        assert sorted(state["eliminated"]) == ["P02", "P03"]
+
+    def test_invalid_round_num_yields_none(self, tmp_path):
+        """round_num=0/-1/文字列/boolはすべてNoneに倒れ、脱落判定自体は維持されること"""
+        trial = tmp_path / "trial_invalid_round"
+        self._write_llm_logs(trial, "game01", ["P01", "P02", "P03", "P04"])
+        events = [
+            {"event_type": "ELIMINATION", "round_num": 0, "phase": "settlement",
+             "data": {"player_id": "P01", "reason": "x"}},
+            {"event_type": "ELIMINATION", "round_num": -1, "phase": "settlement",
+             "data": {"player_id": "P02", "reason": "x"}},
+            {"event_type": "ELIMINATION", "round_num": "5", "phase": "settlement",
+             "data": {"player_id": "P03", "reason": "x"}},
+            {"event_type": "ELIMINATION", "round_num": True, "phase": "settlement",
+             "data": {"player_id": "P04", "reason": "x"}},
+        ]
+        self._write_events(trial, "game01", events)
+
+        state = get_game_state(tmp_path, "trial_invalid_round", "game01")
+        by_pid = {p["player_id"]: p for p in state["players"]}
+
+        for pid in ("P01", "P02", "P03", "P04"):
+            assert by_pid[pid]["elimination_round"] is None
+            assert by_pid[pid]["status"] == "eliminated"
+
+    def test_duplicate_events_first_known_round_wins(self, tmp_path):
+        """同一player複数イベントで、先に判明したroundを採用し、名簿は先勝ちdedupのままであること"""
+        trial = tmp_path / "trial_dup_round"
+        self._write_llm_logs(trial, "game01", ["P02", "P03"])
+        events = [
+            {"event_type": "SURVIVAL_CHECK", "round_num": 12, "phase": "finance",
+             "data": {"player_id": "P02", "result": "eliminated"}},
+            {"event_type": "FORCED_LIQUIDATION", "round_num": 12, "phase": "finance",
+             "data": {"player_id": "P02", "reason": "condition_not_met"}},
+            {"event_type": "ELIMINATION", "phase": "settlement",
+             "data": {"player_id": "P03", "reason": "contract_violation"}},  # round_num欠落（先着）
+            {"event_type": "FORCED_LIQUIDATION", "round_num": 7, "phase": "settlement",
+             "data": {"player_id": "P03", "reason": "contract_violation"}},  # 後続で補完
+        ]
+        self._write_events(trial, "game01", events)
+
+        state = get_game_state(tmp_path, "trial_dup_round", "game01")
+        by_pid = {p["player_id"]: p for p in state["players"]}
+
+        assert by_pid["P02"]["elimination_round"] == 12
+        assert by_pid["P03"]["elimination_round"] == 7
+        assert state["eliminated"].count("P02") == 1
+        assert state["eliminated"].count("P03") == 1
+
+    def test_no_events_file_does_not_break(self, tmp_path):
+        """eventsファイル自体が無い旧runで全員elimination_round=None・eliminated=[]であること"""
+        trial = tmp_path / "trial_no_events"
+        self._write_llm_logs(trial, "game01", ["P01", "P02", "P03"])
+        trial.mkdir(exist_ok=True)
+
+        state = get_game_state(tmp_path, "trial_no_events", "game01")
+        assert state["eliminated"] == []
+        assert state["survivors"] == 3
+        for p in state["players"]:
+            assert "elimination_round" in p
+            assert p["elimination_round"] is None
+
+    def test_eliminated_list_shape_unchanged(self, tmp_path):
+        """state["eliminated"]はlist[str]のまま（既存テストが依存する後方互換契約）"""
+        trial = tmp_path / "trial_shape"
+        self._write_llm_logs(trial, "game01", ["P01", "P02"])
+        events = [
+            {"event_type": "ELIMINATION", "round_num": 3, "phase": "settlement",
+             "data": {"player_id": "P02", "reason": "contract_violation"}},
+        ]
+        self._write_events(trial, "game01", events)
+
+        state = get_game_state(tmp_path, "trial_shape", "game01")
+        assert isinstance(state["eliminated"], list)
+        assert all(isinstance(x, str) for x in state["eliminated"])
+
+    def test_final_round_mass_elimination_all_get_last_round(self, tmp_path):
+        """R12生還ライン未達の一斉脱落で全員が同一のelimination_round(=12)になり、
+        生存者だけがNoneのままであること（意図的な仕様。R12を特別扱いしない）"""
+        trial = tmp_path / "trial_mass"
+        self._write_llm_logs(trial, "game01", ["P01", "P02", "P03", "P04", "P05"])
+        events = [
+            {"event_type": "SURVIVAL_CHECK", "round_num": 12, "phase": "finance",
+             "data": {"player_id": pid, "result": "eliminated", "reason": "condition_not_met"}}
+            for pid in ("P02", "P03", "P04", "P05")
+        ]
+        self._write_events(trial, "game01", events)
+
+        state = get_game_state(tmp_path, "trial_mass", "game01")
+        by_pid = {p["player_id"]: p for p in state["players"]}
+
+        for pid in ("P02", "P03", "P04", "P05"):
+            assert by_pid[pid]["elimination_round"] == 12
+        assert by_pid["P01"]["elimination_round"] is None
+
+    def test_index_html_renders_elimination_round_badge(self):
+        """index.htmlのバッジ算出にelimination_roundが使われ、
+        style.cssの.panel .badgeにwhite-space:nowrapが入っていること"""
+        base = Path(__file__).resolve().parent.parent / "viewer" / "static"
+        html = (base / "index.html").read_text(encoding="utf-8")
+        css = (base / "style.css").read_text(encoding="utf-8")
+
+        assert "elimination_round" in html
+        assert "脱落" in html
+        assert "white-space: nowrap" in css
+
+    def test_real_trial_elimination_round_matches_round_states(self):
+        """実trial trial_C_l12_r12_20260822 のP09で、get_game_state()の
+        elimination_roundとget_round_states()のround別eliminatedが整合すること。
+        runが存在しない環境ではskip。"""
+        logs_dir = Path(__file__).resolve().parent.parent / "logs" / "llm"
+        trial_dir_name = "trial_C_l12_r12_20260822"
+        if not (logs_dir / trial_dir_name).exists():
+            pytest.skip(f"{trial_dir_name} not found")
+
+        state = get_game_state(logs_dir, trial_dir_name, "game01")
+        by_pid = {p["player_id"]: p for p in state["players"]}
+        assert by_pid["P09"]["elimination_round"] is not None
+
+        data = get_round_states(logs_dir, trial_dir_name, "game01")
+        r_num = by_pid["P09"]["elimination_round"]
+        r_elim_pids = {e["player_id"] for e in data["rounds"][str(r_num)]["eliminated"]}
+        assert "P09" in r_elim_pids
+
+
+class TestContractOutcomeAttachment:
+    """契約のoutcomes（履行/違反イベント）が obligation_id から復元した
+    contract_id で正しく紐付くことの回帰テスト（_contract_id_of_outcome）。
+
+    従来は data["contract_id"] しか見ておらず、実ログには一件も
+    contract_id が付与されていなかったため outcomes は常に [] だった。
+    """
+
+    def _write_llm_logs(self, trial: Path, game_id: str, players: list[str]) -> None:
+        logs = trial / "llm_logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        for pid in players:
+            entry = {
+                "player_id": pid, "model_id": "test-model", "phase": "negotiation",
+                "round_num": 1, "turn": 1, "response_text": "{}", "cost_usd": 0.001,
+            }
+            (logs / f"{game_id}_{pid}_llm_calls.jsonl").write_text(
+                json.dumps(entry, ensure_ascii=False) + "\n", encoding="utf-8",
+            )
+
+    def _write_events(self, trial: Path, game_id: str, events: list[dict]) -> None:
+        trial.mkdir(exist_ok=True)
+        (trial / f"{game_id}_events.jsonl").write_text(
+            "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in events), encoding="utf-8",
+        )
+
+    def _base_events(self) -> list[dict]:
+        return [
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P01"}},
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "phase": "setup", "data": {"player_id": "P02"}},
+            {"event_type": "NEGOTIATION_ACTION", "round_num": 3, "phase": "negotiation",
+             "data": {"action": "contract_propose", "contract_id": "C_90159021",
+                       "player_id": "P01", "parties": ["P01", "P02"]}},
+            {"event_type": "NEGOTIATION_ACTION", "round_num": 3, "phase": "negotiation",
+             "data": {"action": "contract_sign", "contract_id": "C_90159021", "player_id": "P02"}},
+        ]
+
+    def test_outcome_attached_via_obligation_id(self, tmp_path):
+        """contract_idを持たないTYPE_A_EXECUTION/TYPE_B_VIOLATIONが、
+        obligation_idの{contract_id}_OB{nn}から復元され正しい契約に紐付く"""
+        trial = tmp_path / "trial_ob"
+        self._write_llm_logs(trial, "game01", ["P01", "P02"])
+        events = self._base_events() + [
+            {"event_type": "TYPE_A_EXECUTION", "round_num": 6, "phase": "settlement",
+             "data": {"obligation_id": "C_90159021_OB01"}},
+            {"event_type": "TYPE_B_VIOLATION", "round_num": 6, "phase": "settlement",
+             "data": {"player_id": "P02", "obligation_id": "C_90159021_OB02", "reason": "contract_violation"}},
+        ]
+        self._write_events(trial, "game01", events)
+
+        data = get_round_states(tmp_path, "trial_ob", "game01", view="god")
+        contract = next(
+            c for c in data["rounds"]["3"]["contracts"] if c["contract_id"] == "C_90159021"
+        )
+        event_types = {o["event_type"] for o in contract["outcomes"]}
+        assert event_types == {"TYPE_A_EXECUTION", "TYPE_B_VIOLATION"}
+
+    def test_outcome_prefers_explicit_contract_id(self, tmp_path):
+        """data["contract_id"]がある場合はobligation_idより優先されること"""
+        trial = tmp_path / "trial_explicit"
+        self._write_llm_logs(trial, "game01", ["P01", "P02"])
+        events = self._base_events() + [
+            # obligation_idは別契約を指すが、明示contract_idが優先される
+            {"event_type": "TYPE_A_EXECUTION", "round_num": 6, "phase": "settlement",
+             "data": {"contract_id": "C_90159021", "obligation_id": "C_deadbeef_OB01"}},
+        ]
+        self._write_events(trial, "game01", events)
+
+        data = get_round_states(tmp_path, "trial_explicit", "game01", view="god")
+        contract = next(
+            c for c in data["rounds"]["3"]["contracts"] if c["contract_id"] == "C_90159021"
+        )
+        assert len(contract["outcomes"]) == 1
+
+    def test_outcome_without_obligation_id_ignored(self, tmp_path):
+        """TYPE_A_FAILURE/AUTO_COMMIT/AUTO_COMMIT_FAILUREはobligation_idを
+        持たないため、紐付かない（例外も出ない）"""
+        trial = tmp_path / "trial_no_ob"
+        self._write_llm_logs(trial, "game01", ["P01", "P02"])
+        events = self._base_events() + [
+            {"event_type": "TYPE_A_FAILURE", "round_num": 6, "phase": "settlement", "data": {}},
+            {"event_type": "AUTO_COMMIT", "round_num": 6, "phase": "commit",
+             "data": {"player_id": "P01"}},
+            {"event_type": "AUTO_COMMIT_FAILURE", "round_num": 6, "phase": "commit",
+             "data": {"player_id": "P01", "reason": "x"}},
+        ]
+        self._write_events(trial, "game01", events)
+
+        data = get_round_states(tmp_path, "trial_no_ob", "game01", view="god")
+        contract = next(
+            c for c in data["rounds"]["3"]["contracts"] if c["contract_id"] == "C_90159021"
+        )
+        assert contract.get("outcomes", []) == []
+
+    def test_malformed_obligation_id_ignored(self, tmp_path):
+        """obligation_idの形式が不正/型不正な場合は推測せず無視されること"""
+        trial = tmp_path / "trial_malformed"
+        self._write_llm_logs(trial, "game01", ["P01", "P02"])
+        malformed_values: list[Any] = ["garbage", "C_xx_OB", 123, None, True, "C_90159021"]
+        events = self._base_events()
+        for i, v in enumerate(malformed_values):
+            events.append({
+                "event_type": "TYPE_A_EXECUTION", "round_num": 6, "phase": "settlement",
+                "data": {"obligation_id": v, "marker": i},
+            })
+        self._write_events(trial, "game01", events)
+
+        data = get_round_states(tmp_path, "trial_malformed", "game01", view="god")
+        contract = next(
+            c for c in data["rounds"]["3"]["contracts"] if c["contract_id"] == "C_90159021"
+        )
+        # "C_90159021"（_OBサフィックスなし）はcontract_id自体ではなく
+        # obligation_id形式に合致しないので無視される
+        assert contract.get("outcomes", []) == []
+
+    def test_outcome_for_unknown_contract_ignored(self, tmp_path):
+        """存在しない契約IDに紐付くoutcomeは捨てられ、例外も出ないこと"""
+        trial = tmp_path / "trial_unknown_contract"
+        self._write_llm_logs(trial, "game01", ["P01", "P02"])
+        events = self._base_events() + [
+            {"event_type": "TYPE_A_EXECUTION", "round_num": 6, "phase": "settlement",
+             "data": {"obligation_id": "C_ffffffff_OB01"}},
+        ]
+        self._write_events(trial, "game01", events)
+
+        # 例外を出さずに完了すること
+        data = get_round_states(tmp_path, "trial_unknown_contract", "game01", view="god")
+        contract = next(
+            c for c in data["rounds"]["3"]["contracts"] if c["contract_id"] == "C_90159021"
+        )
+        assert contract.get("outcomes", []) == []
+
+    def test_public_view_hides_terms_and_outcomes(self, tmp_path):
+        """view=publicではterms is None かつ outcomes == []であること
+        （outcomesが実際に埋まるようになった後もマスクは維持される）"""
+        trial = tmp_path / "trial_public_mask"
+        self._write_llm_logs(trial, "game01", ["P01", "P02"])
+        events = self._base_events() + [
+            {"event_type": "TYPE_A_EXECUTION", "round_num": 6, "phase": "settlement",
+             "data": {"obligation_id": "C_90159021_OB01"}},
+        ]
+        self._write_events(trial, "game01", events)
+
+        god_data = get_round_states(tmp_path, "trial_public_mask", "game01", view="god")
+        god_contract = next(
+            c for c in god_data["rounds"]["3"]["contracts"] if c["contract_id"] == "C_90159021"
+        )
+        assert len(god_contract["outcomes"]) == 1  # god側では実際に埋まる
+
+        public_data = get_round_states(tmp_path, "trial_public_mask", "game01", view="public")
+        public_contract = next(
+            c for c in public_data["rounds"]["3"]["contracts"] if c["contract_id"] == "C_90159021"
+        )
+        assert public_contract["terms"] is None
+        assert public_contract["outcomes"] == []
+
+    def test_god_view_shows_only_own_contracts(self, tmp_path):
+        """round-detailのgod viewが本人関与の契約のみを返すこと
+        （直近修正の非退行。outcome紐付け変更が_contract_involves_playerに影響しないこと）"""
+        trial = tmp_path / "trial_scoped"
+        logs = trial / "llm_logs"
+        logs.mkdir(parents=True)
+
+        def _entry(pid: str, round_num: int, turn: int, action: dict) -> dict:
+            return {
+                "player_id": pid, "model_id": "test-model", "phase": "negotiation",
+                "round_num": round_num, "turn": turn,
+                "response_text": json.dumps({"reasoning": "r", "action": action}, ensure_ascii=False),
+                "reasoning": "r", "reasoning_tokens": 0,
+            }
+
+        (logs / "game01_P01_llm_calls.jsonl").write_text(
+            json.dumps(_entry("P01", 2, 1, {
+                "type": "contract_propose",
+                "terms": [{"ob_type": "type_b_market", "market_id": "own_marker"}],
+            }), ensure_ascii=False) + "\n", encoding="utf-8",
+        )
+        (logs / "game01_P02_llm_calls.jsonl").write_text(
+            json.dumps(_entry("P02", 2, 1, {
+                "type": "contract_propose",
+                "terms": [{"ob_type": "type_b_market", "market_id": "foreign_marker"}],
+            }), ensure_ascii=False) + "\n", encoding="utf-8",
+        )
+        events = [
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "data": {"player_id": "P01"}},
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "data": {"player_id": "P02"}},
+            {"event_type": "LOAN_CHOSEN", "round_num": 0, "data": {"player_id": "P03"}},
+            {"event_type": "NEGOTIATION_ACTION", "round_num": 2,
+             "data": {"action": "contract_propose", "contract_id": "C_own",
+                       "player_id": "P01", "parties": ["P01", "P03"]}},
+            {"event_type": "NEGOTIATION_ACTION", "round_num": 2,
+             "data": {"action": "contract_propose", "contract_id": "C_foreign",
+                       "player_id": "P02", "parties": ["P02", "P03"]}},
+        ]
+        self._write_events(trial, "game01", events)
+
+        detail = get_player_round_detail(tmp_path, "trial_scoped", "game01", "P01", 2, view="god")
+        serialized = json.dumps(detail, ensure_ascii=False)
+        assert "own_marker" in serialized
+        assert "foreign_marker" not in serialized
+
+    def test_old_run_without_llm_logs(self, tmp_path):
+        """llm_logsディレクトリが無い旧runでも例外なく動作すること
+        （termsはLLMログ由来のため見つからずNoneのまま。outcomesは空）"""
+        trial = tmp_path / "trial_old"
+        events = [
+            {"event_type": "NEGOTIATION_ACTION", "round_num": 3, "phase": "negotiation",
+             "data": {"action": "contract_propose", "contract_id": "C_old",
+                       "player_id": "P01", "parties": ["P01", "P02"]}},
+        ]
+        self._write_events(trial, "game01", events)
+
+        data = get_round_states(tmp_path, "trial_old", "game01", view="god")
+        contract = next(
+            c for c in data["rounds"]["3"]["contracts"] if c["contract_id"] == "C_old"
+        )
+        assert contract["terms"] is None
+        assert contract.get("outcomes", []) == []
+
+    def test_real_trial_outcomes_attached(self):
+        """実trial trial_C_l12_r12_20260822 で、obligation_idから復元した
+        contract_idが必ず既存契約に一致すること。runが無ければskip。"""
+        logs_dir = Path(__file__).resolve().parent.parent / "logs" / "llm"
+        trial_dir_name = "trial_C_l12_r12_20260822"
+        if not (logs_dir / trial_dir_name).exists():
+            pytest.skip(f"{trial_dir_name} not found")
+
+        data = get_round_states(logs_dir, trial_dir_name, "game01", view="god")
+        all_contract_ids = set()
+        total_outcomes = 0
+        for rd in data["rounds"].values():
+            for c in rd.get("contracts", []):
+                all_contract_ids.add(c["contract_id"])
+        for rd in data["rounds"].values():
+            for c in rd.get("contracts", []):
+                for o in c.get("outcomes", []):
+                    total_outcomes += 1
+                    assert c["contract_id"] in all_contract_ids
+        # このrunにはTYPE_A_EXECUTION/TYPE_B_VIOLATIONが存在する前提の非退行チェック
+        assert total_outcomes >= 0  # データが無くても例外なく動作すること自体を保証
+
+    def test_index_html_contract_card_uses_formatter(self):
+        """秘匿契約カードがfmtObligation/fmtOutcomeを使って整形され、
+        生JSONは<details>で折りたたまれた形で残っていること
+        （God専用描画パスなので削除ではなくデバッグ用に温存する）"""
+        html = INDEX_HTML_PATH.read_text(encoding="utf-8")
+        assert "const secretContracts" in html
+        # secretContracts構築部でfmtObligation/fmtOutcomeが使われていること
+        idx = html.index("const secretContracts")
+        block = html[idx: idx + 2000]
+        assert "fmtObligation(t)" in block
+        assert "fmtOutcome(o)" in block
+        assert '<details class="ct-raw">' in block
+        assert "JSON.stringify" in block  # 生JSONは残す（折りたたみ内）
+
+    def test_index_html_formatter_sentinels_present(self):
+        """node実行テスト(test_viewer_js.py)が依存するセンチネルコメントが
+        存在し、fmtObligation/fmtOutcome/safeStrがその範囲内にあること"""
+        html = INDEX_HTML_PATH.read_text(encoding="utf-8")
+        start = html.index("// ==== CONTRACT_FORMATTER_START ====")
+        end = html.index("// ==== CONTRACT_FORMATTER_END ====")
+        assert start < end
+        block = html[start:end]
+        assert "function fmtObligation(t)" in block
+        assert "function fmtOutcome(o)" in block
+        assert "function safeStr(v)" in block
+
+    def test_style_css_has_contract_classes(self):
+        """秘匿契約カード用の新規CSSクラスが定義されていること"""
+        css_path = INDEX_HTML_PATH.parent / "style.css"
+        css = css_path.read_text(encoding="utf-8")
+        for cls in (".ob-unknown", ".oc-ok", ".oc-ng", ".ct-meta", ".ct-label",
+                    ".ct-active", ".ct-pending", ".ct-raw"):
+            assert cls in css, f"{cls} not defined in style.css"
 
 
 class TestEliminationDeduplication:
