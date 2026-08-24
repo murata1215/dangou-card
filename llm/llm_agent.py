@@ -453,6 +453,18 @@ class LLMAgent(PlayerAgent):
         self.auto_commit_count += 1
         raise ValueError("Failed to get valid commit from LLM")
 
+    def note_auto_commit(self, reason: str | None) -> None:
+        """
+        A-8: commit() が有効な MarketCommitAction を返したにもかかわらず、
+        engine側のvalidate_action()がそれを却下してAUTO COMMITになった経路を
+        記録する（例: 手札に無いカード名を指定した場合）。
+
+        従来 auto_commit_count は commit() 内部の例外経路（コスト超過・
+        parse失敗等）でのみ加算されており、validation失敗によるAUTOは
+        集計から漏れていた。engine/game.py の commit フェイズから呼ばれる。
+        """
+        self.auto_commit_count += 1
+
     def choose_double_up(
         self,
         player_state: PlayerState,

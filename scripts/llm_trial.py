@@ -155,6 +155,24 @@ def build_trial_manifest(
     }
 
 
+def _roster_summary(seat_map: dict[str, str]) -> str:
+    """
+    seat_map (pid -> "model_key:model_name") から実データで「N社Mモデル・LLM×P・Random 0体」を組み立てる。
+
+    C-1: 過去は "6社8モデル・LLM×8・Random 0体" が固定文字列で、12体試合を8体戦と誤認する
+    事故があった。ここでは実 seat_map の人数・distinct model_key・distinct provider から動的に導出する。
+    """
+    model_keys: set[str] = set()
+    providers: set[str] = set()
+    for v in seat_map.values():
+        model_key = v.split(":", 1)[0]
+        model_keys.add(model_key)
+        info = MODEL_REGISTRY.get(model_key)
+        if info is not None:
+            providers.add(info.provider)
+    return f"{len(providers)}社{len(model_keys)}モデル・LLM×{len(seat_map)}・Random 0体"
+
+
 def build_phase_c_agents(
     roster_keys: list[str], game_index: int, config: GameConfig, output_dir: Path,
     seed: int, max_output_tokens: int | None,
@@ -445,7 +463,11 @@ def generate_phase_c_report(
     """Phase Cレポートを生成する"""
     lines: list[str] = []
     lines.append("# Step 3C: 全LLM戦レポート\n")
-    lines.append(f"- 構成: **6社8モデル・LLM×8・Random 0体**")
+    if results:
+        _, _, _, first_seat_map = results[0]
+        lines.append(f"- 構成: **{_roster_summary(first_seat_map)}**")
+    else:
+        lines.append("- 構成: **(データなし)**")
     lines.append(f"- 設定: RULESET_BASELINE_V1 ({config.num_rounds}R, survival={config.survival_cash // 10_000}万)")
     lines.append(f"- 試合数: {len(results)}")
     lines.append(f"- 実行時間: {elapsed:.1f}秒")
@@ -457,6 +479,13 @@ def generate_phase_c_report(
     lines.append("")
 
     total_cost = 0.0
+    # T-R4: results=[] でも末尾の全体サマリ行が参照できるよう、ループ外で初期化する
+    # （旧実装はfor内で毎試合リセットしていたため、results=[]でUnboundLocalError、
+    # 複数試合でも最後の試合のトークン数しか反映されなかった）。
+    total_input = 0
+    total_output = 0
+    total_cache = 0
+    total_think = 0
 
     for game_idx, (result, llm_agents, event_logger, seat_map) in enumerate(results):
         lines.append(f"## 試合 {game_idx + 1}\n")
@@ -488,13 +517,9 @@ def generate_phase_c_report(
 
         # モデル別集計（Stage 3: トークン内訳付き）
         lines.append("\n### モデル別集計\n")
-        lines.append("| 座席 | モデル | JSON率 | AUTO | ERR | Calls | Input | Output | Cache | Think | コスト |")
-        lines.append("|---|---|---|---|---|---|---|---|---|---|---|")
+        lines.append("| 座席 | モデル | JSON率 | AUTO | FAILURE | ERR | Calls | Input | Output | Cache | Think | コスト |")
+        lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
 
-        total_input = 0
-        total_output = 0
-        total_cache = 0
-        total_think = 0
         for agent in llm_agents:
             pid = agent.player_id
             model_name = seat_map.get(pid, "?")
@@ -504,6 +529,12 @@ def generate_phase_c_report(
             total_cost += cost
             # エラー数を集計
             errors = sum(1 for e in agent.llm_logger.entries if e.get("error"))
+            # C-3: AUTO_COMMIT_FAILURE（合法commitゼロで脱落）を AUTO 列とは別に集計
+            auto_failures = sum(
+                1 for e in event_logger.events
+                if e.event_type == "AUTO_COMMIT_FAILURE"
+                and e.data.get("player_id") == pid
+            )
             # トークン内訳集計
             inp_tok = sum(e.get("input_tokens", 0) or 0 for e in agent.llm_logger.entries)
             out_tok = sum(e.get("output_tokens", 0) or 0 for e in agent.llm_logger.entries)
@@ -518,7 +549,7 @@ def generate_phase_c_report(
                 if n >= 1_000_000: return f"{n/1_000_000:.1f}M"
                 if n >= 1_000: return f"{n/1_000:.0f}k"
                 return str(n)
-            lines.append(f"| {pid} | {model_name} | {json_rate} ({pct:.0f}%) | {agent.auto_commit_count} | {errors} | {agent.total_calls} | {_fmtk(inp_tok)} | {_fmtk(out_tok)} | {_fmtk(cache_tok) if cache_tok else '-'} | {_fmtk(think_tok) if think_tok else '-'} | ${cost:.4f} |")
+            lines.append(f"| {pid} | {model_name} | {json_rate} ({pct:.0f}%) | {agent.auto_commit_count} | {auto_failures} | {errors} | {agent.total_calls} | {_fmtk(inp_tok)} | {_fmtk(out_tok)} | {_fmtk(cache_tok) if cache_tok else '-'} | {_fmtk(think_tok) if think_tok else '-'} | ${cost:.4f} |")
 
         # 行動観察
         lines.append("\n### 行動観察\n")
@@ -705,10 +736,20 @@ def regenerate_phase_c_report(log_dir: Path) -> None:
     llm_logs_dir = log_dir / "llm_logs"
     seat_map_path = log_dir / "game01_seat_map.json"
     events_path = log_dir / "game01_events.jsonl"
+    manifest_path = log_dir / "trial_manifest.json"
 
     if not llm_logs_dir.exists():
         print(f"ログディレクトリが見つかりません: {llm_logs_dir}")
         return
+
+    # C-2: run_id / seed / 予定ラウンド数は trial_manifest.json（Phase C実行時にのみ書かれる）から取る。
+    # 無い場合（旧ログ・Phase B等）はNoneのまま扱い、表示側でフォールバックする。
+    manifest: dict[str, Any] = {}
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            manifest = {}
 
     # 座席マップ読み込み
     seat_map: dict[str, str] = {}
@@ -774,11 +815,22 @@ def regenerate_phase_c_report(log_dir: Path) -> None:
     else:
         elapsed = 0.0
 
+    # C-3 (report): 予定R数 vs 完走R数。manifest優先、無ければROUND_COMPLETEイベントから推定。
+    rounds_planned = manifest.get("num_rounds")
+    round_complete_nums = [
+        e.get("round_num") for e in events if e.get("event_type") == "ROUND_COMPLETE"
+    ]
+    rounds_completed = max(round_complete_nums) if round_complete_nums else None
+    if rounds_planned is None:
+        rounds_planned = rounds_completed
+    total_calls_all = sum(len(c) for c in player_calls.values())
+
     # --- プレイヤー別統計 ---
     stats: dict[str, dict[str, Any]] = {}
     for pid, calls in player_calls.items():
         valid = 0
         auto_commit = 0
+        auto_failure = 0
         errors = 0
         latencies: list[float] = []
         cost = 0.0
@@ -808,11 +860,17 @@ def regenerate_phase_c_report(log_dir: Path) -> None:
                 except Exception:
                     pass
 
-        # AUTO COMMITカウント（イベントログから）
+        # AUTO COMMITカウント（イベントログから）。
+        # C-3: AUTO_COMMIT_FAILURE（合法commitゼロで脱落）はAUTO列に出ないバグがあったため
+        # auto_failure として別集計する。
         for e in events:
-            if (e.get("event_type") == "AUTO_COMMIT"
-                    and e.get("data", {}).get("player_id") == pid):
+            if e.get("data", {}).get("player_id") != pid:
+                continue
+            et = e.get("event_type")
+            if et == "AUTO_COMMIT":
                 auto_commit += 1
+            elif et == "AUTO_COMMIT_FAILURE":
+                auto_failure += 1
 
         total_lat = sum(latencies)
         avg_lat = total_lat / len(latencies) if latencies else 0
@@ -821,6 +879,7 @@ def regenerate_phase_c_report(log_dir: Path) -> None:
             "calls": len(calls),
             "valid": valid,
             "auto_commit": auto_commit,
+            "auto_failure": auto_failure,
             "errors": errors,
             "avg_lat": avg_lat,
             "total_lat": total_lat,
@@ -830,10 +889,24 @@ def regenerate_phase_c_report(log_dir: Path) -> None:
         }
 
     # --- レポート生成 ---
+    # RULESET_BASELINE_V1 は survival_cash=2,000,000 固定（S1/S2共通、engine/config.py:284,294）。
+    # manifestにもイベントにも生存条件金額そのものは記録されないため、この値のみプリセット定数として扱う。
+    survival_cash_baseline_v1 = 2_000_000
     lines: list[str] = []
     lines.append("# Step 3C: 全LLM戦レポート\n")
-    lines.append("- 構成: **6社8モデル・LLM×8・Random 0体**")
-    lines.append("- 設定: RULESET_BASELINE_V1 (12R, survival=200万)")
+    lines.append(f"- 構成: **{_roster_summary(seat_map)}**")
+    rounds_str = f"{rounds_planned}R" if rounds_planned is not None else "?R"
+    lines.append(
+        f"- 設定: RULESET_BASELINE_V1 ({rounds_str}, "
+        f"survival={survival_cash_baseline_v1 // 10_000}万)"
+    )
+    if manifest.get("run_id"):
+        lines.append(f"- run_id: `{manifest['run_id']}` / seed: {manifest.get('seed', '?')}")
+    if rounds_planned is not None and rounds_completed is not None:
+        status = "" if rounds_completed >= rounds_planned else "（途中停止）"
+        lines.append(f"- ラウンド: 予定{rounds_planned}R / 完走{rounds_completed}R{status}")
+    lines.append(f"- 生還: {len(survivors_data)}人 / 脱落: {len(eliminated_data)}人")
+    lines.append(f"- 総LLMコール数: {total_calls_all}")
     lines.append(f"- 実行時間: {elapsed:.0f}秒 ({elapsed / 3600:.1f}時間)")
     lines.append("")
 
@@ -866,8 +939,8 @@ def regenerate_phase_c_report(log_dir: Path) -> None:
 
     # === モデル別集計 ===
     lines.append("\n## モデル別集計\n")
-    lines.append("| 座席 | モデル | JSON率 | AUTO | エラー | コール数 | 平均レイテンシ | 総レイテンシ | コスト |")
-    lines.append("|---|---|---|---|---|---|---|---|---|")
+    lines.append("| 座席 | モデル | JSON率 | AUTO | FAILURE | エラー | コール数 | 平均レイテンシ | 総レイテンシ | コスト |")
+    lines.append("|---|---|---|---|---|---|---|---|---|---|")
     total_cost = 0.0
     total_calls = 0
     total_valid = 0
@@ -885,7 +958,7 @@ def regenerate_phase_c_report(log_dir: Path) -> None:
         total_lat = s.get("total_lat", 0)
         lines.append(
             f"| {pid} | {model} | {valid_n}/{calls_n} ({pct:.0f}%) "
-            f"| {s.get('auto_commit', 0)} | {s.get('errors', 0)} | {calls_n} "
+            f"| {s.get('auto_commit', 0)} | {s.get('auto_failure', 0)} | {s.get('errors', 0)} | {calls_n} "
             f"| {avg_lat:.1f}s | {total_lat:.0f}s | ${cost:.4f} |"
         )
 

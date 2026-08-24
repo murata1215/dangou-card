@@ -1,5 +1,115 @@
 # Changelog
 
+## 2026-08-24: Cycle 4: Phase2予算上限調整 + anonymous_broadcast送信者本人self-marker
+
+Cycle 3 Human Review（GO）で確定した2件の積み残しをまとめて実装した。
+
+- **Part A（予算）**: Cycle 3のPrompt追加（129文字増）でCORE_18予約合計が`PHASE_DEFAULTS[2]["max_cost"]`
+  （$0.22）を$0.0011987（0.54%）超過し`xfail(strict=True)`で可視化していた件、人間判断により
+  `scripts/model_matrix.py`の同値を$0.23へ引き上げてxfailを解除した（headroom $0.0088013/3.83%を確保）。
+  予約計算ロジック・他Phaseの`max_cost`・per-model cap・モデル単価は無変更。
+- **Part B（self-marker）**: `anonymous_broadcast`の送信者本人が自分の匿名発言をメタデータ上識別できず、
+  次ラウンドのreflection prompt（＝Handover Memory生成入力）で自分の発言を他人のものと誤認する余地が
+  あった。`llm/prompt_builder.py`はvisible_stateしか受け取らず送信者情報が無いため、`engine/game.py`に
+  `_anon_broadcast_owners: dict[int, str]`（`_round_messages`のindex→実送信者、`_god_transcript`には積まない
+  私的情報）を追加し、`_reset_round_message_state()`で`_round_messages`と**同一関数内で同時にクリア**する
+  設計とした（片方だけ残すと新ラウンドでindexが再利用された際に前ラウンドの所有者が誤適用される
+  state corruptionを構造的に排除するため）。`_visible_messages()`は本人向けコピーにのみ`"is_mine": True`を
+  付与（他プレイヤー・Bot経路はキー自体が無い、既存の`redacted`と同じ慣習）。`llm/prompt_builder.py`は
+  `is_mine`が真のとき`[匿名/あなたが送信]`、それ以外は従来どおり`[匿名]`。`RULES_SUMMARY`・戦略助言文言は
+  無変更。`engine/actions.py`/`config.py`/`settlement.py`/`viewer/**`は無変更。
+
+新規`tests/test_anon_self_marker.py`（16件、owner登録・reject非登録・同一本文index判定・ラウンド境界同時
+clear・stale owner非漏洩・再代入箇所のソーススキャン固定・本人marker/他人フィールド欠如・God View不変・
+reflection/commit伝播・Viewer投影不変・戦略助言0件）全PASS。API-free人工ケース（repo外`/tmp/cycle4_synth/`、
+実Engine/StubAgent/PromptBuilder使用・実APIコール0件）でHuman Review必須10ケースを実出力確認、特にR1で
+P01が使ったindex=0をR2でP02が再利用した際に誤適用されないことを実証。回帰1271/1271PASS（xfail 0件）、
+`dry_run.py`正常終了（12人・seed=42・578イベント、Cycle3から数値不変）。成果物:
+`.devrelay-output/cycle4_anon_self_marker_review_20260824_224516.md`。実API0件・Cycle5/R12 Acceptance Test
+起動なしで停止（詳細: `doc/devlog/2026-08-24_224516.md`）。
+
+## 2026-08-24: Cycle 3: anonymous_broadcast / bounty / card_trade 利用経路監査
+
+12体×R12 Acceptance Test前に、残る戦略アクション3種が「AIが使おうと思えば正しく使える」状態かを
+API-freeで監査した。`llm/prompt_builder.py`のみ変更（Engine変更ゼロ）。
+
+- **E1**: `anonymous_broadcast`のJSON形式をaction一覧に追加（schema/parser/engineは対応済みだが
+  Promptに形式が無かった）。
+- **E2**: Engineが既に構築していた`bounties_public`を`build_negotiation_prompt()`に描画（従来は
+  bounty_idを取得する手段が皆無で`bounty_cancel`が構造的に不可能だった）。
+- **E3**: `bounty_cancel`のJSON形式をaction一覧に追加。
+- **E4-a/b**: 匿名通信費が現金払い・Free Cash制限外である事実を機能説明直下に再掲し、表示の参照元を
+  `entry_fee`由来から`anon_broadcast_fee`由来へ修正（両設定値が偶然同額だったため従来は表面化していな
+  かった表示バグ、`entry_fee != anon_broadcast_fee`の回帰テストで検証）。
+
+card_tradeはコード修正なし（過去の指定失敗は`ACTION_CONSTRUCTION_ERROR`と確定、失敗feedback配線は
+既存commitで解消済みを再確認）。新規`tests/test_prompt_action_paths.py`（14件）全PASS。Phase A（repo外
+`/tmp/cycle3_phase_a.py`）でR12実戦ログの8段階マトリクスを独立再集計しPlan記載数値と完全一致、Phase D
+（repo外`/tmp/cycle3_synth/`、実APIコール0件）で3機能のend-to-end実出力（秘匿境界・bounty往復・
+card_trade往復）を確認。回帰1254/1254PASS+xfail1件（E1+E3のprompt増分でPhase2予算上限を0.54%超過する
+既存の緊張関係を発見し`PHASE_DEFAULTS`は無変更のまま可視化、Cycle 4で人間判断により解消）、`dry_run.py`
+正常終了（578イベント）。成果物: `.devrelay-output/cycle3_action_path_review_20260824_210659.md`。実API0件・
+Cycle4/R12 Acceptance Test起動なしで停止（詳細: `doc/devlog/2026-08-24_210659.md`）。
+
+## 2026-08-24: サイクル2.2: Cycle 2 wording-only fix（残る断定文2分岐+通常Finance不足文の中立化）
+
+サイクル2.1で未対応のまま残っていた`_obligation_conflict_warnings()`の市場競合分岐・参加×不参加競合
+分岐と、`_render_finance_block()`の通常Finance不足文の計3箇所を、`llm/prompt_builder.py`の文字列
+リテラルのみで「事実＋ルール制約のみを提示し、違反・脱落という結果は書かない」文体へ統一した
+（`⚠`・「必ず違反で脱落」・「矛盾」・「不足します」・`MANDATORY_REPAY_FAILED（強制清算・脱落）になります`
+を除去、if条件・数値計算・処理順・Engineは無変更）。`build_double_up_prompt()`はサイクル2.1で対応済み
+のため今回はtouchせず維持確認のみ。
+
+`tests/test_prompt_finance.py`の既存3テストのassertを更新し、新規2テスト（Finance不足行が数値事実のみ
+であることの直接確認／Cycle 2追加ブロック限定のJUDGMENT語彙12語スキャン）を追加。回帰1241/1241PASS
+（新規2件）、`dry_run.py`正常終了、`git diff --stat engine/`は増減ゼロ、`llm/prompt_builder.py`内の`⚠`
+出現数は6→3（残る3件はスコープ外指定箇所と完全一致）。API-free再チェック（repo外`/tmp/cycle2_recheck2/`）
+で旧文0ヒット・新文出現・数値完全維持・語彙スキャン新規混入ゼロを確認し
+`.devrelay-output/cycle2_wording_recheck2_20260824_130510.md`に出力（最終判定GO）。実API0件・commit/push
+無し・Cycle3着手やR12実戦起動はせず停止（詳細: `doc/devlog/2026-08-24_130601.md`）。
+
+## 2026-08-24: サイクル2.1: Cycle 2 wording-only fix（境界事例2文の中立化）
+
+Cycle 2 Human Reviewで唯一の留保事項として残った、double-up Promptの不足警告文と契約義務の競合表示
+（type_b_card分岐）の2文だけを、`llm/prompt_builder.py`で結果断定を含まない数値事実・ルール事実のみの
+表現に置き換えた（ゲームルール・計算式・Engineは無変更のwording-only fix）。同関数内の他2分岐（市場
+競合・参加/不参加競合）と`_render_finance_block()`の不足警告文はスコープ外として意図的に非変更のまま
+残した（サイクル2.2で解消）。
+
+影響した既存テスト3関数のみ最小更新。回帰1239/1239PASS（新規0件、純粋な文言更新のみ）、`dry_run.py`
+正常終了、`git diff --stat engine/`は増減ゼロ。API-free再チェックスクリプトで旧文0ヒット・新文出現・
+数値完全維持・助言語彙12語スキャンが増加していないことを確認し
+`.devrelay-output/cycle2_wording_recheck_20260824_120820.md`に出力。実API0件・commit/push無し・Cycle3
+着手やR12実戦起動はせず停止（詳細: `doc/devlog/2026-08-24_120934.md`）。
+
+## 2026-08-24: Cycle 2: 契約・財務・倍掛けの「事故死」要因を除去
+
+前回の12人R12実戦（`logs/llm/trial_C_l12_r12_20260822/`）で脱落した7名のうち、AUTO COMMIT経路を除く
+残りが「盤面の事実がプロンプトに出ていない／engineの実装と食い違う」ことによる事故死だった。
+`llm/prompt_builder.py`のみ変更（engineルールは無変更）。
+
+- `_render_finance_block()`/`_compute_finance_forecast()`新設: 今Rの借金残高・利息・強制最低返済額
+  （実額）・差引後現金見込みを`engine.player.apply_interest`/`compute_mandatory_repayment`を直接
+  再利用して算出し、negotiation/commit/reflection/double_upの4プロンプトに注入。
+- 「残りラウンド」表示のoff-by-one解消（`num_rounds - round_num + 1`に統一）。
+- `build_double_up_prompt`に同一ラウンドのFinance処理順の事実とTAKE/DOUBLE双方のFinance後現金見込みを
+  数値で併記。
+- `_render_obligations_block()`の型B義務に手札との突合注記を付与し、矛盾検出を3型（type_b_card×2 /
+  type_b_market×2異市場 / type_b_market+type_b_no_market同一市場）に拡張。
+- `contracts_pending`に署名した場合の合流後義務プレビューを追加。
+- Entry Feeの実額と自動徴収タイミング、自分の倍掛け預託額を財務ブロックに明記。
+
+助言語彙（すべき/推奨します/危険/安全な/おすすめ/注意しましょう）は一切追加せず、機械スキャンで0件を
+確認。Cycle 1未了タスクとして`tests/test_prompt_finance.py`（新規17件）・`tests/test_viewer.py`拡張
+（4件）・`tests/test_trial_report.py`（新規9件、副産物として`generate_phase_c_report()`の
+`UnboundLocalError`/複数試合トークン集計バグを発見・修正）も消化。
+
+回帰1239/1239PASS（新規30件）、`dry_run.py`/`simulate.py --games 1000`正常終了、`git diff --stat`で
+`engine/autocommit.py`・`engine/finance.py`・`engine/settlement.py`・`engine/contracts.py`・
+`engine/actions.py`が全て0行を確認。人間レビュー用プロンプトスナップショット6点を
+`.devrelay-output/cycle2_prompt_snapshots_20260824_072949.md`に出力。実API0件・commit/push無し・Cycle3
+着手やR12実戦起動はせず、人間のGO判定待ちで停止（詳細: `doc/devlog/2026-08-24_072954.md`）。
+
 ## 2026-08-23: 全当事者合意による契約解除（contract_cancel）
 
 実runでP11/P06の間に同一R・同一市場に両立不能な条件（TWO_PAIR要求とONE_PAIR要求）の契約が

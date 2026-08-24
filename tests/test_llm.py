@@ -683,9 +683,12 @@ class TestStep31Fixes:
         ]}
         lines = _render_obligations_block("P01", visible, 5)
         text = "\n".join(lines)
-        assert "⚠" in text
+        assert "カード使用義務が2件あります" in text
         assert "2件" in text
         assert "1枚" in text
+        # Cycle 2 wording-only fix: 結果断定・警告記号を排し事実提示のみにする
+        assert "⚠" not in text
+        assert "必ず違反" not in text
 
     def test_obligations_no_conflict_for_single_card(self):
         """同一ラウンドにtype_b_card義務1件ならコンフリクト警告が出ないこと"""

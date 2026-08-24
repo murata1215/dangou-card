@@ -154,7 +154,7 @@ temperature互換フォールバックを無効化する。成功・parse失敗�
 
 ```bash
 uv run python scripts/model_matrix.py --phase 2 --run-id run_20260818_041810 \
-  --resume --tier all --max-cost 0.22 --max-cost-per-model 0.03 \
+  --resume --tier all --max-cost 0.23 --max-cost-per-model 0.03 \
   --max-calls 24 --max-tokens 400 --retries 0 --max-cost-total 0.25
 ```
 

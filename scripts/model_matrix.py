@@ -18,7 +18,7 @@
     uv run python scripts/model_matrix.py --phase 0
     uv run python scripts/model_matrix.py --phase 1 --dry-run
     uv run python scripts/model_matrix.py --phase 1 --tier weak,mid,strong --max-cost 0.08
-    uv run python scripts/model_matrix.py --phase 2 --max-cost 0.22
+    uv run python scripts/model_matrix.py --phase 2 --max-cost 0.23
     uv run python scripts/model_matrix.py --phase 3 --tier weak,mid --max-cost 0.20
     uv run python scripts/model_matrix.py --phase 3 --tier strong --max-cost 0.45 --max-cost-per-model 0.10
     uv run python scripts/model_matrix.py --report
@@ -90,7 +90,7 @@ DEFAULT_SEED = 901
 
 PHASE_DEFAULTS: dict[int, dict[str, Any]] = {
     1: {"max_cost": 0.08, "max_cost_per_model": 0.02, "max_calls": 40, "max_tokens": 64, "retries": 1},
-    2: {"max_cost": 0.22, "max_cost_per_model": 0.03, "max_calls": 24, "max_tokens": 400, "retries": 0},
+    2: {"max_cost": 0.23, "max_cost_per_model": 0.03, "max_calls": 24, "max_tokens": 400, "retries": 0},
     3: {"max_cost": 0.20, "max_cost_per_model": 0.03, "max_calls": 96, "max_tokens": 500, "retries": 0},
 }
 

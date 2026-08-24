@@ -198,8 +198,13 @@ def test_gemini_phase2_overrides_and_reserves_are_model_specific():
     # 2026-08-23サイクル「全当事者合意による契約解除（contract_cancel）」でアクションカタログに
     # contract_cancel の説明文を追加し、system prompt長が変化したため期待値を更新（意図的な
     # 一度きりの変更。このコミットを跨ぐキャッシュ率・コスト予約値は比較不可）。
-    assert mm._phase2_worst_case_cost(MODEL_REGISTRY["M3"], system, 512) == pytest.approx(0.0147945)
-    assert mm._phase2_worst_case_cost(MODEL_REGISTRY["H3"], system, 912) == pytest.approx(0.024526)
+    # Cycle 2（2026-08-24）: RULES_SUMMARYの強制最低返済の説明文を実装（除数の定義）に
+    # 合わせて訂正したことでsystem prompt長が変化したため、再度期待値を更新。
+    # Cycle 3（2026-08-24）: anonymous_broadcast/bounty_cancel のJSON action形式を
+    # アクションカタログへ追加（Plan E1/E3、PROMPT_DISCOVERY_GAPの是正）したことで
+    # system prompt長が変化したため、三度目の期待値更新。
+    assert mm._phase2_worst_case_cost(MODEL_REGISTRY["M3"], system, 512) == pytest.approx(0.014994)
+    assert mm._phase2_worst_case_cost(MODEL_REGISTRY["H3"], system, 912) == pytest.approx(0.024792)
     assert mm._phase2_worst_case_cost(MODEL_REGISTRY["M3"], system, 512) < 0.03
     assert mm._phase2_worst_case_cost(MODEL_REGISTRY["H3"], system, 912) < 0.03
 

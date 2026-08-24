@@ -2683,3 +2683,105 @@ class TestPostGameReflectionViewer:
         fr_b = detail_b["result"]["final_reflection"]
         assert set(fr_a.keys()) == set(fr_b.keys())
         assert fr_a == fr_b
+
+
+class TestCommitKindTracking:
+    """
+    Cycle 1 未了タスク（T-V1〜T-V4）。
+
+    get_round_states() の rounds[R].commits[].commit_kind（"auto"/"self"）は
+    viewer/static/index.html からは参照されている（`c.commit_kind === 'auto'`）が、
+    これまで tests/test_viewer.py に直接の検証が無かった（既存の
+    TestEliminationRoundDisplay 系は rounds[R].eliminated[].commit_kind="failure"
+    のみをカバーしており、commits[] 側の auto/self 区別は未検証だった）。
+
+    COMMIT イベント（`data.auto`）は REVEAL イベント（正・rank付き）より先に
+    発火するため、commit_auto[(round_num, player_id)] に記録された値を
+    REVEAL処理時に引いて commit_kind を決める（本体: viewer/log_parser.py
+    のREVEAL/COMMIT分岐）。
+    """
+
+    def _write_events(self, trial: Path, game_id: str, events: list[dict]) -> None:
+        trial.mkdir(exist_ok=True)
+        (trial / f"{game_id}_events.jsonl").write_text(
+            "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in events), encoding="utf-8",
+        )
+
+    def test_t_v1_commit_then_reveal_auto_true_marks_auto(self, tmp_path):
+        """T-V1: COMMIT(auto=True) → REVEAL の順で来た場合、commits[]のcommit_kindが"auto\""""
+        trial = tmp_path / "trial_ck_auto"
+        events = [
+            {"event_type": "COMMIT", "round_num": 1, "phase": "commit",
+             "data": {"player_id": "P01", "market_id": "M01", "card": "HIGH_CARD_1", "auto": True}},
+            {"event_type": "REVEAL", "round_num": 1, "phase": "settlement",
+             "data": {"commits": [
+                 {"player_id": "P01", "market_id": "M01", "card": "HIGH_CARD_1", "rank": "HIGH_CARD"},
+             ]}},
+        ]
+        self._write_events(trial, "game01", events)
+
+        data = get_round_states(tmp_path, "trial_ck_auto", "game01")
+        commits = data["rounds"]["1"]["commits"]
+        assert len(commits) == 1
+        assert commits[0]["player_id"] == "P01"
+        assert commits[0]["commit_kind"] == "auto"
+
+    def test_t_v2_commit_then_reveal_auto_false_marks_self(self, tmp_path):
+        """T-V2: COMMIT(auto=False) → REVEAL の順で来た場合、commits[]のcommit_kindが"self\""""
+        trial = tmp_path / "trial_ck_self"
+        events = [
+            {"event_type": "COMMIT", "round_num": 1, "phase": "commit",
+             "data": {"player_id": "P01", "market_id": "M01", "card": "HIGH_CARD_1", "auto": False}},
+            {"event_type": "REVEAL", "round_num": 1, "phase": "settlement",
+             "data": {"commits": [
+                 {"player_id": "P01", "market_id": "M01", "card": "HIGH_CARD_1", "rank": "HIGH_CARD"},
+             ]}},
+        ]
+        self._write_events(trial, "game01", events)
+
+        data = get_round_states(tmp_path, "trial_ck_self", "game01")
+        commits = data["rounds"]["1"]["commits"]
+        assert len(commits) == 1
+        assert commits[0]["commit_kind"] == "self"
+
+    def test_t_v3_reveal_without_preceding_commit_falls_back_to_self(self, tmp_path):
+        """T-V3: COMMITイベントを含まない旧形式ログ（REVEALのみ）との後方互換。
+        commit_auto に対応エントリが無いため False 扱い→commit_kind="self\""""
+        trial = tmp_path / "trial_ck_legacy"
+        events = [
+            {"event_type": "REVEAL", "round_num": 1, "phase": "settlement",
+             "data": {"commits": [
+                 {"player_id": "P01", "market_id": "M01", "card": "HIGH_CARD_1", "rank": "HIGH_CARD"},
+             ]}},
+        ]
+        self._write_events(trial, "game01", events)
+
+        data = get_round_states(tmp_path, "trial_ck_legacy", "game01")
+        commits = data["rounds"]["1"]["commits"]
+        assert len(commits) == 1
+        assert commits[0]["commit_kind"] == "self"
+
+    def test_t_v4_commit_only_no_reveal_yet_preserves_kind_and_dedups(self, tmp_path):
+        """T-V4: REVEAL到達前（settlement前）の中間状態。COMMITイベント由来の
+        rd["commits"]がcommit_kindを正しく保持し、同一(player_id, card)の重複が
+        除去されること"""
+        trial = tmp_path / "trial_ck_midround"
+        events = [
+            {"event_type": "COMMIT", "round_num": 1, "phase": "commit",
+             "data": {"player_id": "P01", "market_id": "M01", "card": "HIGH_CARD_1", "auto": True}},
+            # 同一(player_id, card)の重複COMMIT（ログ再送等を模した防御確認）
+            {"event_type": "COMMIT", "round_num": 1, "phase": "commit",
+             "data": {"player_id": "P01", "market_id": "M01", "card": "HIGH_CARD_1", "auto": True}},
+            {"event_type": "COMMIT", "round_num": 1, "phase": "commit",
+             "data": {"player_id": "P02", "market_id": "M02", "card": "ONE_PAIR_1", "auto": False}},
+        ]
+        self._write_events(trial, "game01", events)
+
+        data = get_round_states(tmp_path, "trial_ck_midround", "game01")
+        commits = data["rounds"]["1"]["commits"]
+        assert len(commits) == 2  # dedup済み（P01の重複は1件に）
+
+        by_pid = {c["player_id"]: c for c in commits}
+        assert by_pid["P01"]["commit_kind"] == "auto"
+        assert by_pid["P01"]["rank"] is None  # REVEAL未到達のためrank情報は無い
+        assert by_pid["P02"]["commit_kind"] == "self"

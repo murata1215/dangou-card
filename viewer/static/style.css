@@ -466,6 +466,14 @@ body > .god-banner { margin: 0; border-radius: 0; text-align: center; }
 .sit-ok { color: #5cc98a; font-weight: bold; }
 .sit-debt { color: var(--pid-alt); }
 .sit-elim { color: var(--text-muted); }
+/* A-7: AUTO COMMIT / AUTO COMMIT失敗 の視覚的区別（神視点のみ）。
+   「本人が約束を破った」のではなく「システムが代行した/合法な提出が
+   1つも無かった」ことを一目で判別できるようにする。 */
+.auto-badge {
+  display: inline-block; padding: 1px 6px; margin-left: 4px; border-radius: 4px;
+  background: #6b5b1f; color: #ffe08a; font-size: 10.5px; font-weight: bold;
+}
+.auto-badge-failure { background: #7a2b2b; color: #ffb3b3; }
 .sit-msg { padding: 2px 0; font-size: 12.5px; color: var(--text-secondary); line-height: 1.6; }
 .sit-msg b { color: var(--text); }
 .sit-msg.dm { color: var(--action-type); }

@@ -1194,6 +1194,10 @@ function renderSituation() {
   const players = situationData.players || [];
   const elimMap = {};
   (rd.eliminated || []).forEach(x => { elimMap[x.player_id] = x.reason; });
+  // A-7: AUTO_COMMIT_FAILURE経由の脱落（合法な提出が1つも無かった）を
+  // 通常の脱落と視覚的に区別するためのマップ。
+  const elimKindMap = {};
+  (rd.eliminated || []).forEach(x => { elimKindMap[x.player_id] = x.commit_kind || null; });
 
   // 1) 市場
   let mHtml = '<div class="sit-card"><h4>🏪 市場の賞金</h4>';
@@ -1230,7 +1234,8 @@ function renderSituation() {
     const survive = (x.debt === 0 && x.cash != null && x.cash >= currentSurvivalCash);
     const ok = survive ? ' <span class="sit-ok">✅生還圏</span>' : '';
     const debtStr = (x.debt != null && x.debt > 0) ? ` <span class="sit-debt">借金${yen(x.debt)}</span>` : '';
-    const elimStr = elim ? ` <span class="sit-elim">脱落(${elimMap[x.pid]})</span>` : '';
+    const failureBadge = elimKindMap[x.pid] === 'failure' ? ' <span class="auto-badge auto-badge-failure" title="合法な提出が1つも無く脱落">AUTO失敗</span>' : '';
+    const elimStr = elim ? ` <span class="sit-elim">脱落(${elimMap[x.pid]})</span>${failureBadge}` : '';
     rHtml += `<div class="sit-row">${i + 1}. <b>${escapeHtml(pidLabel(x.pid))}</b> ${yen(x.cash)}${debtStr}${ok}${elimStr}</div>`;
   });
   rHtml += '</div>';
@@ -1245,8 +1250,11 @@ function renderSituation() {
       const c = byPid[pid];
       if (!c) return;
       const info = cardInfo(c.card);
+      // A-7: AUTO COMMITだった提出を本人提出と区別して表示する
+      // （「約束を破った」ではなく「システムが代行した」ことが神視点で分かるように）。
+      const autoBadge = c.commit_kind === 'auto' ? ' <span class="auto-badge">AUTO</span>' : '';
       cHtml += `<div class="sit-row"><b>${escapeHtml(pidLabel(pid))}</b> → `
-        + `<span class="card-chip" title="強さ${info.v}">${info.l}</span> @${c.market_id || '?'}</div>`;
+        + `<span class="card-chip" title="強さ${info.v}">${info.l}</span> @${c.market_id || '?'}${autoBadge}</div>`;
     });
   } else {
     cHtml += '<div class="sit-row sit-muted">提出情報なし</div>';

@@ -118,6 +118,13 @@ earlier_for_thinking_models`・`test_budgeted_adapter_plain_models_unaffected`�
 (3) `scripts/model_smoke.py --suite thinking_matrix` はケース単位で`extra_params`を上書きし
 DeepSeek等でもthinkingを強制有効化するため、モデル単位の`hidden_thinking_reserve_tokens=0`
 前提が崩れる（手動診断専用・`--max-cost`明示前提のため据置、既知の残余リスクとして明記のみ）。
+(4) `PHASE_DEFAULTS[2]["max_cost"]`自体（見積計算式ではなく上限値そのもの）は、system prompt長の
+増加でCORE_18予約合計が上限へ接近・超過した際に**人間が個別サイクルで判断して調整する値**であり、
+見積ロジックが自動追随することはない。Cycle 3でaction一覧2行追加（129文字増）により0.54%超過し
+`xfail(strict=True)`で可視化、Cycle 4で人間判断により$0.22→$0.23へ引き上げてheadroom 3.83%を確保した
+（`scripts/model_matrix.py`側の予約計算ロジック・他Phaseの`max_cost`・per-model cap・モデル単価は
+無変更）。system prompt長を変えない変更であれば`reservations["H1"] == 0.0289`（`tests/test_model_matrix.py`）
+が不変であることが、予約計算ロジック側を触っていないことの検知テストとして機能する。
 
 ## matrixのstrict retryは下位再送・temperature fallbackも明示的に止める
 
@@ -461,3 +468,30 @@ LLMログ1件をこの索引と突き合わせる`_match_delivery()`を経由し
 end-to-endテスト、public view非漏洩テストを含む）。実データ照合:
 `trial_C_l12_r12_20260822`でdelivered:653/rejected:25/unverified:4、P06→P09のR7-R9全25件が
 `rejected`かつ`reject_reason`一致を確認済み。
+
+## 匿名性を破らずに送信者本人だけへ事実を返す: index-keyed private map パターン
+
+`anonymous_broadcast`は他プレイヤーに対しては`sender: None`で正しく匿名だが、送信者本人にとっても
+同じ形で返ってしまうため、本人が次ラウンドのreflection prompt（＝Handover Memory生成入力）で自分の
+匿名発言を他人のものと誤認する余地があった（Cycle 4）。`_god_transcript`（`actual_sender`保持）は
+`_visible_messages()`/`_build_visible_state()`から一切参照しない絶対条件があるため、`engine/game.py`に
+`_god_transcript`とは独立した「本人限定の私的情報」を追加する必要があった。
+
+採用したのは`_round_messages`のindexをキーにした専用dict（`_anon_broadcast_owners: dict[int, str]`）
+を持ち、`_visible_messages()`が本人向けコピーにのみ真偽フラグ（`is_mine`）を付与するパターン。
+本文一致ではなくindexで判定するため、2人が同一本文の匿名発言をしても取り違えない。フラグは
+`redacted`と同じ「真のときだけキーを付ける」慣習に従い、他プレイヤー・`for_player_id=None`
+（Bot/内部）向けコピーにはキー自体が存在しない（`False`すら出さない）。
+
+**このパターンを別の私的情報に転用する場合、必ず守ること**:
+
+1. index-keyed private mapは、キーの元になるリスト（本件は`_round_messages`）と**必ず同一ライフサイクル**
+   で管理する。リストがラウンド境界で`[]`に戻りindexが0から再利用される設計である以上、mapを一緒に
+   クリアし忘れると、新ラウンドの別プレイヤーの発言へ前ラウンドの所有者情報が誤適用される
+   （匿名性破壊＋AI自己認識の誤認識という複合的なstate corruption）。
+2. クリアは**単一の関数に集約**する（本件は`_reset_round_message_state()`）。リストとmapを別々の箇所で
+   個別にクリアするコードを書かないこと。ソーススキャンテスト（`_round_messages`/対応するmapへの
+   再代入が`__init__`とそのリセット関数以外に存在しないことを`inspect.getsource`等で機械確認）で
+   固定するのが望ましい（`tests/test_anon_self_marker.py::test_round_message_state_reset_is_single_sourced`）。
+3. private mapは`_god_transcript`にもリスト本体（本件`_round_messages`）にも積まない。Prompt層
+   （`llm/prompt_builder.py`）に渡す直前のvisible_state加工でのみ参照する。

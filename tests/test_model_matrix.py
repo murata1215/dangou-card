@@ -1431,15 +1431,35 @@ def test_phase1_records_corrected_cost_in_state_and_jsonl(tmp_path, monkeypatch)
 # ============================================================
 
 def test_phase_defaults_phase2_per_model_cap_is_adjusted_only():
-    """Phase 2のper-modelだけを$0.03へ上げ、他の既定予算は不変に保つ。"""
+    """Phase 2のper-modelだけを$0.03へ上げ、他の既定予算は不変に保つ。
+
+    Cycle 4（2026-08-24）: phase capも$0.22→$0.23へ調整（人間判断）。
+    Cycle 3でanonymous_broadcast/bounty_cancelのJSON action形式追加によりsystem prompt長が
+    129文字増加し、CORE_18予約合計が$0.2211987まで増加、旧上限$0.22を$0.0012超過していた
+    （下記test_phase2_core18_reservations_cover_model_overrides_and_flag_h4_cap_gap直上のコメント参照）。
+    予約計算ロジック・他Phase・max_cost_per_model・モデル単価は無変更。
+    """
     assert mm.PHASE_DEFAULTS == {
         1: {"max_cost": 0.08, "max_cost_per_model": 0.02, "max_calls": 40, "max_tokens": 64, "retries": 1},
-        2: {"max_cost": 0.22, "max_cost_per_model": 0.03, "max_calls": 24, "max_tokens": 400, "retries": 0},
+        2: {"max_cost": 0.23, "max_cost_per_model": 0.03, "max_calls": 24, "max_tokens": 400, "retries": 0},
         3: {"max_cost": 0.20, "max_cost_per_model": 0.03, "max_calls": 96, "max_tokens": 500, "retries": 0},
     }
     assert mm.DEFAULT_MAX_COST_TOTAL == 1.00
 
 
+# Cycle 3（2026-08-24）: anonymous_broadcast/bounty_cancel のJSON action形式を
+# アクションカタログへ追加（Plan E1/E3、PROMPT_DISCOVERY_GAPの是正）した結果、
+# system prompt長が129文字増加した。Cycle 2終了時点のCORE_18予約合計は
+# 既に$0.219054（上限$0.22の99.57%）まで消費されており、残り headroom（約$0.0009）
+# はこの2行の必須追加（約$0.0021）を吸収できず、合計は$0.2211987で上限を
+# $0.0012（0.54%）超過した。engine/機能・費用ロジックは無変更、
+# llm/prompt_builder.pyの表示追加のみが原因。当時は
+# PHASE_DEFAULTS[2]['max_cost']（scripts/model_matrix.py）の変更が
+# Cycle 3のdiffスコープ（llm/prompt_builder.pyのみ）外だったため、
+# 予算値変更はdoc/changelog.md記載の方針どおり人間が別サイクルで判断することとし、
+# 解消するまでの間 xfail(strict=True) で既知のregressionとして可視化していた。
+# Cycle 4（2026-08-24）: 人間判断によりPHASE_DEFAULTS[2]['max_cost']を$0.23へ引き上げ、
+# headroom $0.0088013（3.83%）を確保したためxfailを解除。
 def test_phase2_core18_reservations_cover_model_overrides_and_flag_h4_cap_gap():
     """Phase 2の予約は専用output上限を使い、H4の実測由来reserve不足を隠さない。"""
     defaults = mm.PHASE_DEFAULTS[2]
@@ -1460,7 +1480,12 @@ def test_phase2_core18_reservations_cover_model_overrides_and_flag_h4_cap_gap():
     # 2026-08-23サイクル「全当事者合意による契約解除（contract_cancel）」でアクションカタログに
     # contract_cancel の説明文を追加し、system prompt長が変化したため期待値を更新（意図的な
     # 一度きりの変更。このコミットを跨ぐキャッシュ率・コスト予約値は比較不可）。
-    assert reservations["H1"] == pytest.approx(0.02824, abs=1e-12)
+    # Cycle 2（2026-08-24）: RULES_SUMMARYの強制最低返済の説明文を実装（除数の定義）に
+    # 合わせて訂正したことでsystem prompt長が変化したため、再度期待値を更新。
+    # Cycle 3（2026-08-24）: anonymous_broadcast/bounty_cancel のJSON action形式を
+    # アクションカタログへ追加（Plan E1/E3）したことでsystem prompt長が変化したため、
+    # 三度目の期待値更新。
+    assert reservations["H1"] == pytest.approx(0.0289, abs=1e-12)
     for key in ("H1", "H2", "H4"):
         assert reservations[key] > 0.02
         if key != "H4":

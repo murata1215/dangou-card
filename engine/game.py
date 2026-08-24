@@ -134,6 +134,10 @@ class Game:
         self.bounties: list[Bounty] = []
         self.carryovers: dict[str, int] = {}  # 市場ID → キャリーオーバー額
         self._last_round_results: dict | None = None  # 前ラウンドの市場決着サマリ（§8.1公開情報）
+        self._current_auto_pids: set[str] = set()  # A-6: 当該ラウンドでAUTOになったplayer_id集合
+        # A-4: 自分の過去AUTO COMMIT履歴（round/requested/reason/actual）。秘匿情報として
+        # for_player_id が一致する本人にのみ visible_state 経由で渡す。
+        self._auto_commit_history: dict[str, list[dict]] = {}
         self.current_round: int = 0
         self.pending_repayments: dict[str, int] = {}  # Negotiation中のrepay記録
 
@@ -141,6 +145,13 @@ class Game:
         self._action_counts: dict[str, int] = {}
         self._anon_broadcast_counts: dict[str, int] = {}
         self._round_messages: list[dict] = []  # ラウンド内のメッセージ履歴（Bot交渉用）
+        # anonymous_broadcastの実送信者記録（_round_messagesのindex → player_id）。
+        # 本人の visible_state にだけ返す私的情報（Cycle 4: self-marker）。
+        # _round_messages / _god_transcript には積まない（§8.2の秘匿境界を壊さないため）。
+        # 【必須】_round_messages と必ず同一ライフサイクルでクリアする
+        # （_reset_round_message_state() 以外で再代入しない。片方だけ残すと
+        # 新ラウンドでindexが再利用された際に前ラウンドの所有者が誤適用される）。
+        self._anon_broadcast_owners: dict[int, str] = {}
         # 当該ラウンドで不成立になった自分のアクション記録（player_id → list）。
         # 本人の visible_state にだけ返す私的情報。他プレイヤーには渡さない。
         self._action_failures: dict[str, list[dict]] = {}
@@ -331,6 +342,19 @@ class Game:
             ],
         })
 
+    def _reset_round_message_state(self) -> None:
+        """ラウンド開始時のメッセージ系stateリセット（Cycle 4）。
+
+        _anon_broadcast_owners は _round_messages のindexをキーにするため、
+        両者は必ず同時にクリアしなければならない。片方だけ残すと、新ラウンドで
+        indexが0から再利用された際に前ラウンドの所有者が新ラウンドの別プレイヤーの
+        匿名発言へ誤適用され、匿名性破壊・AI自己認識の誤認識という重大なstate
+        corruptionになる。このリセットは本メソッド内でのみ行い、他の箇所で
+        self._round_messages / self._anon_broadcast_owners を再代入しないこと。
+        """
+        self._round_messages = []
+        self._anon_broadcast_owners = {}
+
     def _phase_negotiation(self, round_num: int) -> None:
         """
         Phase 2: Negotiation（§5.1）
@@ -342,7 +366,7 @@ class Game:
         self._action_counts = {pid: 0 for pid in self.players}
         self._anon_broadcast_counts = {pid: 0 for pid in self.players}
         self._trade_counts = {pid: 0 for pid in self.players}
-        self._round_messages = []  # ラウンド開始時にクリア
+        self._reset_round_message_state()  # ラウンド開始時にクリア（_round_messages / _anon_broadcast_owners を同時に）
         self._action_failures = {pid: [] for pid in self.players}
         self._contract_notices = {pid: [] for pid in self.players}
 
@@ -607,6 +631,11 @@ class Game:
                 "message": action.message,
                 "turn": turn,
             })
+            # Cycle 4: 送信者本人だけが自分の匿名発言だと識別できるようにするための
+            # 私的所有者記録（_round_messagesのindexキー）。_round_messages自体には
+            # 積まない（§8.2の秘匿境界を壊さないため）。この分岐はバリデーション成功
+            # パスにのみ到達するため、reject された匿名通信は登録されない。
+            self._anon_broadcast_owners[len(self._round_messages) - 1] = pid
             self._god_transcript.append({
                 "round": round_num, "turn": turn, "type": "anonymous_broadcast",
                 "message": action.message, "actual_sender": pid,
@@ -824,6 +853,7 @@ class Game:
         Entry Fee不足者はCommit前に破産・脱落。
         """
         self._current_commits: list[MarketCommit] = []
+        self._current_auto_pids = set()  # A-6: 当ラウンドでAUTOになったplayer_id
 
         alive_ids = [pid for pid, p in self.players.items() if p.is_alive]
 
@@ -858,12 +888,19 @@ class Game:
                 commit_action = None
 
             # Commit検証
+            # A-3: validate_action() の却下理由を捨てずに保持する（従来は result.success
+            # のみ見て result.reason を握り潰していた。AUTO発生時の診断に必須）。
             valid_commit = False
+            reject_reason: str | None = None
             if commit_action is not None:
                 result = action_ops.validate_action(
                     commit_action, p, self.config, self.players, round_num,
                 )
                 valid_commit = result.success
+                if not result.success:
+                    reject_reason = result.reason
+            else:
+                reject_reason = "no_valid_response"
 
             if valid_commit and commit_action is not None:
                 # 正常コミット
@@ -888,20 +925,51 @@ class Game:
             )
             selected = autocommit_ops.select_auto_commit(legal, self._current_markets)
 
+            # A-1: 本人が何を指定しようとしたか（requested_*）を、取得できた場合のみ記録
+            requested_market_id = getattr(commit_action, "market_id", None)
+            requested_card_rank = getattr(commit_action, "card_rank", None)
+
             if selected is None:
                 # 合法Commit 0件 → 履行不能 → 契約違反 → 即時脱落
                 # Entry Feeは既に支払済みなので返金しない
+                # A-2（バグ修正）: 従来は **record の展開順により診断理由
+                # ("No legal commits available (contradictory contracts)") が
+                # record["reason"]="contract_violation" に上書きされ、握り潰されていた。
+                # 診断理由は failure_detail に退避し、reason は既存互換のため変更しない。
+                blocking_obligations = [
+                    {"ob_type": ob.ob_type.value, "details": dict(ob.details)}
+                    for ob in contract_ops.get_all_type_b_for_player(
+                        self.contracts, pid, round_num,
+                    )
+                ]
                 p, self.contracts, record = elim_ops.forced_liquidation(
                     p, "contract_violation", round_num, self.contracts,
                 )
                 self.players[pid] = p
                 self.logger.log("AUTO_COMMIT_FAILURE", round_num, "commit", data={
                     "player_id": pid,
-                    "reason": "No legal commits available (contradictory contracts)",
                     **record,
+                    "failure_detail": "No legal commits available (contradictory contracts)",
+                    "legal_commit_count": 0,
+                    "blocking_obligations": blocking_obligations,
+                    "requested_market_id": requested_market_id,
+                    "requested_card_rank": requested_card_rank,
+                    "reject_reason": reject_reason,
+                })
+                # A-4: 本人の秘匿履歴に記録（脱落済みのため次ラウンドprompt自体は
+                # もう届かないが、途中脱落しない他ケースとの一貫性のため記録は残す）
+                self._auto_commit_history.setdefault(pid, []).append({
+                    "round": round_num,
+                    "requested_market_id": requested_market_id,
+                    "requested_card_rank": requested_card_rank,
+                    "reason": reject_reason,
+                    "actual_market_id": None,
+                    "actual_card": None,
+                    "failure": True,
                 })
             else:
                 self._current_commits.append(selected)
+                self._current_auto_pids.add(pid)
                 self.logger.log("COMMIT", round_num, "commit", data={
                     "player_id": pid,
                     "market_id": selected.market_id,
@@ -909,10 +977,35 @@ class Game:
                     "auto": True,
                 })
                 # AUTO COMMIT公示（§4.4）
+                # A-1: 本人が指定したもの（requested_*）・却下理由・実際に提出されたもの
+                # (actual_*) を1イベントに揃える。requested_* が None のケースは
+                # 「コミット自体が取得できなかった」（agent例外/parse失敗）ことを示す。
                 self.logger.log("AUTO_COMMIT", round_num, "commit", data={
                     "player_id": pid,
                     "message": f"{pid}: AUTO COMMIT",
+                    "requested_market_id": requested_market_id,
+                    "requested_card_rank": requested_card_rank,
+                    "reason": reject_reason,
+                    "actual_market_id": selected.market_id,
+                    "actual_card": selected.card.card_id,
                 })
+                # A-4: 本人の秘匿履歴に記録（次ラウンドprompt用）
+                self._auto_commit_history.setdefault(pid, []).append({
+                    "round": round_num,
+                    "requested_market_id": requested_market_id,
+                    "requested_card_rank": requested_card_rank,
+                    "reason": reject_reason,
+                    "actual_market_id": selected.market_id,
+                    "actual_card": selected.card.card_id,
+                    "failure": False,
+                })
+                # A-8: validation失敗経路（agent.commit()自体は例外を投げず有効な
+                # アクションを返したが、validate_action()がそれを却下した経路）でのみ
+                # 本人のAUTOカウンタへ反映する。commit_action is None の場合は
+                # agent.commit() 内部の例外経路で既に auto_commit_count が加算済み
+                # のため、ここで呼ぶと二重カウントになる。
+                if commit_action is not None and hasattr(agent, "note_auto_commit"):
+                    agent.note_auto_commit(reject_reason)
 
     def _phase_settlement(self, round_num: int) -> None:
         """Phase 4: Reveal & Settlement（§5.2）+ S2倍掛け処理"""
@@ -978,6 +1071,8 @@ class Game:
                         {
                             "player_id": c.player_id,
                             "card_rank": "FOG" if is_fog_round else c.card.rank.name,
+                            # A-6: AUTO COMMITだったかどうか（§8.1公開情報「AUTO COMMIT発生」）
+                            "auto": c.player_id in self._current_auto_pids,
                         }
                         for c in mr.participants
                     ],
@@ -1714,13 +1809,26 @@ class Game:
         for_player_id が None の場合（現状 commit/double_up フェイズの一部呼び出し）は
         誰とも一致しないため、全DMが安全側（redacted）に倒れる。
         broadcast・anonymous_broadcast は常に本文を含める（§8.1公開情報）。
+
+        Cycle 4: anonymous_broadcast の送信者本人にだけ、self._anon_broadcast_owners
+        （_round_messagesのindex→player_id）を参照して "is_mine": True を付与する。
+        _god_transcript は一切参照しない。他プレイヤー・for_player_id=None（Bot/内部）
+        向けコピーには is_mine キー自体を含めない（redactedと同じ「真のときだけ付ける」慣習）。
         """
         out: list[dict] = []
-        for m in self._round_messages:
+        for i, m in enumerate(self._round_messages):
             if m.get("type") == "dm" and for_player_id not in (m.get("sender"), m.get("to")):
                 redacted = {k: v for k, v in m.items() if k != "message"}
                 redacted["redacted"] = True
                 out.append(redacted)
+            elif (
+                m.get("type") == "anonymous_broadcast"
+                and for_player_id is not None
+                and self._anon_broadcast_owners.get(i) == for_player_id
+            ):
+                mine = dict(m)
+                mine["is_mine"] = True
+                out.append(mine)
             else:
                 out.append(dict(m))
         return out
@@ -1749,6 +1857,15 @@ class Game:
                 for m in getattr(self, "_current_markets", [])
             ],
             "last_round_results": self._last_round_results,
+            # A-4: 前ラウンドにAUTO COMMITが発生したplayer_idのリスト（公開情報）。
+            # RULES_SUMMARY(L506)は「AUTO COMMIT発生」を既に公開情報と明記しており、
+            # 新たな秘匿情報の追加ではない。理由・requestedはここに含めない。
+            "last_round_auto_players": sorted({
+                c["player_id"]
+                for mr in (self._last_round_results or {}).get("markets", [])
+                for c in mr.get("commits", [])
+                if c.get("auto")
+            }),
             "alive_players": [
                 pid for pid, p in self.players.items() if p.is_alive
             ],
@@ -1873,6 +1990,14 @@ class Game:
                 if c.status in (ContractStatus.ACTIVE, ContractStatus.CANCELLED)
                 and for_player_id in c.parties
             ]
+
+            # A-4: 自分の過去AUTO COMMIT履歴（round/requested/reason/actual）。秘匿情報。
+            # 「自分が何を指定してAUTOになったか」を機械的に確認できる経路が存在せず、
+            # 同じ取り違え（例: 手札に無いカードを指定）を翌ラウンドも繰り返す事故が
+            # 確認された（trial_C_l12_r12_20260822 の P09 R3→R4）ための追加。
+            state["my_auto_commits"] = list(
+                self._auto_commit_history.get(for_player_id, []),
+            )
 
             # 当事者向け: 署名済み契約の未履行義務一覧（自分が obligor のもの）
             # 帳簿ミス起因の契約違反脱落を防ぐための情報提示（§7.3の思想を契約に適用）

@@ -1206,7 +1206,10 @@ def get_round_states(
             }
         return result["rounds"][rn]
 
-    def add_elimination(rd: dict[str, Any], player_id: Any, reason: Any) -> None:
+    def add_elimination(
+        rd: dict[str, Any], player_id: Any, reason: Any,
+        commit_kind: str | None = None,
+    ) -> None:
         """同一ラウンド・同一プレイヤーの脱落は1件だけ記録する。
 
         engineは1回の脱落に対し複数のイベントを出すことがある
@@ -1215,12 +1218,19 @@ def get_round_states(
         get_game_state() 側は L349/L355 相当で既に先勝ち重複排除しており、
         ラウンド脱落者一覧もそれに合わせる。生のtimeline/outcomesは対象外
         （このヘルパは rd["eliminated"] のみを操作する）。
+
+        commit_kind: A-7。AUTO_COMMIT_FAILURE経由の脱落のみ "failure" を渡し、
+        Viewerが「合法な提出が1つも無く脱落した」ことを本人commit/AUTO成功と
+        区別して表示できるようにする（通常の脱落は None のまま）。
         """
         if not player_id:
             return
         if any(x.get("player_id") == player_id for x in rd["eliminated"]):
             return
-        rd["eliminated"].append({"player_id": player_id, "reason": reason})
+        entry: dict[str, Any] = {"player_id": player_id, "reason": reason}
+        if commit_kind is not None:
+            entry["commit_kind"] = commit_kind
+        rd["eliminated"].append(entry)
 
     def add_final_reflection(rd: dict[str, Any], data: dict[str, Any]) -> None:
         """同一ラウンド・同一プレイヤーのFINAL_REFLECTIONは1件だけ記録する（先勝ち）。
@@ -1262,6 +1272,9 @@ def get_round_states(
     contracts: dict[str, dict[str, Any]] = {}
     # カード累積提出 {pid: set(card_id)}
     committed: dict[str, set[str]] = {}
+    # A-7: 当ラウンドの (round, player_id) → auto(bool)。COMMITイベントは
+    # REVEALより先に発火するため、REVEAL処理時点で参照可能（本人commit/AUTO区別）。
+    commit_auto: dict[tuple[int, str], bool] = {}
     max_round = 0
 
     for e in events:
@@ -1311,13 +1324,18 @@ def get_round_states(
             rd = rnd(r)
             rd["commits"] = []  # REVEALが正（rank付き）。COMMIT由来の重複を置換
             for c in data.get("commits", []):
+                pid = c.get("player_id")
+                # A-7: COMMITイベント（本ループでREVEALより先に処理済み）から
+                # auto/selfを引く。COMMITイベントが見当たらない場合は self 扱い
+                # （REVEALのみを含む旧形式ログとの後方互換）。
+                is_auto = commit_auto.get((r, pid), False)
                 rd["commits"].append({
-                    "player_id": c.get("player_id"),
+                    "player_id": pid,
                     "market_id": c.get("market_id"),
                     "card": c.get("card"),
                     "rank": c.get("rank"),
+                    "commit_kind": "auto" if is_auto else "self",
                 })
-                pid = c.get("player_id", "")
                 card = c.get("card")
                 if pid and card:
                     committed.setdefault(pid, set()).add(card)
@@ -1327,6 +1345,9 @@ def get_round_states(
             pid = data.get("player_id", "")
             card = data.get("card")
             rd = rnd(r)
+            is_auto = bool(data.get("auto", False))
+            if pid:
+                commit_auto[(r, pid)] = is_auto
             if pid and card:
                 committed.setdefault(pid, set()).add(card)
                 if not any(x.get("player_id") == pid and x.get("card") == card
@@ -1334,6 +1355,7 @@ def get_round_states(
                     rd["commits"].append({
                         "player_id": pid, "market_id": data.get("market_id"),
                         "card": card, "rank": None,
+                        "commit_kind": "auto" if is_auto else "self",
                     })
 
         elif et == "SNAPSHOT":
@@ -1415,7 +1437,10 @@ def get_round_states(
             # BANKRUPTCY/FORCED_LIQUIDATIONと同じelifチェーンに置くと
             # このブロックで先にマッチしてしまい到達しないため、ここで記録する。
             if et == "AUTO_COMMIT_FAILURE":
-                add_elimination(rd, data.get("player_id"), data.get("reason"))
+                add_elimination(
+                    rd, data.get("player_id"), data.get("reason"),
+                    commit_kind="failure",
+                )
 
         elif et in ("BANKRUPTCY", "FORCED_LIQUIDATION"):
             rd = rnd(r)

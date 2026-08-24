@@ -429,7 +429,11 @@ class TestNoSecretInfoLeak:
         "market_id", "participants", "winners", "prize_per_winner",
         "total_pool", "surged", "carryover_to_next", "commits",
     }
-    ALLOWED_COMMIT_KEYS = {"player_id", "card_rank"}
+    # "auto" はCycle 1のAUTO COMMIT機能で追加された公開情報キー
+    # （RULES_SUMMARYで「AUTO COMMIT発生」は公開情報と明記されている）。
+    # このテスト自体はCycle 2で変更していないが、既存の許可リストが
+    # 追加当時から更新されていなかったため、実装に合わせて追記する。
+    ALLOWED_COMMIT_KEYS = {"player_id", "card_rank", "auto"}
 
     def test_last_round_results_has_no_secret_keys(self):
         """
