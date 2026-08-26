@@ -31,6 +31,16 @@ uv run python scripts/contract_cancel_smoke.py --scripted  # 4席本番経路ス
 実API（DeepSeek V4 Flash限定・`REAL_MODEL_ALLOWLIST`で機械的に制限）を叩くモードで、
 人間の明示承認後にのみ実行する。
 
+`scripts/replay_probe.py`は過去トライアルログ（例: `trial_C_l12_r12_20260824`）を
+読み取り専用で再生し、baseline（当時のprompt）とpatched（現行コードで再生成した
+prompt）を同一モデルへ投げて対比するA/Bハーネス。`--execute`以外は実API0件。
+
+```bash
+uv run python scripts/replay_probe.py --dry-run                       # 既定27件・API0件
+uv run python scripts/replay_probe.py --dry-run --targets-file <json> # 選抜差し替え・API0件
+uv run python scripts/replay_probe.py --execute --preflight-only ...  # 見積のみ・API0件
+```
+
 ## ドライラン
 
 ```bash

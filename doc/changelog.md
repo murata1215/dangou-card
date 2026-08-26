@@ -1,5 +1,54 @@
 # Changelog
 
+## 2026-08-26: Cycle 5系: D1（契約系アクション消滅）のprompt側修正と、replay probeによる4回のA/B実測
+
+`ac844b3`（Cycle 2-4）以降の clean L12×R12 実戦・全面監査で最重要欠陥 D1 を特定し、
+その修正が実際に効くかを過去ログ再生ハーネスで4回計測した一連のサイクルをまとめる。
+
+- **背景（D1）**: clean L12×R12（`trial_C_l12_r12_20260824`、$6.8108 / 1,449 call /
+  1,697 event）で`contract_propose`11→0・`contract_sign`11→0・`card_trade_propose`1→0。
+  funnelのATTEMPT=0（engineの拒否でもparser落ちでもない）、モデル出力の「契約」言及
+  31.6%→6.2%。原因はpromptの便益記述ゼロ＋締め指示がS2の6アクションを1つも
+  列挙していないことに絞り込まれた。
+- **Cycle 5（修正本体）**: `llm/prompt_builder.py`に(1)便益とコストを同格に並べる
+  新セクション、(2)失敗コスト文の条件文化（中立化）、(3)締め指示でその時点の選択可能
+  アクション全列挙、(4)倍掛け成功条件の毎回再掲、(5)Handover Memoryへの「公式状態優先」
+  明記、の5方向を実装した。**`engine/`は1行も変更していない**（仕様§13.2「S2は観察対象の
+  まま、ルール変更による強制は行わない」に従う）。system_promptは5,901→7,079字。
+- **Cycle 5.2**: 締め指示に「対応付け説明句」を追加（user_prompt+132〜179字、
+  system_promptは7,079字のまま不変）。
+- **予算追随**: system_prompt増加でCORE_18の予約合計が`PHASE_DEFAULTS[2]["max_cost"]`
+  （$0.23）を超えるため、人間判断で**$0.23→$0.25 / per-model cap $0.03→$0.035**
+  （`scripts/model_matrix.py`）。予約計算ロジック・他Phase・モデル単価は無変更。
+  追随して`tests/test_phase2_schema.py`（h1 < 0.035、M3 $0.0158775、H3 $0.02597）と
+  `tests/test_model_matrix.py`（H1 $0.031845、CORE_18合計$0.24124109・headroom
+  $0.00932601 / 3.87%）の期待値を更新。
+- **`scripts/replay_probe.py`（新規・API-free既定）**: `trial_C_l12_r12_20260824`の
+  実promptを**読み取り専用で**再生し、baseline（当時のまま）とpatched（現行コードで
+  再生成）を同一モデルへ投げて対比するA/Bハーネス。`--dry-run`（既定・API0件）/
+  `--execute` / `--preflight-only`の3モード、事前見積ゲート（`--max-cost-usd`）とコール
+  単位の予算予約による二重ガード、Wilson 95% CI、Cycle 5.4で**McNemar正確二項検定**
+  （`math.comb`のみ・scipy不使用）と`--targets-file`による選抜差し替え（schema v1・
+  role分割集計）を追加。既定27件モードの出力はbyte単位で不変（`diff -r`実測）。
+- **計測結果（契約系変換率 = `contract_propose`/`card_trade_propose`/`bounty_post`）**:
+
+  | Cycle | 対象の選び方 | N | baseline | patched | 検定 | 実測コスト |
+  |---|---|---|---|---|---|---|
+  | 5.1 | 契約を口にした手番27件 | 3 | 0/81 | 2/81 (2.47%) | p=0.50 | $0.528249 |
+  | 5.3 | 同上（5.2の締め指示で） | 3 | 2/81 | 1/81 (1.23%) | p≈1.0 | $0.281507 |
+  | 5.4 | **合意の返事の直後の手番38件** | 1 | 0/38 | 1/38 (2.63%) | b=1,c=0 p=1.0 | $0.283179 |
+
+  5.4はrole別にproposer 0/19→1/19、replier 0/19→0/19。転換した1件は相手の破産危機を
+  契機にしたもの。**いずれも上限$0.90内、有意差なし。**
+- **結論**: prompt側のsalience修正だけでは、小型・非思考モデル群の契約系アクション
+  選択率はほぼ動かない。engineの変更は依然として行っていない。
+- **テスト**: 新規`tests/test_cycle5_prompt_salience.py`33件（5方向の文言を文字列
+  アサーションで固定）、新規`tests/test_replay_probe_targets.py`39件（既定27件モードの
+  golden order回帰・targets-file検証・McNemar golden vector・role分割paired集計）。
+  全体**1343 passed**。
+- 詳細は`doc/devlog/2026-08-25_053950.md` / `2026-08-25_054023.md` /
+  `2026-08-26_064521.md` / `084625.md` / `095502.md` / `130007.md` / `165524.md`を参照。
+
 ## 2026-08-24: Cycle 4: Phase2予算上限調整 + anonymous_broadcast送信者本人self-marker
 
 Cycle 3 Human Review（GO）で確定した2件の積み残しをまとめて実装した。
