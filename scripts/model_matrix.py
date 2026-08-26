@@ -90,7 +90,7 @@ DEFAULT_SEED = 901
 
 PHASE_DEFAULTS: dict[int, dict[str, Any]] = {
     1: {"max_cost": 0.08, "max_cost_per_model": 0.02, "max_calls": 40, "max_tokens": 64, "retries": 1},
-    2: {"max_cost": 0.23, "max_cost_per_model": 0.03, "max_calls": 24, "max_tokens": 400, "retries": 0},
+    2: {"max_cost": 0.25, "max_cost_per_model": 0.035, "max_calls": 24, "max_tokens": 400, "retries": 0},
     3: {"max_cost": 0.20, "max_cost_per_model": 0.03, "max_calls": 96, "max_tokens": 500, "retries": 0},
 }
 

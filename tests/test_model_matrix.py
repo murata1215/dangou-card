@@ -1437,11 +1437,15 @@ def test_phase_defaults_phase2_per_model_cap_is_adjusted_only():
     Cycle 3でanonymous_broadcast/bounty_cancelのJSON action形式追加によりsystem prompt長が
     129文字増加し、CORE_18予約合計が$0.2211987まで増加、旧上限$0.22を$0.0012超過していた
     （下記test_phase2_core18_reservations_cover_model_overrides_and_flag_h4_cap_gap直上のコメント参照）。
-    予約計算ロジック・他Phase・max_cost_per_model・モデル単価は無変更。
+    Cycle 5（2026-08-26）: D1契約系アクションsalience修正（RULES_SUMMARYへ便益/コスト節を追加）で
+    system prompt長が5,901→7,079字に増加し、CORE_18予約合計が$0.24124109→$0.23を超過。
+    人間承認によりmax_cost $0.23→$0.25、max_cost_per_model $0.03→$0.035へ調整
+    （headroom $0.00932601・3.87%を確保。H1 $0.031845もmax_cost_per_model以内に収まる）。
+    予約計算ロジック・他Phase・モデル単価は無変更。
     """
     assert mm.PHASE_DEFAULTS == {
         1: {"max_cost": 0.08, "max_cost_per_model": 0.02, "max_calls": 40, "max_tokens": 64, "retries": 1},
-        2: {"max_cost": 0.23, "max_cost_per_model": 0.03, "max_calls": 24, "max_tokens": 400, "retries": 0},
+        2: {"max_cost": 0.25, "max_cost_per_model": 0.035, "max_calls": 24, "max_tokens": 400, "retries": 0},
         3: {"max_cost": 0.20, "max_cost_per_model": 0.03, "max_calls": 96, "max_tokens": 500, "retries": 0},
     }
     assert mm.DEFAULT_MAX_COST_TOTAL == 1.00
@@ -1460,6 +1464,10 @@ def test_phase_defaults_phase2_per_model_cap_is_adjusted_only():
 # 解消するまでの間 xfail(strict=True) で既知のregressionとして可視化していた。
 # Cycle 4（2026-08-24）: 人間判断によりPHASE_DEFAULTS[2]['max_cost']を$0.23へ引き上げ、
 # headroom $0.0088013（3.83%）を確保したためxfailを解除。
+# Cycle 5（2026-08-26）: D1契約系アクションsalience修正でsystem prompt長が5,901→7,079字に
+# 増加し、CORE_18予約合計が$0.24124109（トリム前。トリム後$0.24067398）で旧上限$0.23を
+# 超過した。人間承認によりmax_cost $0.25・max_cost_per_model $0.035へ調整
+# （headroom $0.00932601・3.87%）。H1はmax_cost_per_model 0.035以内、H4は引き続き例外側。
 def test_phase2_core18_reservations_cover_model_overrides_and_flag_h4_cap_gap():
     """Phase 2の予約は専用output上限を使い、H4の実測由来reserve不足を隠さない。"""
     defaults = mm.PHASE_DEFAULTS[2]
@@ -1485,7 +1493,9 @@ def test_phase2_core18_reservations_cover_model_overrides_and_flag_h4_cap_gap():
     # Cycle 3（2026-08-24）: anonymous_broadcast/bounty_cancel のJSON action形式を
     # アクションカタログへ追加（Plan E1/E3）したことでsystem prompt長が変化したため、
     # 三度目の期待値更新。
-    assert reservations["H1"] == pytest.approx(0.0289, abs=1e-12)
+    # Cycle 5（2026-08-26）: D1便益/コスト節の追加でsystem prompt長が5,901→7,079字に
+    # 変化したため、四度目の期待値更新。
+    assert reservations["H1"] == pytest.approx(0.031845, abs=1e-12)
     for key in ("H1", "H2", "H4"):
         assert reservations[key] > 0.02
         if key != "H4":

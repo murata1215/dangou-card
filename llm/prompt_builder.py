@@ -535,7 +535,11 @@ def _render_memory_block(memory: str | None, stale_warning: bool = False) -> lis
         lines.append(
             "  ※このメモは過去の自分の記述です。書かれた後に起きた消費・脱落・契約失効は"
             "反映されていません。「手札」「使用済みカード」「脱落者」「生存者」"
-            "「あなたが当事者の正式契約」欄が常に正しい現状です。")
+            "「あなたが当事者の正式契約」「倍掛け預託中とその成功条件」"
+            "「前ラウンド結果に載っているあなたのコミット内容と獲得額」欄が"
+            "常に正しい現状です。"
+            "メモの記述とこれらの欄が食い違う場合は、必ず欄の側を正とし、"
+            "メモ側の記憶は捨ててください。")
     return lines
 
 
@@ -561,8 +565,9 @@ def _render_eliminations_block(
         lines.append(
             f"  {e.get('player_id', '?')}: R{e.get('round', '?')}脱落（{reason}）{marker}")
     lines.append(
-        "  脱落者は以後一切行動しません。脱落者を宛先にしたDM・送金・契約提案・"
-        "カードトレードは必ず不成立になり、アクション枠だけを失います。"
+        "  脱落者は以後一切行動しません。上の「生存者」欄にいる相手であれば"
+        "DM・送金・契約提案・カードトレードはいずれも通常どおり成立します"
+        "（脱落者を宛先にした場合のみ不成立になり、アクション枠だけを失います）。"
         "脱落者が当事者である未履行義務は§6.3で自動失効済みで、解除交渉は不要です。")
     return lines
 
@@ -639,6 +644,125 @@ def _render_action_feedback_block(visible_state: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _render_double_up_deposit_lines(
+    du: dict[str, Any], *, label: str = "倍掛け預託中",
+) -> list[str]:
+    """倍掛け預託額に成功条件と空き巣除外を必ず併記する（P01-D2）
+
+    仕様§6.2: 次ラウンドのSettlementで参加者2人以上の市場から1円以上の
+    市場賞金を獲得できれば預託額の2倍を受領。単独参加市場（空き巣）での
+    賞金獲得は成功判定に含めない。獲得できなければ全額没収。
+    """
+    sr = du["success_round"]
+    return [
+        f"  {label}: {du['deposit'] // 10_000}万円（R{sr}で判定）",
+        f"    成功条件: R{sr}のSettlementで、参加者が2人以上の市場から"
+        f"1円以上の市場賞金を獲得すること。成功で預託額の2倍"
+        f"（{du['deposit'] * 2 // 10_000}万円）を受領",
+        f"    参加者が自分1人だけの市場（空き巣）での勝利は成功に含まれません。"
+        f"失敗すると預託額は全額没収されます",
+    ]
+
+
+def _available_negotiation_actions(
+    player_state: PlayerState,
+    round_num: int,
+    visible_state: dict[str, Any],
+    config: GameConfig,
+) -> tuple[list[str], list[str]]:
+    """いま実際に選べる交渉アクション種別と、いま選べない理由を返す（D2/Cycle5.2）
+
+    engineの可否判定（engine/actions.py・engine/game.py）そのものを写すだけで、
+    推奨・優先度は書かない。visible_stateに無い情報（匿名通信の当ラウンド残数、
+    カードトレードの当ラウンド実施済みフラグ）は判定に使わない。
+
+    Cycle 5.2: 選べる側の各アクションに15字前後の中立な説明句を括弧で添える
+    （D1残存要因＝「口頭合意→どのアクションで拘束力を持たせるか」の対応付けが
+    無かったことへの対処）。手数料はconfigから算出しハードコードしない。
+    「選べないもの」側の短句は一切変更しない。
+    """
+    fee_anon = config.anon_broadcast_fee // 10_000
+    fee_contract = config.contract_fee // 10_000
+    desc = {
+        "dm": "特定の相手に非公開で送る",
+        "broadcast": "全員に公開で送る",
+        "pass": "何もしない",
+        "anonymous_broadcast": f"発信者を伏せて全体へ送る。{fee_anon}万円",
+        "transfer": "相手へ現金を即時送金",
+        "bounty_post": "条件付きの報奨を掲示する",
+        "bounty_cancel": "自分の報奨を取り下げる",
+        "repay": "借金を任意返済",
+        "contract_propose": f"口頭合意を拘束力のある正式契約にする。発行料{fee_contract}万円",
+        "contract_sign": "提案された契約に署名して成立させる",
+        "contract_cancel": "成立済み契約の解除を申し出る",
+        "card_trade_propose": "未使用カードを1枚ずつ交換する提案",
+        "card_trade_accept": "提案されたトレードを受諾",
+        "card_trade_reject": "提案されたトレードを拒否",
+    }
+
+    available: list[str] = []
+    unavailable: list[str] = []
+
+    def _add(name: str) -> None:
+        available.append(f"{name}（{desc[name]}）")
+
+    _add("dm")
+    _add("broadcast")
+    _add("pass")
+
+    if player_state.cash >= config.anon_broadcast_fee:
+        _add("anonymous_broadcast")
+    else:
+        unavailable.append("anonymous_broadcast（現金不足）")
+
+    if player_state.free_cash > 0:
+        _add("transfer")
+        _add("bounty_post")
+    else:
+        unavailable.append("transfer・bounty_post（Free Cash 0）")
+
+    bounties_public = visible_state.get("bounties_public", []) or []
+    if any(
+        b.get("poster") == player_state.player_id and b.get("is_active")
+        for b in bounties_public
+    ):
+        _add("bounty_cancel")
+
+    if player_state.debt_balance > 0 and player_state.cash > 0:
+        _add("repay")
+    else:
+        unavailable.append("repay（借金なし）")
+
+    if player_state.cash >= config.contract_fee:
+        _add("contract_propose")
+    else:
+        unavailable.append("contract_propose（発行料の現金不足）")
+
+    if visible_state.get("contracts_pending"):
+        _add("contract_sign")
+    else:
+        unavailable.append("contract_sign（署名できる契約がない）")
+
+    my_contracts = visible_state.get("my_contracts") or []
+    if any(c.get("status") == "active" for c in my_contracts):
+        _add("contract_cancel")
+    else:
+        unavailable.append("contract_cancel（あなたが当事者の有効な契約なし）")
+
+    if config.card_trade_enabled and round_num <= config.card_trade_last_round:
+        _add("card_trade_propose")
+    else:
+        unavailable.append("card_trade_propose（R12は不可）")
+
+    if visible_state.get("trades_pending"):
+        _add("card_trade_accept")
+        _add("card_trade_reject")
+    else:
+        unavailable.append("card_trade_accept・card_trade_reject（提案されているトレードなし）")
+
+    return available, unavailable
+
+
 def _render_message_list(
     messages: list[dict[str, Any]], heading: str, limit: int | None = None,
 ) -> list[str]:
@@ -703,7 +827,8 @@ RULES_SUMMARY = """# 談合カード ルール
 - 同ランク最高位は賞金均等分配。譲渡・売買は不可
 
 ## 市場
-- 毎ラウンド3市場を賞金額とともに公開。1市場参加につきEntry Fee {entry_fee_man}万円（必須支払い。当該市場の賞金プールへ加算）
+- 毎ラウンド3市場を賞金額とともに公開。**1ラウンドに参加できる市場は1つだけで、複数市場への同時参加はできない**
+- 市場参加につきEntry Fee {entry_fee_man}万円（1ラウンド1市場なので毎ラウンド{entry_fee_man}万円。必須支払い。当該市場の賞金プールへ加算）
 - 参加者が多いほど賞金プールが膨らむ（ハニーポット戦術が成立）
 - 参加者1人の市場: その1人が獲得（空き巣）
 - 参加者0の市場: 翌ラウンドの同市場へキャリーオーバー（最終Rのみ消滅）
@@ -723,7 +848,7 @@ RULES_SUMMARY = """# 談合カード ルール
 
 ## ラウンド進行
 1. Market Open: 3市場と賞金を公開（キャリーオーバー反映）
-2. Negotiation: 最大10巡、毎巡ランダム手番。DM/全体発言/送金(即時決済)/契約提案・署名/報奨/匿名通信/返済/pass。全員連続パスで早期終了。1プレイヤーあたり最大{negotiation_max_actions}アクション/ラウンド（passは枠を消費しないが、**不成立アクションも枠を消費する**）
+2. Negotiation: 最大10巡、毎巡ランダム手番。DM/全体発言/送金(即時決済)/契約提案・署名/契約解除/報奨/匿名通信/カードトレード/返済/pass。全員連続パスで早期終了。1プレイヤーあたり最大{negotiation_max_actions}アクション/ラウンド（passは枠を消費しない。**不成立アクションも枠を消費する**が、宛先が「生存者」欄にいるか・Free Cashが足りるかを出す前に確認すれば避けられる）
 3. Commit: 全生存プレイヤーが「市場+カード」を秘密提出。Entry Fee不足→破産脱落。手札に無いカード名を指定した場合や無効な指定の場合はシステムが自動で選ぶ（AUTO COMMIT）
 4. Settlement（8Step処理）:
    - Reveal: 全市場の参加者・使用カードを公開
@@ -790,13 +915,24 @@ strategyに必ず"emotion"を含めてください。現在のあなたの感情
     1人でも出していなければ元の契約は有効なまま。
     **義務が1件でも履行/違反/監査済みになった契約は解除できません**（今Rが期限の義務までは解除可）。
     契約内容を変えたいときは「旧契約を全員で解除 → 新条件で contract_propose」の順で行う。
-    同じ相手と両立しない契約を二重に結ぶと必ず型B違反で脱落します。
+    同じ相手と両立しない契約（例: 同じラウンドについて別々の市場を指定する型B）を二重に結ぶと、どちらかが必ず型B違反になる。
+    条件を変えたいときは「旧契約を全員で解除 → 新条件で contract_propose」の順にすれば回避できる。
 - {{"type": "bounty_post", "amount": 500000, "bounty_type": "achievement", "condition_type": "market_win_against", "condition": {{"target_player": "P07"}}, "round_num": 5}}
 - {{"type": "bounty_cancel", "bounty_id": "B_xxxxxxxx"}}
 - {{"type": "card_trade_propose", "with_players": ["P07"], "give_card": "ONE_PAIR", "receive_card": "FLUSH", "cash_amount": 0}}
   ※with_playersは最大5人のリスト（ブロードキャスト提案）。cash_amount: 正=自分が払う、負=相手が払う、0=カード交換のみ
   ※1ラウンド1回まで。R12は不可。受諾した相手と即時交換成立、他の宛先は自動失効。拒否に理由は添えられない
-※宛先を取るアクション（dm / transfer / contract_propose の with / card_trade_propose の with_players）の宛先は、必ずプロンプトの「生存者」欄に載っているプレイヤーから選ぶこと。脱落者を指定すると必ず不成立になり、アクション枠だけを失う。
+※宛先を取るアクション（dm / transfer / contract_propose の with / card_trade_propose の with_players）の宛先は、毎ターン提示される「生存者」欄から選べばよい。脱落者を指定すると必ず不成立になり、アクション枠だけを失うが、生存者欄から選ぶ限りこれは起きない。
+
+## 各アクションの使いどころ（便益 / コスト・失敗条件）
+- dm / broadcast: 便益=コスト無料で情報と口約束を配れる。コスト=拘束力はゼロで、破られても相手に罰はない
+- transfer: 便益=即時決済なので、その場で信用や協力を買える。コスト=Free Cash以内でのみ可能。返金は相手の任意
+- repay: 便益=借金残高が減り、以後の複利と毎ラウンドの強制最低返済額が下がる（Free Cashも増えやすくなる）。コスト=手元の現金が減る。Entry Fee分を残しているか確認すること
+- anonymous_broadcast: 便益=発信者を伏せたまま全体へ情報を出せる。コスト=1通{anon_fee_man}万円の現金払い、1ラウンド2通まで
+- contract_propose / contract_sign: 便益=口約束と違い、システムが自動で監査・執行する。相手が破れば相手は即時脱落するので、裏切りに機械的なコストを付けられる。「絶対に来ない」「必ずこのカードを出す」を検証可能な形にできる。コスト=発行料{contract_fee_man}万円は提案者負担。自分が義務者の側は、自分の違反・履行不能でも即時脱落する
+- contract_cancel: 便益=不要になった契約・条件を変えたい契約を、全当事者の合意で無効化できる（違反脱落を回避する正規の手段）。コスト=生存する全当事者が同じ contract_cancel を出すまで成立しない。義務が1件でも履行/違反/監査済みの契約は解除できない
+- bounty_post: 便益=自分では実行できない結果を、第三者の行動として金で買える。匿名でも掲載できる。コスト=預託はFree Cash制限対象。匿名掲載は手数料+10%。取り下げれば預託金は返還される
+- card_trade_propose / card_trade_accept / card_trade_reject: 便益=システムが原子的に執行するので相手の信用が要らない。手札の穴を埋めて勝てる市場を作れる。最大5人へ同時提案でき、最初に受諾した相手と即時成立する。コスト=1ラウンド1回まで、R12は不可。現金支払いはFree Cash以内で、支払不能なら不成立（脱落はしない）
 
 コミットフェイズのアクション:
 - {{"type": "market_commit", "market_id": "M01", "card": "ONE_PAIR"}}
@@ -921,10 +1057,7 @@ def build_negotiation_prompt(
     # P0-1/P1-3: 自分の倍掛け預託中の額（あれば）
     for du in visible_state.get("double_ups", []):
         if du.get("player_id") == player_state.player_id:
-            lines.append(
-                f"  倍掛け預託中: {du['deposit'] // 10_000}万円"
-                f"（R{du['success_round']}で判定）"
-            )
+            lines.extend(_render_double_up_deposit_lines(du))
 
     # P0-1: 今ラウンドのFinance（利息計上→強制最低返済）の確定計算
     # このR内で見ればCommit/Settlementより前なので、現金は今R決着前の値。
@@ -933,8 +1066,9 @@ def build_negotiation_prompt(
         timing_note="（このRのCommit・Settlementの後、今RのFinanceで実行されます。"
                     "現金は今Rの市場結果反映前の値です）",
         entry_fee_note=(
-            f"次のCommitフェイズ冒頭で、参加する市場ごとにEntry Fee "
-            f"{config.entry_fee}円が自動徴収されます（不足の場合は破産脱落）。"
+            f"次のCommitフェイズ冒頭で、参加する1市場分のEntry Fee "
+            f"{config.entry_fee}円が自動徴収されます"
+            f"（1ラウンドに参加できる市場は1つだけです。不足の場合は破産脱落）。"
         ),
     ))
 
@@ -1076,9 +1210,15 @@ def build_negotiation_prompt(
         json_example = '{"reasoning": "...", "strategy": {...}, "action": {"type": "pass"}}'
     else:
         json_example = '{"strategy": {...}, "action": {"type": "pass"}}'
+    available, unavailable = _available_negotiation_actions(
+        player_state, round_num, visible_state, config)
+    lines.append("\n## いま選べるアクション")
+    lines.append("  " + " / ".join(available))
+    if unavailable:
+        lines.append("  いま選べないもの: " + " / ".join(unavailable))
     lines.append(
-        f"\n交渉フェイズのアクションをJSON形式で1つ選んでください。"
-        f"（market_commitはコミットフェイズで行います。ここではdm/broadcast/transfer/repay/pass等を選択）\n"
+        f"\n上の一覧から1つ選び、JSON形式で回答してください。"
+        f"（market_commitはコミットフェイズで行います。ここでは選べません）\n"
         f"例: {json_example}"
     )
 
@@ -1107,7 +1247,9 @@ def build_commit_prompt(
     """
     lines: list[str] = []
     lines.append(f"=== ラウンド{round_num} / コミットフェイズ ===\n")
-    lines.append("参加する市場と使用するカードを選んでください。\n")
+    lines.append("参加する市場と使用するカードを選んでください。")
+    lines.append(
+        "1ラウンドに参加できる市場は1つだけです。複数市場への同時参加はできません。\n")
 
     lines.append("## 市場")
     for m in markets:
@@ -1146,10 +1288,7 @@ def build_commit_prompt(
     # P0-1/P1-3: 自分の倍掛け預託中の額（あれば）
     for du in visible_state.get("double_ups", []):
         if du.get("player_id") == player_state.player_id:
-            lines.append(
-                f"  倍掛け預託中: {du['deposit'] // 10_000}万円"
-                f"（R{du['success_round']}で判定）"
-            )
+            lines.extend(_render_double_up_deposit_lines(du))
 
     # P0-1: 今ラウンドのFinance（利息計上→強制最低返済）の確定計算
     # コミットはこのR決着前なので、現金はまだ今Rの市場結果を反映していない。
@@ -1158,8 +1297,9 @@ def build_commit_prompt(
         timing_note="（このコミットの後のSettlementを経て、今RのFinanceで実行されます。"
                     "現金は今Rの市場結果反映前の値です）",
         entry_fee_note=(
-            f"このコミットで選ぶ市場ごとにEntry Fee {config.entry_fee}円が"
-            f"この後自動徴収されます（不足の場合は破産脱落）。"
+            f"このコミットで選ぶ1市場のEntry Fee {config.entry_fee}円が"
+            f"この後自動徴収されます"
+            f"（1ラウンドに参加できる市場は1つだけです。不足の場合は破産脱落）。"
         ),
     ))
 
@@ -1320,10 +1460,7 @@ def build_reflection_prompt(
     # P0-1/P1-3: 自分の倍掛け預託中の額（あれば）
     for du in visible_state.get("double_ups", []):
         if du.get("player_id") == player_state.player_id:
-            lines.append(
-                f"  倍掛け預託中: {du['deposit'] // 10_000}万円"
-                f"（R{du['success_round']}で判定）"
-            )
+            lines.extend(_render_double_up_deposit_lines(du))
 
     # P0-1: 次ラウンドのFinanceの予測（今Rはすでに決着済みなので、現在の
     # 現金・借金残高がそのまま次Rの開始値になる。Negotiationでの返済等で
@@ -1665,10 +1802,7 @@ def build_double_up_prompt(
     double_ups = visible_state.get("double_ups", [])
     for du in double_ups:
         if du.get("player_id") == player_state.player_id:
-            lines.append(
-                f"  既存の倍掛け預託中: {du['deposit'] // 10_000}万円"
-                f"（R{du['success_round']}で判定）"
-            )
+            lines.extend(_render_double_up_deposit_lines(du, label="既存の倍掛け預託中"))
 
     # P0-3: 同一ラウンドの処理順の事実 — この選択の直後、今RのFinanceで
     # 利息計上→強制最低返済が実行される。TAKE/DOUBLEそれぞれを選んだ場合の

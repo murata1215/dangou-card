@@ -184,7 +184,10 @@ def test_phase2_structured_schema_reserve_is_budgeted_only_for_target_models():
     h1 = mm._phase2_worst_case_cost(MODEL_REGISTRY["H1"], system, 400)
     h1_without_schema = mm._worst_case_cost(MODEL_REGISTRY["H1"], system, h1_user, 400)
     assert h1 > h1_without_schema
-    assert h1 < 0.03
+    # Cycle 5（2026-08-26）: D1便益/コスト節の追加でsystem prompt長が5,901→7,079字に
+    # 増加し、H1予約が0.03を超過したため、人間承認済みのPHASE_DEFAULTS[2]更新
+    # （max_cost_per_model 0.03→0.035）に合わせて上限を更新。
+    assert h1 < 0.035
     assert mm._phase2_worst_case_cost(MODEL_REGISTRY["L1"], system, 400) == pytest.approx(
         mm._worst_case_cost(MODEL_REGISTRY["L1"], system, mm.GAME2_USER, 400)
     )
@@ -203,8 +206,10 @@ def test_gemini_phase2_overrides_and_reserves_are_model_specific():
     # Cycle 3（2026-08-24）: anonymous_broadcast/bounty_cancel のJSON action形式を
     # アクションカタログへ追加（Plan E1/E3、PROMPT_DISCOVERY_GAPの是正）したことで
     # system prompt長が変化したため、三度目の期待値更新。
-    assert mm._phase2_worst_case_cost(MODEL_REGISTRY["M3"], system, 512) == pytest.approx(0.014994)
-    assert mm._phase2_worst_case_cost(MODEL_REGISTRY["H3"], system, 912) == pytest.approx(0.024792)
+    # Cycle 5（2026-08-26）: D1便益/コスト節の追加でsystem prompt長が5,901→7,079字に
+    # 変化したため、四度目の期待値更新。M3/H3とも引き続き0.03未満に収まる。
+    assert mm._phase2_worst_case_cost(MODEL_REGISTRY["M3"], system, 512) == pytest.approx(0.0158775)
+    assert mm._phase2_worst_case_cost(MODEL_REGISTRY["H3"], system, 912) == pytest.approx(0.02597)
     assert mm._phase2_worst_case_cost(MODEL_REGISTRY["M3"], system, 512) < 0.03
     assert mm._phase2_worst_case_cost(MODEL_REGISTRY["H3"], system, 912) < 0.03
 
