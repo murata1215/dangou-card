@@ -52,6 +52,30 @@ def _norm_response_model(value: Any) -> str | None:
         return None
 
 
+# Cycle 6.1: thinking を有効化すると temperature を 1 以外にできない provider。
+# Cycle 6 スモークの HTTP 400 本文で実測確認したものだけを列挙する。
+#   Anthropic: "temperature may only be set to 1 when thinking is enabled or in adaptive ..."
+#   Moonshot : "invalid temperature: only 1 is allowed for this model"
+# 本走(llm_agent.py)は request_options を渡さず、Moonshot既定のextra_paramsは
+# {"thinking": {"type": "disabled"}} のため、この分岐には入らない（本走は不変）。
+THINKING_TEMPERATURE_LOCKED_PROVIDERS = ("Anthropic", "Moonshot")
+THINKING_LOCKED_TEMPERATURE = 1.0
+
+
+def _thinking_enabled_payload(payload: dict[str, Any] | None) -> bool:
+    """リクエストに『思考を有効化する』指示が入っているかを判定する。
+
+    registry既定の {"thinking": {"type": "disabled"}} は False を返す。
+    request_options 由来の {"thinking": {"type": "adaptive"|"enabled"}} は True。
+    """
+    if not payload:
+        return False
+    thinking = payload.get("thinking")
+    if not isinstance(thinking, dict):
+        return False
+    return thinking.get("type") != "disabled"
+
+
 class AdapterError(Exception):
     """APIアダプタのエラー（キー情報を含まない安全なメッセージのみ）"""
     pass
@@ -165,11 +189,18 @@ class AnthropicAdapter:
                 }
                 if request_options:
                     kwargs.update(request_options)
+                # Cycle 6.1: thinking有効時、Anthropic/Moonshotはtemperature=1以外を拒否する。
+                thinking_locked = (
+                    _thinking_enabled_payload(kwargs)
+                    and self.model_info.provider in THINKING_TEMPERATURE_LOCKED_PROVIDERS
+                )
                 # Sonnet/Opusなどtemperatureを廃止したモデルは、ModelInfoで明示的に省略する。
                 # Haiku等の対応モデルには従来どおり呼出側の値を送る。
                 if self.model_info.supports_temperature:
                     effective_temperature = (
-                        self.model_info.temperature_override
+                        THINKING_LOCKED_TEMPERATURE
+                        if thinking_locked
+                        else self.model_info.temperature_override
                         if self.model_info.temperature_override is not None
                         else temperature
                     )
@@ -296,9 +327,16 @@ class OpenAICompatAdapter:
                     create_kwargs["extra_body"] = self.model_info.extra_params
                 if request_options:
                     create_kwargs.update(request_options)
+                # Cycle 6.1: thinking有効時、Anthropic/Moonshotはtemperature=1以外を拒否する。
+                thinking_locked = (
+                    _thinking_enabled_payload(create_kwargs.get("extra_body"))
+                    and self.model_info.provider in THINKING_TEMPERATURE_LOCKED_PROVIDERS
+                )
                 if self.model_info.supports_temperature:
                     create_kwargs["temperature"] = (
-                        self.model_info.temperature_override
+                        THINKING_LOCKED_TEMPERATURE
+                        if thinking_locked
+                        else self.model_info.temperature_override
                         if self.model_info.temperature_override is not None
                         else temperature
                     )

@@ -135,9 +135,11 @@ def test_worst_case_cost_includes_gemini_hidden_thinking(key):
 @pytest.mark.parametrize("key", ["M4", "L4", "H4"])
 def test_worst_case_cost_includes_xai_reasoning(key):
     """xAI対象3モデルは、予約分だけ旧式(estimate_cost直呼び)より高くなること。
-    差分は各モデルの実測由来reserve * output_priceに厳密一致する"""
+    差分は各モデルの実測由来reserve * output_priceに厳密一致する。
+    Cycle 6.1(2026-08-27): M4/H4はthinking medium実測を反映して引き上げ済み
+    （M4: 1024→2560, H4: 1536→9728）。L4はthinking無効化のため不変。"""
     model = get_model(key)
-    assert model.hidden_thinking_reserve_tokens == {"L4": 768, "M4": 1024, "H4": 1536}[key]
+    assert model.hidden_thinking_reserve_tokens == {"L4": 768, "M4": 2560, "H4": 9728}[key]
     system, user = "system prompt text", "user prompt text"
     approx_input_tokens = (len(system) + len(user)) // 2 + 50
     old_style = estimate_cost(model, approx_input_tokens, 64)

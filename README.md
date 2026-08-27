@@ -41,6 +41,18 @@ uv run python scripts/replay_probe.py --dry-run --targets-file <json> # 選抜�
 uv run python scripts/replay_probe.py --execute --preflight-only ...  # 見積のみ・API0件
 ```
 
+`--model-override <Key>`（`_preflight`前に`dataclasses.replace`でモデルだけ差し替え、`--dry-run`と
+併用不可）と`--thinking {off,medium}`（provider別`request_options`でthinkingを明示的に有効化）を
+組み合わせると、既定ロスター以外のモデルへ同一手番をreplayして比較できる。
+
+```bash
+uv run python scripts/replay_probe.py --execute --model-override H4 --thinking medium \
+  --max-output-tokens 3000 --budget-mode hardened --max-cost-usd 0.20
+```
+
+各社の実測単価に基づく二次資料は[`doc/llm_api_pricing.md`](doc/llm_api_pricing.md)（`llm/models.py`の
+単価変更の根拠には使わない、参考情報）を参照。
+
 ## ドライラン
 
 ```bash

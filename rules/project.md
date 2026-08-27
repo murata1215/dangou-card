@@ -495,3 +495,47 @@ end-to-endテスト、public view非漏洩テストを含む）。実データ�
    固定するのが望ましい（`tests/test_anon_self_marker.py::test_round_message_state_reset_is_single_sourced`）。
 3. private mapは`_god_transcript`にもリスト本体（本件`_round_messages`）にも積まない。Prompt層
    （`llm/prompt_builder.py`）に渡す直前のvisible_state加工でのみ参照する。
+
+## thinking有効時はAnthropic/Moonshotのtemperatureを1.0に強制する（provider allowlist）
+
+Cycle 6の監査スモークで、thinkingを有効化した状態でAnthropic/Moonshot系モデルへ
+`temperature`を1以外の値で送るとHTTP 400になることを実測確認した
+（Anthropic: "temperature may only be set to 1 when thinking is enabled or in adaptive ..."、
+Moonshot: "invalid temperature: only 1 is allowed for this model"）。Cycle 6.1で
+`llm/adapters.py`に対処を実装した。
+
+- `THINKING_TEMPERATURE_LOCKED_PROVIDERS = ("Anthropic", "Moonshot")`と
+  `THINKING_LOCKED_TEMPERATURE = 1.0`は、**HTTP 400本文で実測確認したproviderだけ**を
+  列挙する。xAI/DeepSeek/Google/OpenAIは対象外（未実測のまま挙動を変えない）。
+- `_thinking_enabled_payload(payload)`は、リクエストに実際に「thinkingを有効化する」指示が
+  入っているか（`{"thinking": {"type": "disabled"}}`ではないか）を判定する。registry既定の
+  extra_paramsはdisabledのため、`request_options`（実験・検証専用経路）でthinkingを明示的に
+  有効化したときだけ`temperature=1.0`強制が発動する。
+- **本走（`llm/llm_agent.py`）は`request_options`を一切渡さない**ため、この分岐には入らず
+  L1〜L6を含む全登録モデルの送信内容は不変。この非回帰は`tests/test_thinking_temperature.py`
+  の`TestCoreRosterRequestSnapshotUnchanged`で、実際に送信されるkwargs dictの完全一致として
+  固定している。
+- 新しいproviderでも同種の400を実測したら、`THINKING_TEMPERATURE_LOCKED_PROVIDERS`へ追記する
+  （未実測のまま推測で追加しないこと）。
+
+## `hidden_thinking_reserve_tokens`は複数回実測の最大値へ安全マージンを掛けて設定する
+
+上記「LLMコストは常に`_usage_cost(model, usage)`経由で算出する」節で導入した
+`hidden_thinking_reserve_tokens`（xAI/Gemini 6モデル対象）は、Cycle 6.1でH4
+（`grok-4.6`: 1536→9728）・M4（`grok-4.5`: 1024→2560）を実測ベースで引き上げた。
+
+- Cycle 6の単発実測（H4 reasoning_tokens=6756）だけでなく、Cycle 6.1の検証スモークで
+  再実測した値（H4=7746、M4=2035）も含め、**複数回の実測のうち最大値**を基準にする。
+  単発実測はconditionのばらつき（`thinking`パラメータ、`max_output_tokens`）で再現しない
+  ことがあるため（`hidden_thinking_reserve_tokens=1536`は元々thinkingが浅い条件での観測値で、
+  `thinking medium`・`max_output_tokens=3000`条件では大きく下回っていた）。
+- 安全マージンは`ceil(max_measured_reasoning_tokens * 1.2)`を512単位へ切り上げる方式に統一した
+  （H4: ceil(7746*1.2)=9296→9728、M4: ceil(2035*1.2)=2442→2560）。1.2倍は経験的マージンであり
+  provider保証の数学的worst-case上限ではない点は既存節の注意書きのまま変わらない。
+- reserve値を引き上げると`scripts/model_matrix.py`の`_phase2_worst_case_cost()`が計算する
+  CORE_18予約合計が増えるため、`PHASE_DEFAULTS[2]["max_cost"]`（Phase 2の全体上限）が不足する
+  場合がある。Cycle 6.1では0.25→0.40へ人間判断で引き上げた（headroom 6.8%）。reserve値と
+  Phase 2上限は連動して見直す必要があることに留意する。担保テスト:
+  `tests/test_registry_18.py`（`test_h4_hidden_reserve_covers_measured_reasoning`・
+  `test_m4_hidden_reserve_covers_measured_reasoning`）、`tests/test_model_matrix.py`
+  （`test_xai_reserves_cover_phase2_observed_reasoning_without_claiming_a_hard_cap`）。

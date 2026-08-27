@@ -51,7 +51,7 @@ import math
 import re
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -436,6 +436,59 @@ def _resolve_model_key(model_id: str) -> str:
     return keys[0] if keys else model_id
 
 
+# ---------------------------------------------------------------------------
+# Cycle 5.5: 上位・思考モデルreplay probe用の追加（--model-override / --thinking）。
+# どちらのフラグも未指定なら以下のコードには一切到達せず、既定モードの挙動は
+# 完全にno-op（バイト一致）を維持する。Planの調査A・B（doc: dapper-snuggling-
+# cloud.md 「調査で判明した事実」節）に基づく。
+# ---------------------------------------------------------------------------
+
+# 5.4の既定--max-output-tokens=2000ではAnthropic adaptive thinking等で
+# 思考トークンが可視JSON出力の余地を食い潰す（llm/models.py L162-164の
+# 既知事故と同型）。--thinking medium 使用時はこの下限を要求する
+# （0 API call の事前バリデーション。Plan「ハーネス変更の要旨」参照）。
+THINKING_MIN_OUTPUT_TOKENS = 3000
+
+# provider名(ModelInfo.provider)をキーに、--thinking medium 時にadapter.complete()
+# へ渡すrequest_optionsを定義する。値がNoneのprovider（xAI）は「既定で常時
+# 思考する」ため追加送信なし（hidden_thinking_reserve_tokensで別途会計する）。
+# Anthropicの形は scripts/model_matrix.py _phase3_request_options() で実証済み
+# （タスク指定の{"type":"enabled","budget_tokens":N}ではない）。DeepSeek/Moonshot
+# はextra_bodyでregistryのthinking無効化(extra_params)を上書きする
+# （llm/adapters.py: OpenAICompatAdapter.completeはextra_paramsの後に
+# request_optionsをupdateするため完全に置き換わる）。
+THINKING_REQUEST_OPTIONS: dict[str, dict[str, Any] | None] = {
+    "Anthropic": {"thinking": {"type": "adaptive"}, "output_config": {"effort": "medium"}},
+    "OpenAI": {"reasoning_effort": "medium"},
+    "xAI": None,
+    "DeepSeek": {"extra_body": {"thinking": {"type": "enabled"}}},
+    "Moonshot": {"extra_body": {"thinking": {"type": "enabled"}}},
+}
+
+
+def _thinking_request_options(model: ModelInfo, thinking_mode: str) -> dict[str, Any] | None:
+    """--thinkingフラグからadapter.complete()へ渡すrequest_optionsを決める
+
+    thinking_mode=="off"（既定）は常にNoneを返す。run_execute()側もNoneの
+    場合はrequest_optionsキーワード自体を渡さないため、既定モードの
+    adapter.complete()呼び出しはCycle 5.5以前と完全に同一になる。
+    """
+    if thinking_mode == "off":
+        return None
+    return THINKING_REQUEST_OPTIONS.get(model.provider)
+
+
+def _apply_model_override(targets: list["PreparedTarget"], model_key: str) -> list["PreparedTarget"]:
+    """全対象のmodel_key/model_idを指定レジストリキーへ一括差し替える（--model-override）
+
+    prompt本文（baseline/patched system/user）・meta・input_token_ratio等は
+    一切変更しない（dataclasses.replace()でmodel_key/model_idの2フィールドのみ
+    差し替える）。呼ばれるのは--model-override指定時のみ＝未指定時は完全no-op。
+    """
+    model = get_model(model_key)
+    return [replace(t, model_key=model_key, model_id=model.model_id) for t in targets]
+
+
 @dataclass
 class PreparedTarget:
     index: int
@@ -505,18 +558,27 @@ def _prepare_targets(
     return prepared
 
 
-def _hardened_cost(model: ModelInfo, system: str, user: str, max_output_tokens: int) -> float:
+def _hardened_cost(
+    model: ModelInfo, system: str, user: str, max_output_tokens: int,
+    include_hidden_reserve: bool = False,
+) -> float:
     """保守的な入力見積（0.80 tok/char）＋出力満額での見積（P8対応）
 
     llm.costing.worst_case_cost() の `(len//2)+50` ヒューリスティックは、この
     日本語promptでは実測input tokenを12〜24%過小評価することが分かっている
     （Cycle 5.1 §5.1-4）。本番のcosting.pyは触らず、このモジュール内だけで
     より保守的な見積を別途用意する。
+
+    include_hidden_reserve（Cycle 5.5追加、既定False＝現行と完全同値）:
+    Trueの場合、model.hidden_thinking_reserve_tokens（max_tokensの外側で
+    課金されるhidden thinking予約分。例: grok-4.6=1536）をtotal_tokensへ
+    加算する（llm.costing.worst_case_cost()と同じ会計パターン）。
     """
     approx_input_tokens = int((len(system) + len(user)) * 0.80)
+    reserve = model.hidden_thinking_reserve_tokens if include_hidden_reserve else 0
     return estimate_cost(
         model, approx_input_tokens, max_output_tokens,
-        total_tokens=approx_input_tokens + max_output_tokens,
+        total_tokens=approx_input_tokens + max_output_tokens + reserve,
     )
 
 
@@ -537,12 +599,15 @@ def _realistic_cost(
 
 def _estimate_call_cost(
     mode: str, model: ModelInfo, system: str, user: str, max_output_tokens: int,
-    ratio: float, logged_output_tokens: int,
+    ratio: float, logged_output_tokens: int, *, include_hidden_reserve: bool = False,
 ) -> float:
     if mode == "worst_case":
         return worst_case_cost(model, system, user, max_output_tokens)
     if mode == "hardened":
-        return _hardened_cost(model, system, user, max_output_tokens)
+        return _hardened_cost(
+            model, system, user, max_output_tokens,
+            include_hidden_reserve=include_hidden_reserve,
+        )
     if mode == "realistic":
         return _realistic_cost(model, system, user, ratio, logged_output_tokens)
     raise ValueError(f"unknown budget mode: {mode}")
@@ -563,13 +628,27 @@ class _NullEventLogger:
 def _preflight(
     targets: list[PreparedTarget], *, samples: int, variants: list[str], budget_mode: str,
     max_output_tokens: int, max_cost_usd: float, check_keys: bool = True,
+    thinking_mode: str = "off",
 ) -> dict[str, Any]:
     """API呼び出し0件の事前ゲート。見積・締め指示置換の健全性・APIキー有無を確認する
 
     P4対応: closing_replacedがFalseのレコードが1件でもあれば、patchedが
     baselineに化けている可能性があるため即中止する。
+
+    thinking_mode（Cycle 5.5追加、既定"off"）: "off"以外の場合、
+    max_output_tokensがTHINKING_MIN_OUTPUT_TOKENS未満なら即中止する
+    （思考トークンが可視JSON出力を食い潰す既知事故の事前検出）。
     """
     import os as _os
+
+    if thinking_mode != "off" and max_output_tokens < THINKING_MIN_OUTPUT_TOKENS:
+        print(
+            f"[replay_probe] --thinking {thinking_mode} 指定時は --max-output-tokens が"
+            f" {THINKING_MIN_OUTPUT_TOKENS} 以上必要です（現在 {max_output_tokens}）。"
+            "思考トークンが可視JSON出力の余地を食い潰す既知の事故を避けるため中止します。",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     bad_closing = [t for t in targets if not t.closing_replaced]
     if bad_closing:
@@ -594,6 +673,7 @@ def _preflight(
             est = _estimate_call_cost(
                 budget_mode, model, system, user, max_output_tokens,
                 t.input_token_ratio, t.logged_output_tokens,
+                include_hidden_reserve=(thinking_mode != "off"),
             )
             est_total = est * samples
             total += est_total
@@ -857,6 +937,57 @@ def _write_summary_and_csv(
             dist[key] = dist.get(key, 0) + 1
         return dict(sorted(dist.items()))
 
+    def _by_model() -> dict[str, Any]:
+        """Cycle 5.5追加: model_key別の変換率・role分布・思考トークン量等をまとめる
+
+        既存キー（by_variant等）には触れず、summaryへの追加キーとしてのみ働く。
+        """
+        model_keys = sorted({r.get("model_key") for r in records if r.get("model_key")})
+        out: dict[str, Any] = {}
+        for mk in model_keys:
+            rs = [r for r in records if r.get("model_key") == mk]
+            n = len(rs)
+            n_contract = sum(1 for r in rs if r.get("is_contract_action"))
+            n_parsed = sum(1 for r in rs if r.get("parse_ok"))
+            n_json = sum(1 for r in rs if r.get("json_extracted"))
+            n_trunc = sum(1 for r in rs if r.get("truncated"))
+            lo, hi = _wilson_ci(n_contract, n)
+            role_dist: dict[str, int] = {}
+            action_dist: dict[str, int] = {}
+            finish_dist: dict[str, int] = {}
+            reasoning_vals: list[float] = []
+            for r in rs:
+                role_dist[r.get("role") or "_none"] = role_dist.get(r.get("role") or "_none", 0) + 1
+                key = r.get("action_type") or f"_error:{r.get('parse_error_class') or r.get('error_type')}"
+                action_dist[key] = action_dist.get(key, 0) + 1
+                fr = r.get("finish_reason") or "_none"
+                finish_dist[fr] = finish_dist.get(fr, 0) + 1
+                rt = r.get("reasoning_tokens")
+                if rt is None:
+                    rt = (r.get("usage") or {}).get("reasoning_tokens")
+                if rt:
+                    reasoning_vals.append(rt)
+            out[mk] = {
+                "model_id": rs[0].get("model_id") if rs else None,
+                "n": n,
+                "conversion_rate": {
+                    "num": n_contract, "den": n,
+                    "rate": (n_contract / n if n else 0.0), "wilson95": [lo, hi],
+                },
+                "json_valid_rate": (n_json / n if n else 0.0),
+                "parse_ok_rate": (n_parsed / n if n else 0.0),
+                "truncation_rate": (n_trunc / n if n else 0.0),
+                "truncated_count": n_trunc,
+                "role_distribution": dict(sorted(role_dist.items())),
+                "action_type_distribution": dict(sorted(action_dist.items())),
+                "finish_reason_distribution": dict(sorted(finish_dist.items())),
+                "reasoning_tokens_mean": (
+                    sum(reasoning_vals) / len(reasoning_vals) if reasoning_vals else 0.0
+                ),
+                "reasoning_tokens_max": (max(reasoning_vals) if reasoning_vals else 0),
+            }
+        return out
+
     summary = {
         "generated_at": datetime.datetime.now().isoformat(),
         "terminated_reason": terminated_reason,
@@ -888,6 +1019,10 @@ def _write_summary_and_csv(
                     summary["mcnemar_by_role"][role] = _mcnemar_exact(
                         pc_r["b_baseline0_patched1"], pc_r["c_baseline1_patched0"],
                     ) | {"n_pairs": pc_r["n_pairs"]}
+        # Cycle 5.5追加: model_key別内訳。--variants patched単独（5.5既定）でもn_pairs
+        # なしで単独集計できるため、baseline/patched両方揃っている必要はない。
+        if any(r.get("model_key") for r in records):
+            summary["by_model"] = _by_model()
 
     (out_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2))
     print(f"[replay_probe] --execute 完了: {len(records)} call, "
@@ -900,6 +1035,7 @@ def run_execute(
     targets: list[PreparedTarget], out_dir: Path, *, samples: int, variants: list[str],
     budget_mode: str, max_output_tokens: int, max_cost_usd: float, sleep_seconds: float,
     rate_limit_cooldown: float, resume: bool, legacy_summary: bool = False,
+    thinking_mode: str = "off", cycle55_extra_fields: bool = False,
 ) -> None:
     """--execute経路の実処理。P2対応: create_adapterを正しくimportする。
 
@@ -907,6 +1043,12 @@ def run_execute(
     経路には一切波及させない。呼び出しごとにGameCostBudgetへ事前予約を行い、
     上限に達したらそのサンプル境界でgracefulに停止する（実費が承認上限を
     構造的に超えないようにする2層目のガード）。
+
+    thinking_mode / cycle55_extra_fields（Cycle 5.5追加、既定"off"/False＝
+    現行と完全同値）: thinking_modeが"off"以外ならadapter.complete()へ
+    request_optionsを追加する。cycle55_extra_fieldsがTrueならresults.jsonlの
+    各recordへ thinking_mode/thinking_applied/request_options/reasoning_tokens/
+    max_output_tokens を追加する（既定モードのrecordスキーマは変更しない）。
     """
     from llm.adapters import AdapterError, _classify_error, create_adapter
 
@@ -971,6 +1113,7 @@ def run_execute(
                     est = _estimate_call_cost(
                         budget_mode, model, system, user, max_output_tokens,
                         t.input_token_ratio, t.logged_output_tokens,
+                        include_hidden_reserve=(thinking_mode != "off"),
                     )
                     try:
                         reservation = budget.reserve(
@@ -990,13 +1133,17 @@ def run_execute(
                     error_type: str | None = None
                     text = ""
                     usage: dict[str, Any] = {"input_tokens": 0, "output_tokens": 0}
+                    thinking_opts = _thinking_request_options(model, thinking_mode)
+                    complete_kwargs: dict[str, Any] = dict(
+                        system=system,
+                        messages=[{"role": "user", "content": user}],
+                        max_tokens=max_output_tokens,
+                        temperature=DEFAULT_TEMPERATURE,
+                    )
+                    if thinking_opts is not None:
+                        complete_kwargs["request_options"] = thinking_opts
                     try:
-                        text, usage = adapter.complete(
-                            system=system,
-                            messages=[{"role": "user", "content": user}],
-                            max_tokens=max_output_tokens,
-                            temperature=DEFAULT_TEMPERATURE,
-                        )
+                        text, usage = adapter.complete(**complete_kwargs)
                     except AdapterError as e:
                         error_msg = str(e)[:200]
                         error_type = _classify_error(e)
@@ -1067,6 +1214,12 @@ def run_execute(
                         record["role"] = t.meta.get("role")
                         record["peer"] = t.meta.get("peer")
                         record["meta"] = t.meta
+                    if cycle55_extra_fields:
+                        record["thinking_mode"] = thinking_mode
+                        record["thinking_applied"] = thinking_opts is not None
+                        record["request_options"] = thinking_opts
+                        record["reasoning_tokens"] = usage.get("reasoning_tokens", 0)
+                        record["max_output_tokens"] = max_output_tokens
                     results_f.write(json.dumps(record, ensure_ascii=False) + "\n")
                     results_f.flush()
                     all_results.append(record)
@@ -1117,6 +1270,14 @@ def main() -> None:
                         help="Cycle 5.4: 対象手番を外部JSONから読み込む（既定: 内蔵27件選抜）")
     parser.add_argument("--legacy-summary", action="store_true",
                         help="Cycle 5.4で追加したrole分割/McNemarキーをsummaryへ含めない")
+    parser.add_argument("--model-override", type=str, default=None,
+                        help="Cycle 5.5: 全対象のmodel_keyを指定レジストリキー"
+                             "（例: M1/H4/H6/TERRA）へ一括差し替える。"
+                             "--only/--modelsフィルタ適用後・preflight前に適用。"
+                             "--dry-run（既定含む）とは併用不可")
+    parser.add_argument("--thinking", choices=["off", "medium"], default="off",
+                        help="Cycle 5.5: providerごとのthinking/reasoning "
+                             "request_optionsを有効化する（既定off＝完全no-op）")
     args = parser.parse_args()
 
     targets_file = Path(args.targets_file) if args.targets_file else None
@@ -1128,6 +1289,11 @@ def main() -> None:
         parser.error("--dry-run と --execute は同時指定できません")
     if not args.dry_run and not args.execute:
         args.dry_run = True
+
+    # Cycle 5.5: --model-override は --dry-run（既定含む）と併用不可。
+    # dry-run経路に5.5コードが一切届かないことを構造的に保証する。
+    if args.model_override and args.dry_run:
+        parser.error("--model-override は --dry-run（既定含む）と併用できません（--executeが必須）")
 
     if args.out_dir:
         out_dir = Path(args.out_dir)
@@ -1182,9 +1348,15 @@ def main() -> None:
         print("[replay_probe] 対象レコードが0件です（--only/--modelsの指定を確認）", file=sys.stderr)
         sys.exit(1)
 
+    # Cycle 5.5: --only/--models フィルタ適用後・_preflight()の前に適用する
+    # （preflightの単価・APIキー判定・budget.reserve()を実モデルに一致させるため）。
+    if args.model_override:
+        targets = _apply_model_override(targets, args.model_override)
+
     preflight = _preflight(
         targets, samples=args.samples, variants=variants, budget_mode=args.budget_mode,
         max_output_tokens=args.max_output_tokens, max_cost_usd=args.max_cost_usd,
+        thinking_mode=args.thinking,
     )
     print(json.dumps(preflight, ensure_ascii=False, indent=2))
 
@@ -1206,12 +1378,14 @@ def main() -> None:
         print("[replay_probe] --preflight-only: 見積・キー確認のみ完了。API呼び出しは行っていません。")
         return
 
+    cycle55_extra_fields = bool(args.model_override) or args.thinking != "off"
     run_execute(
         targets, out_dir, samples=args.samples, variants=variants,
         budget_mode=args.budget_mode, max_output_tokens=args.max_output_tokens,
         max_cost_usd=args.max_cost_usd, sleep_seconds=args.sleep_seconds,
         rate_limit_cooldown=args.rate_limit_cooldown, resume=args.resume,
         legacy_summary=args.legacy_summary,
+        thinking_mode=args.thinking, cycle55_extra_fields=cycle55_extra_fields,
     )
 
 

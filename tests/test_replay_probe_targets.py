@@ -10,6 +10,7 @@ API呼び出しは一切行わない（LLMアダプタは`_load_targets`/`_prepa
 from __future__ import annotations
 
 import json
+import sys
 
 import pytest
 
@@ -345,3 +346,269 @@ class TestRealTargetsFile:
         loaded = rp._load_targets(_REAL_TARGETS_FILE)
         if "total" in counts:
             assert len(loaded) == counts["total"]
+
+
+# ---------------------------------------------------------------------------
+# Cycle 5.5: targets_cycle55.json（19件・チェーン一意・★手番必須）
+# ---------------------------------------------------------------------------
+_REAL_TARGETS_FILE_55 = rp.TRIAL_DIR.parent.parent.parent / "replay_probe" / "targets_cycle55.json"
+
+
+@pytest.mark.skipif(
+    not (TRIAL_AVAILABLE and _REAL_TARGETS_FILE_55.exists()),
+    reason=f"targets_cycle55.jsonが未生成、またはtrialログ不在: {_REAL_TARGETS_FILE_55}",
+)
+class TestRealTargetsFileCycle55:
+    def test_loads_19_with_role_balance(self):
+        loaded = rp._load_targets(_REAL_TARGETS_FILE_55)
+        assert len(loaded) == 19
+        roles = [t.meta.get("role") for t in loaded]
+        assert roles.count("proposer") == 10
+        assert roles.count("replier") == 9
+
+    def test_chains_are_unique(self):
+        loaded = rp._load_targets(_REAL_TARGETS_FILE_55)
+        chain_keys = set()
+        for t in loaded:
+            dm = t.meta["agreement_dm"]
+            key = (dm["round_num"], dm["turn"], dm["sender"], dm["recipient"])
+            assert key not in chain_keys, f"チェーン重複: {key}"
+            chain_keys.add(key)
+        assert len(chain_keys) == 19
+
+    def test_includes_star_target(self):
+        # Cycle 5.4で唯一 contract_propose に転換した手番（必須採用）
+        loaded = rp._load_targets(_REAL_TARGETS_FILE_55)
+        assert any(
+            t.player_id == "P03" and t.round_num == 6 and t.turn == 10
+            and t.meta.get("role") == "proposer"
+            for t in loaded
+        )
+
+    def test_all_closing_replaced(self):
+        config = rp.GameConfig.baseline_v1_s2(12)
+        prepared = rp._prepare_targets(config, _REAL_TARGETS_FILE_55)
+        assert len(prepared) == 19
+        assert all(p.closing_replaced for p in prepared)
+
+
+# ---------------------------------------------------------------------------
+# Cycle 5.5: --thinking の request_options テーブル（API呼び出しなし）
+# ---------------------------------------------------------------------------
+class TestThinkingRequestOptions:
+    def test_off_is_always_none_regardless_of_provider(self):
+        for key in ("M1", "TERRA", "H4", "H6", "M5"):
+            model = rp.get_model(key)
+            assert rp._thinking_request_options(model, "off") is None
+
+    def test_anthropic_medium_uses_proven_adaptive_shape(self):
+        # scripts/model_matrix.py _phase3_request_options() で実証済みの形。
+        # タスク指定の{"type":"enabled","budget_tokens":N}ではない。
+        model = rp.get_model("M1")
+        opts = rp._thinking_request_options(model, "medium")
+        assert opts == {"thinking": {"type": "adaptive"}, "output_config": {"effort": "medium"}}
+
+    def test_openai_medium_uses_reasoning_effort(self):
+        model = rp.get_model("TERRA")
+        opts = rp._thinking_request_options(model, "medium")
+        assert opts == {"reasoning_effort": "medium"}
+
+    def test_xai_medium_sends_nothing_extra(self):
+        # grok-4.6は既定で常時思考するため、追加のrequest_optionsは送らない
+        # （hidden_thinking_reserve_tokensで別途会計する）。
+        model = rp.get_model("H4")
+        assert rp._thinking_request_options(model, "medium") is None
+
+    def test_deepseek_medium_overrides_registry_disable(self):
+        model = rp.get_model("H6")
+        opts = rp._thinking_request_options(model, "medium")
+        assert opts == {"extra_body": {"thinking": {"type": "enabled"}}}
+        # registry自体のextra_paramsは無効化のまま（上書きはrequest_options側の責務）
+        assert model.extra_params == {"thinking": {"type": "disabled"}}
+
+
+# ---------------------------------------------------------------------------
+# Cycle 5.5: _hardened_cost の include_hidden_reserve（既定Falseは現行と完全同値）
+# ---------------------------------------------------------------------------
+class TestHardenedCostHiddenReserve:
+    def test_default_is_false_and_matches_explicit_false(self):
+        model = rp.get_model("H4")
+        system, user = "a" * 100, "b" * 100
+        assert rp._hardened_cost(model, system, user, 6000) == rp._hardened_cost(
+            model, system, user, 6000, include_hidden_reserve=False,
+        )
+
+    def test_true_adds_hidden_reserve_at_reasoning_price(self):
+        model = rp.get_model("H4")  # hidden_thinking_reserve_tokens=1536
+        system, user = "a" * 100, "b" * 100
+        without = rp._hardened_cost(model, system, user, 6000, include_hidden_reserve=False)
+        with_reserve = rp._hardened_cost(model, system, user, 6000, include_hidden_reserve=True)
+        effective_reasoning_price = model.reasoning_price if model.reasoning_price is not None else model.output_price
+        expected_diff = model.hidden_thinking_reserve_tokens * effective_reasoning_price / 1_000_000
+        assert with_reserve - without == pytest.approx(expected_diff)
+
+    def test_zero_reserve_model_is_unaffected(self):
+        model = rp.get_model("M1")  # hidden_thinking_reserve_tokens=0（既定）
+        system, user = "a" * 100, "b" * 100
+        assert rp._hardened_cost(model, system, user, 2000, include_hidden_reserve=False) == \
+            rp._hardened_cost(model, system, user, 2000, include_hidden_reserve=True)
+
+    def test_estimate_call_cost_default_matches_hardened_false(self):
+        model = rp.get_model("H4")
+        system, user = "a" * 50, "b" * 50
+        via_estimate = rp._estimate_call_cost("hardened", model, system, user, 6000, 0.5, 400)
+        via_direct = rp._hardened_cost(model, system, user, 6000, include_hidden_reserve=False)
+        assert via_estimate == via_direct
+
+
+# ---------------------------------------------------------------------------
+# Cycle 5.5: --model-override（_apply_model_override）。trial log不要（合成データ）
+# ---------------------------------------------------------------------------
+def _dummy_prepared_target(**overrides) -> "rp.PreparedTarget":
+    base = dict(
+        index=0, player_id="P99", round_num=1, turn=1,
+        model_id="deepseek-v4-flash", model_key="M6",
+        baseline_system="sys_b", baseline_user="user_b",
+        patched_system="sys_p", patched_user="user_p",
+        closing_replaced=True, deposit_replaced=False,
+        logged_input_tokens=100, logged_output_tokens=50, logged_cost_usd=0.001,
+        input_token_ratio=0.5, meta={"role": "proposer", "peer": "P98"},
+    )
+    base.update(overrides)
+    return rp.PreparedTarget(**base)
+
+
+class TestModelOverride:
+    def test_replaces_only_model_key_and_model_id(self):
+        t = _dummy_prepared_target()
+        overridden = rp._apply_model_override([t], "H4")[0]
+        assert overridden.model_key == "H4"
+        assert overridden.model_id == rp.get_model("H4").model_id
+        assert overridden.baseline_system == t.baseline_system
+        assert overridden.baseline_user == t.baseline_user
+        assert overridden.patched_system == t.patched_system
+        assert overridden.patched_user == t.patched_user
+        assert overridden.meta == t.meta
+        assert overridden.input_token_ratio == t.input_token_ratio
+        assert overridden.index == t.index
+        assert overridden.player_id == t.player_id
+
+    def test_original_target_is_not_mutated(self):
+        t = _dummy_prepared_target()
+        rp._apply_model_override([t], "H4")
+        assert t.model_key == "M6"
+        assert t.model_id == "deepseek-v4-flash"
+
+    def test_unknown_model_key_raises(self):
+        t = _dummy_prepared_target()
+        with pytest.raises(ValueError):
+            rp._apply_model_override([t], "NOT_A_REAL_KEY")
+
+
+# ---------------------------------------------------------------------------
+# Cycle 5.5: --thinking の事前バリデーション（0 API call）
+# ---------------------------------------------------------------------------
+class TestThinkingPreflightValidation:
+    def test_thinking_medium_below_min_output_tokens_exits(self):
+        t = _dummy_prepared_target()
+        with pytest.raises(SystemExit):
+            rp._preflight(
+                [t], samples=1, variants=["patched"], budget_mode="hardened",
+                max_output_tokens=2000, max_cost_usd=100, check_keys=False,
+                thinking_mode="medium",
+            )
+
+    def test_thinking_medium_at_min_output_tokens_ok(self):
+        t = _dummy_prepared_target()
+        result = rp._preflight(
+            [t], samples=1, variants=["patched"], budget_mode="hardened",
+            max_output_tokens=rp.THINKING_MIN_OUTPUT_TOKENS, max_cost_usd=100,
+            check_keys=False, thinking_mode="medium",
+        )
+        assert result["target_count"] == 1
+
+    def test_thinking_off_ignores_threshold(self):
+        t = _dummy_prepared_target()
+        result = rp._preflight(
+            [t], samples=1, variants=["patched"], budget_mode="hardened",
+            max_output_tokens=100, max_cost_usd=100,
+            check_keys=False, thinking_mode="off",
+        )
+        assert result["target_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Cycle 5.5: CLI検証（--model-override は --dry-run と併用不可）
+# ---------------------------------------------------------------------------
+class TestCLIModelOverrideValidation:
+    def test_model_override_with_implicit_dry_run_errors(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", ["replay_probe.py", "--model-override", "M1"])
+        with pytest.raises(SystemExit) as exc:
+            rp.main()
+        assert exc.value.code not in (0, None)
+
+    def test_model_override_with_explicit_dry_run_errors(self, monkeypatch):
+        monkeypatch.setattr(
+            sys, "argv", ["replay_probe.py", "--dry-run", "--model-override", "M1"],
+        )
+        with pytest.raises(SystemExit) as exc:
+            rp.main()
+        assert exc.value.code not in (0, None)
+
+
+# ---------------------------------------------------------------------------
+# Cycle 5.5: summary.json の by_model セクション（合成レコードのみ・API不要）
+# ---------------------------------------------------------------------------
+class TestByModelSummary:
+    def _budget(self) -> rp.GameCostBudget:
+        return rp.GameCostBudget(
+            per_player_cap_usd=100, game_cap_usd=100,
+            event_logger=rp._NullEventLogger(), abort_on_block=False,
+        )
+
+    def test_by_model_present_and_correct(self, tmp_path):
+        records = [
+            {
+                "variant": "patched", "model_key": "H4", "model_id": "grok-4.6",
+                "is_contract_action": True, "parse_ok": True, "json_extracted": True,
+                "truncated": False, "role": "proposer", "action_type": "contract_propose",
+                "finish_reason": "stop", "reasoning_tokens": 500, "cost_usd": 0.01,
+            },
+            {
+                "variant": "patched", "model_key": "H4", "model_id": "grok-4.6",
+                "is_contract_action": False, "parse_ok": True, "json_extracted": True,
+                "truncated": True, "role": "replier", "action_type": "pass",
+                "finish_reason": "length", "reasoning_tokens": 700, "cost_usd": 0.02,
+            },
+        ]
+        rp._write_summary_and_csv(tmp_path, records, self._budget(), None, ["patched"])
+        summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
+        bm = summary["by_model"]["H4"]
+        assert bm["n"] == 2
+        assert bm["conversion_rate"]["num"] == 1
+        assert bm["truncated_count"] == 1
+        assert bm["reasoning_tokens_mean"] == pytest.approx(600.0)
+        assert bm["reasoning_tokens_max"] == 700
+        assert bm["role_distribution"] == {"proposer": 1, "replier": 1}
+        assert bm["finish_reason_distribution"] == {"length": 1, "stop": 1}
+
+    def test_legacy_summary_omits_by_model(self, tmp_path):
+        records = [{
+            "variant": "patched", "model_key": "H4", "model_id": "grok-4.6",
+            "is_contract_action": False, "parse_ok": True, "json_extracted": True,
+            "truncated": False, "cost_usd": 0.0,
+        }]
+        rp._write_summary_and_csv(
+            tmp_path, records, self._budget(), None, ["patched"], legacy_summary=True,
+        )
+        summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
+        assert "by_model" not in summary
+
+    def test_no_model_key_omits_by_model(self, tmp_path):
+        records = [{
+            "variant": "patched", "is_contract_action": False, "parse_ok": True,
+            "json_extracted": True, "truncated": False, "cost_usd": 0.0,
+        }]
+        rp._write_summary_and_csv(tmp_path, records, self._budget(), None, ["patched"])
+        summary = json.loads((tmp_path / "summary.json").read_text(encoding="utf-8"))
+        assert "by_model" not in summary

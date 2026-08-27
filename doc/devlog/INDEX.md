@@ -161,3 +161,6 @@ Stage 1 で捕捉したトークン内訳（cached/reasoning/total）を活用�
 - 2026-08-26 09:55 JST | Cycle 5.2: 締め指示に対応付け説明句追加、user_prompt+132～179字(予算内)・system_prompt7079字不変・pytest1304PASS・replay_probe dry-run27件API0件・5.1devlog重複解消(084535削除) → 2026-08-26_095502.md
 - 2026-08-26 13:00 JST | Cycle 5.3: 5.2締め指示で同27件N=3再計測、契約系変換率patched2/81→1/81(McNemar p≈1.0有意差なし)、実測$0.281507/上限$0.90、pytest1304PASS → 2026-08-26_130007.md
 - 2026-08-26 16:55 JST | Cycle 5.4: replay probe選抜を「合意直後手番」38件へ再定義・再計測、契約系変換率0/38→1/38(p=1.0、有意差なし)、実測$0.2832/上限$0.90、pytest1343PASS → 2026-08-26_165524.md
+- 2026-08-26 22:42 JST | Cycle 5.5: 上位・思考モデルreplay probe(19件×2モデル、TERRA/H4は運用制約で除外)、契約系変換率claude-sonnet-5 0/19・deepseek-v4-pro 0/19(5.4の1/38を下回る)、実測$0.4745/上限$4.00、pytest1373PASS → 2026-08-26_224230.md
+- 2026-08-27 07:41 JST | Cycle 6: モデルレジストリ監査(18体ロスター前提)、H4timeout60→180・TERRAパラメータ修正でHTTP400/タイムアウト解消を実測検証、kimi-k2.5実在確認・単価0件変更、スモーク15call実費$0.3007/上限$1.00、pytest1382PASS → 2026-08-27_074110.md
+- 2026-08-27 19:31 JST | Cycle 6.1: thinking時temp=1.0強制でAnthropic/Moonshot400解消、M4timeout60→180・H4予約1536→9728+Phase2上限0.25→0.40、L1〜L6送信非回帰固定、実費$0.2753/上限$0.60、pytest1401PASS → 2026-08-27_193137.md

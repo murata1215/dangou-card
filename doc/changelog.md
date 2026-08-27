@@ -1,5 +1,71 @@
 # Changelog
 
+## 2026-08-27: Cycle 6.1: thinking×temperature競合の修正、xAI reserve実測反映、Phase2上限追随
+
+Cycle 6監査で判明した3件の保留事項（Moonshot/Anthropicのthinking×temperature 400、
+grok-4.5のタイムアウト、grok-4.6のreserve過小見積）と、けいすけさん承認プランの4項目を実装した。
+
+- **Fix 1（thinking×temperature競合）**: `llm/adapters.py`に
+  `THINKING_TEMPERATURE_LOCKED_PROVIDERS = ("Anthropic", "Moonshot")`と
+  `_thinking_enabled_payload()`を追加。thinkingが有効化されたリクエストでは
+  `temperature=1.0`を強制する。本走（`llm/llm_agent.py`）は`request_options`を渡さず
+  Moonshot既定の`extra_params`は`{"thinking":{"type":"disabled"}}`のため、L1〜L6の
+  送信内容は不変（新規snapshotテストで完全一致を固定）。
+- **Fix 2**: `grok-4.5`(M4)の`timeout_seconds`を60→180へ引き上げ（H4と同型のxAI常時思考対策）。
+- **Fix 3**: `hidden_thinking_reserve_tokens`をH4 1536→9728、M4 1024→2560へ引き上げ。
+  Cycle 6実測（H4 reasoning_tokens=6756）とCycle 6.1検証スモーク実測（H4=7746、M4=2035）の
+  両方を下回らないよう`ceil(max_measured * 1.2)`を512単位へ切り上げて算出。
+- **予算追随**: `scripts/model_matrix.py`の`PHASE_DEFAULTS[2]["max_cost"]`を0.25→0.40へ
+  引き上げ（CORE_18予約合計$0.24067398→$0.37276999、headroom 6.8%を確保。人間判断による調整、
+  予約計算ロジック自体は無変更）。
+- **検証スモーク**: L1/M5/H5/M4/H4の5モデル各1callを実施（上限$0.60、実費$0.275279）。
+  M5/H5はFix 1により成功（temperature=1.0強制で400解消）。L1は別種のHTTP 400
+  （"adaptive thinking is not supported on this model"、Fix 1のスコープ外のモデル能力制限）が
+  残存し保留。M4/H4はタイムアウト・費用超過なく成功。
+- **テスト**: 新規`tests/test_thinking_temperature.py`17件（API 0コール、L1〜L6の送信dict
+  完全一致snapshotを含む）、`tests/test_registry_18.py`/`test_model_matrix.py`/
+  `test_model_smoke.py`の期待値を新reserve値・新Phase2上限へ更新。全体`uv run pytest tests/ -q`
+  1401 passed。
+- 詳細は`doc/devlog/2026-08-27_193137.md`・`.devrelay-output/registry_fix_6_1_20260827_193137.md`を参照。
+  ゲーム本走・Viewer再起動・commit/pushはCycle 6.1では実施していない（本コミットが初）。
+
+## 2026-08-27: Cycle 6: モデルレジストリ監査（18体ロスター前提）
+
+18体ロスター（6社×上位/中位/下位）へ進む前に、`llm/models.py`のレジストリ全21〜22
+エントリを実在性・単価・思考設定・タイムアウトの観点で監査した。ゲームルール・`engine/`は無変更、
+修正はレジストリ設定値のみ。
+
+- けいすけさん提供の2026-08-16版価格表を`doc/llm_api_pricing.md`として新規作成（二次資料、
+  単価変更の根拠にはしない）。
+- `llm/models.py`を修正: H4 `grok-4.6`の`timeout_seconds`60→180（5.5実測61.2秒×2の裏付け）、
+  TERRA `gpt-5.6-terra`を`max_completion_tokens`パラメータ・`supports_temperature=False`で
+  修正（5.5のHTTP 400裏付け）、`kimi-k2.5`実在確認用の評価専用エントリ`K25_EVAL`を新規登録。
+- 15モデル×1callスモーク（累計実費$0.3007、上限$1.00の約30%）で検証: H4が123.5秒で成功
+  （旧60秒なら確実にタイムアウト）、TERRAのHTTP 400解消、`kimi-k2.5`の実在確認。
+- **新規に3種の障害クラスを発見**（いずれも`llm/adapters.py`変更が必要でCycle 6の権限外のため
+  未修正・報告のみ）: (1) Anthropic/Moonshot系がthinking有効時に`temperature`制約で400、
+  (2) `gpt-4.1`系がreasoning_effort非対応で400、(3) `grok-4.5`(M4)も60秒タイムアウト。
+  (1)と(3)はCycle 6.1で解消（上記参照）。
+- 詳細は`doc/devlog/2026-08-27_074110.md`・`.devrelay-output/registry_audit_20260827_072456.md`を参照。
+
+## 2026-08-26: Cycle 5.5: 上位・思考モデル replay probe
+
+5.1〜5.4で軽量・非思考モデルの契約系アクション転換率が伸び悩んだため、「モデルの推論能力の
+問題か」を切り分ける目的で上位・思考モデル4種へ同一手番（19件）をreplayした。
+
+- `scripts/replay_probe.py`に`--model-override <key>`（`dataclasses.replace`でモデルのみ
+  差し替え）と`--thinking {off,medium}`（provider別`request_options`テーブル）を追加。
+  既定モードの出力は`diff -rq`でバイト一致を確認済み（非回帰）。
+- `llm/models.py`にQ2で許可された4設定値のみで`gpt-5.6-terra`（TERRA）を新規登録。
+- 4モデル1callスモークで**deepseek-v4-pro**（thinking有効でJSON崩壊→無効へフォールバックし成功）、
+  **claude-sonnet-5**（成功）、**gpt-5.6-terra**（HTTP 400、対応はレジストリ変更が必要で範囲外→
+  Cycle 6で解消）、**grok-4.6**（タイムアウト、同→Cycle 6で解消）を確認。
+- 残った2モデル（deepseek-v4-pro=thinking off、claude-sonnet-5=thinking medium）で19件×2モデル
+  ＝38callの本計測を実行。契約系変換率は両モデルとも0/19（合算0/38）で、5.4の非思考モデル
+  patched 1/38（2.63%）を上回らなかった。実測コスト$0.474460（スモーク込み$0.501524、上限$4.00の
+  約12.5%）。
+- 詳細は`doc/devlog/2026-08-26_224230.md`・`.devrelay-output/replay_probe_report_5_5_20260826_224230.md`を参照。
+
 ## 2026-08-26: Cycle 5系: D1（契約系アクション消滅）のprompt側修正と、replay probeによる4回のA/B実測
 
 `ac844b3`（Cycle 2-4）以降の clean L12×R12 実戦・全面監査で最重要欠陥 D1 を特定し、

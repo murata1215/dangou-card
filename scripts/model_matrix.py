@@ -88,9 +88,14 @@ DEFAULT_OUT_DIR = Path("logs/model_matrix")
 DEFAULT_MAX_COST_TOTAL = 1.00
 DEFAULT_SEED = 901
 
+# Cycle 6.1 (2026-08-27): H4のhidden_thinking_reserve_tokens引き上げ(1536→9728)に伴い
+# CORE_18のPhase2予約合計が$0.24067398→$0.37276999へ増加したため、
+# max_cost を 0.25→0.40 に引き上げる（事前予約ガードの上限。実費ではない）。
+# max_cost_per_model は据え置き。H4単体の予約はこの上限を超える既知の例外として
+# tests/test_model_matrix.py で明示的にテスト固定している。
 PHASE_DEFAULTS: dict[int, dict[str, Any]] = {
     1: {"max_cost": 0.08, "max_cost_per_model": 0.02, "max_calls": 40, "max_tokens": 64, "retries": 1},
-    2: {"max_cost": 0.25, "max_cost_per_model": 0.035, "max_calls": 24, "max_tokens": 400, "retries": 0},
+    2: {"max_cost": 0.40, "max_cost_per_model": 0.035, "max_calls": 24, "max_tokens": 400, "retries": 0},
     3: {"max_cost": 0.20, "max_cost_per_model": 0.03, "max_calls": 96, "max_tokens": 500, "retries": 0},
 }
 

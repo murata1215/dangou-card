@@ -1178,14 +1178,18 @@ def test_phase3_timeout_override_reaches_openai_sdk_without_registry_mutation(mo
 
     monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=FakeOpenAI))
     monkeypatch.setenv(MODEL_REGISTRY["H4"].env_key, "fake-key")
-    effective = mm._phase3_effective_model(MODEL_REGISTRY["H4"], 2000, 180)
+    # Cycle 6監査(2026-08-27)でH4のレジストリ既定timeout_secondsは60→180に変更された
+    # （5.5実測で60秒に2回連続到達したため）。このテストの目的は「runtime override が
+    # 共有レジストリを書き換えないこと」の証明なので、既定値(180)とは異なる override値
+    # (240)を使い、override後もレジストリ既定が変化していないことを確認する。
+    effective = mm._phase3_effective_model(MODEL_REGISTRY["H4"], 2000, 240)
     adapter = mm.create_adapter(effective, max_retries=0, allow_temperature_fallback=False)
     adapter._get_client()
 
-    assert captured["timeout"] == 180
+    assert captured["timeout"] == 240
     assert captured["max_retries"] == 0
     assert effective.max_tokens == 2000
-    assert MODEL_REGISTRY["H4"].timeout_seconds == 60
+    assert MODEL_REGISTRY["H4"].timeout_seconds == 180
     assert MODEL_REGISTRY["H4"].max_tokens is None
 
 
@@ -1441,11 +1445,15 @@ def test_phase_defaults_phase2_per_model_cap_is_adjusted_only():
     system prompt長が5,901→7,079字に増加し、CORE_18予約合計が$0.24124109→$0.23を超過。
     人間承認によりmax_cost $0.23→$0.25、max_cost_per_model $0.03→$0.035へ調整
     （headroom $0.00932601・3.87%を確保。H1 $0.031845もmax_cost_per_model以内に収まる）。
+    Cycle 6.1（2026-08-27）: H4のhidden_thinking_reserve_tokensを1536→9728、M4を1024→2560へ
+    引き上げた結果、CORE_18予約合計が$0.24067398→$0.37276999に増加し旧上限$0.25を超過。
+    人間承認によりmax_cost $0.25→$0.40へ調整（headroom $0.02723001・6.8%を確保）。
+    max_cost_per_modelはCycle 5の$0.035のまま据え置き。
     予約計算ロジック・他Phase・モデル単価は無変更。
     """
     assert mm.PHASE_DEFAULTS == {
         1: {"max_cost": 0.08, "max_cost_per_model": 0.02, "max_calls": 40, "max_tokens": 64, "retries": 1},
-        2: {"max_cost": 0.25, "max_cost_per_model": 0.035, "max_calls": 24, "max_tokens": 400, "retries": 0},
+        2: {"max_cost": 0.40, "max_cost_per_model": 0.035, "max_calls": 24, "max_tokens": 400, "retries": 0},
         3: {"max_cost": 0.20, "max_cost_per_model": 0.03, "max_calls": 96, "max_tokens": 500, "retries": 0},
     }
     assert mm.DEFAULT_MAX_COST_TOTAL == 1.00
@@ -1495,6 +1503,9 @@ def test_phase2_core18_reservations_cover_model_overrides_and_flag_h4_cap_gap():
     # 三度目の期待値更新。
     # Cycle 5（2026-08-26）: D1便益/コスト節の追加でsystem prompt長が5,901→7,079字に
     # 変化したため、四度目の期待値更新。
+    # Cycle 6.1（2026-08-27）: H4/M4のhidden_thinking_reserve_tokens引き上げ
+    # （H4 1536→9728, M4 1024→2560）でCORE_18予約合計が$0.24067398→$0.37276999に増加。
+    # max_cost引き上げ($0.25→$0.40)により sum(...) <= max_cost は引き続き真。H1は無関係のため不変。
     assert reservations["H1"] == pytest.approx(0.031845, abs=1e-12)
     for key in ("H1", "H2", "H4"):
         assert reservations[key] > 0.02
@@ -1503,9 +1514,11 @@ def test_phase2_core18_reservations_cover_model_overrides_and_flag_h4_cap_gap():
 
 
 def test_xai_reserves_cover_phase2_observed_reasoning_without_claiming_a_hard_cap():
-    """xAI実績(L4=526/M4=811/H4=1355)を超える予約マージンを持つ。"""
+    """xAI実績(L4=526、M4=Cycle6.1実測2035、H4=Cycle6実測6756/Cycle6.1実測7746)を
+    超える予約マージンを持つ。M4/H4はCycle 6.1で実測を反映して引き上げた
+    （M4: 1024→2560, H4: 1536→9728）。L4はthinking無効化のため不変。"""
     assert {key: MODEL_REGISTRY[key].hidden_thinking_reserve_tokens for key in ("L4", "M4", "H4")} == {
-        "L4": 768, "M4": 1024, "H4": 1536,
+        "L4": 768, "M4": 2560, "H4": 9728,
     }
 
 

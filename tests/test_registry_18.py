@@ -228,8 +228,8 @@ def test_model_specific_temperature_and_phase2_overrides():
     for key, info in REG.items():
         if info.adapter_type not in ("openai_compat", "gemini"):
             continue
-        if key in ("H2", "M3_G37_EVAL"):
-            if key == "H2":
+        if key in ("H2", "M3_G37_EVAL", "TERRA"):
+            if key in ("H2", "TERRA"):
                 assert info.max_tokens_param == "max_completion_tokens"
             else:
                 assert info.max_tokens_param == "max_tokens"
@@ -259,6 +259,46 @@ def test_log_parser_lookup_matches_get_model():
         _model_by_id.setdefault(mi.model_id, mi)
     assert _model_by_id["kimi-k2.6"] is get_model("kimi-k2.6")
     assert _model_by_id["deepseek-v4-flash"] is get_model("deepseek-v4-flash")
+
+
+def test_h4_timeout_raised_for_always_on_thinking():
+    """Cycle 6監査(2026-08-27): 5.5実測でgrok-4.6が60秒(既定)に2回連続到達したため、
+    Phase 3 runtime override実績のあった180秒をレジストリ既定へ反映した回帰テスト。"""
+    assert MODEL_REGISTRY["H4"].timeout_seconds == 180
+
+
+def test_terra_uses_h2_style_reasoning_params():
+    """Cycle 6監査(2026-08-27): 5.5実測でTERRA(gpt-5.6-terra)がmax_tokensで400を返したため、
+    H2(gpt-5.6-sol)と同型のreasoning系パラメータへ修正した回帰テスト。"""
+    terra = MODEL_REGISTRY["TERRA"]
+    assert terra.max_tokens_param == "max_completion_tokens"
+    assert terra.supports_temperature is False
+
+
+def test_k25_eval_registered_for_moonshot_l_slot_probe():
+    """Cycle 6監査(2026-08-27): kimi-k2.5実在確認スモーク用の評価専用枠（tier=""）。"""
+    k25 = MODEL_REGISTRY["K25_EVAL"]
+    assert k25.model_id == "kimi-k2.5"
+    assert k25.tier == ""
+    assert k25.provider == "Moonshot"
+
+
+def test_m4_timeout_raised_for_always_on_thinking():
+    """Cycle 6.1(2026-08-27): Cycle 6スモークでgrok-4.5が60秒(既定)でタイムアウトしたため、
+    同じxAI・常時思考のH4と同型の180秒へ引き上げた回帰テスト。"""
+    assert MODEL_REGISTRY["M4"].timeout_seconds == 180
+
+
+def test_h4_hidden_reserve_covers_measured_reasoning():
+    """Cycle 6.1(2026-08-27): grok-4.6のCycle 6(6756)・Cycle 6.1(7746)両実測の
+    reasoning_tokensを下回らない予約値であることを固定する回帰テスト。"""
+    assert MODEL_REGISTRY["H4"].hidden_thinking_reserve_tokens >= 7746
+
+
+def test_m4_hidden_reserve_covers_measured_reasoning():
+    """Cycle 6.1(2026-08-27): grok-4.5のCycle 6.1実測reasoning_tokens=2035を
+    下回らない予約値であることを固定する回帰テスト。"""
+    assert MODEL_REGISTRY["M4"].hidden_thinking_reserve_tokens >= 2035
 
 
 def test_tier_label_handles_h():
