@@ -136,9 +136,10 @@ def parse_response(
                 '例: {"strategy": {...}, "action": {"type": "pass"}}'
             )
 
-    # emotionのバリデーション+正規化（リトライ対象にしない）
+    # emotion / reason_category のバリデーション+正規化（リトライ対象にしない）
     if isinstance(strategy, dict):
         strategy = normalize_emotion(strategy)
+        strategy = normalize_reason_category(strategy)
 
     # CoT: reasoning を strategy に埋め込む（戻り値型を維持するため）
     if reasoning and isinstance(reasoning, str):
@@ -444,6 +445,32 @@ def normalize_emotion(strategy: dict[str, Any]) -> dict[str, Any]:
     if emotion not in VALID_EMOTIONS:
         strategy = dict(strategy)  # コピーして変更
         strategy["emotion"] = "平静"
+    return strategy
+
+
+# Cycle 8: pass理由等の構造化カテゴリ（事実の列挙のみ。優劣を示唆しない対称な8種）
+VALID_REASON_CATEGORIES = {
+    "情報収集・様子見",
+    "戦略的沈黙",
+    "返答待ち",
+    "資金・カード制約",
+    "行動枠温存",
+    "関係構築・合意形成",
+    "情報発信・牽制",
+    "その他",
+}
+
+
+def normalize_reason_category(strategy: dict[str, Any]) -> dict[str, Any]:
+    """strategyのreason_categoryを正規化する。
+
+    normalize_emotion と異なり、列挙外・欠落は None にする（ParseError にせず、
+    リトライを誘発しない＝任意項目として扱う）。
+    """
+    category = strategy.get("reason_category")
+    if category not in VALID_REASON_CATEGORIES:
+        strategy = dict(strategy)  # コピーして変更
+        strategy["reason_category"] = None
     return strategy
 
 

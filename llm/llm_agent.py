@@ -106,11 +106,16 @@ class LLMAgent(PlayerAgent):
         self.post_game_reflection: dict[str, Any] | None = None
 
     def _update_last_log_emotion(self, strategy: dict[str, Any]) -> None:
-        """strategyからemotion・reasoningを抽出し、llm_loggerの最新エントリに後付けする"""
+        """strategyからemotion・reasoning・reason_categoryを抽出し、
+        llm_loggerの最新エントリに後付けする"""
         emotion = strategy.get("emotion", "平静") if isinstance(strategy, dict) else "平静"
         reasoning = strategy.get("_reasoning") if isinstance(strategy, dict) else None
+        # Cycle 8: strategyの構造化カテゴリ（normalize_reason_categoryで
+        # 列挙外・欠落は既にNoneへ正規化済み）をログへ後付けする
+        reason_category = strategy.get("reason_category") if isinstance(strategy, dict) else None
         if self.llm_logger._entries:
             self.llm_logger._entries[-1]["emotion"] = emotion
+            self.llm_logger._entries[-1]["reason_category"] = reason_category
             if reasoning is not None:
                 self.llm_logger._entries[-1]["reasoning"] = reasoning
 
@@ -307,7 +312,7 @@ class LLMAgent(PlayerAgent):
         修正4: 新規メッセージがなくturn>=2なら自動pass
         """
         if self._cost_exceeded or self._config is None:
-            return PassAction(player_id=self.player_id)
+            return PassAction(player_id=self.player_id, source="cost_exceeded")
 
         # ラウンドが変わったら交渉メッセージをリセット
         if round_num != self._current_round:
@@ -334,7 +339,7 @@ class LLMAgent(PlayerAgent):
         if AUTO_PASS_ON_NO_NEWS and turn >= 2 and not has_new_failure and not has_new_notice:
             current_msg_count = len(visible_state.get("messages", []))
             if current_msg_count <= self._last_message_count:
-                return PassAction(player_id=self.player_id)
+                return PassAction(player_id=self.player_id, source="auto_no_news")
 
         # メッセージ数を更新
         self._last_message_count = len(visible_state.get("messages", []))
@@ -358,10 +363,10 @@ class LLMAgent(PlayerAgent):
                     retry_count=retry,
                 )
             except BudgetBlockedError:
-                return PassAction(player_id=self.player_id)
+                return PassAction(player_id=self.player_id, source="budget_blocked")
 
             if not text:
-                return PassAction(player_id=self.player_id)
+                return PassAction(player_id=self.player_id, source="parse_failed")
 
             try:
                 strategy, action = parse_response(text, self.player_id, "negotiation")
@@ -383,7 +388,7 @@ class LLMAgent(PlayerAgent):
                     messages_so_far = user_prompt + "\n\n" + correction
                     continue
 
-        return PassAction(player_id=self.player_id)
+        return PassAction(player_id=self.player_id, source="parse_failed")
 
     def commit(
         self,

@@ -539,3 +539,51 @@ Moonshot: "invalid temperature: only 1 is allowed for this model"）。Cycle 6.1
   `tests/test_registry_18.py`（`test_h4_hidden_reserve_covers_measured_reasoning`・
   `test_m4_hidden_reserve_covers_measured_reasoning`）、`tests/test_model_matrix.py`
   （`test_xai_reserves_cover_phase2_observed_reasoning_without_claiming_a_hard_cap`）。
+
+## 倍掛け単独市場除外は判定ゲートとログ記録を分離する（`outcome_reason`/`forfeited_by_solo_only`）
+
+`engine/game.py`の倍掛け（double-up）判定ゲート（`non_solo_winners[pid] > 0`で単独市場のみの
+勝利を除外する）自体は当初から正しく機能していたが、旧`from_solo_market`フィールドは
+**成功分岐の内側にのみ**記録される設計だったため、その分岐に入る時点で既に「非単独市場での
+勝利が確定」しており、同フィールドがTrueになることは代数的に起こり得ない到達不能コードだった
+（forfeit分岐にはフィールド自体が存在しなかった）。
+
+Cycle 8で`forfeited_by_solo_only`（forfeit分岐で設定、到達可能）へ改称し、成功・forfeit・
+未勝利の3分岐すべてに`outcome_reason`（`non_solo_win`/`solo_only_win`/`no_win`/`eliminated`）と
+勝敗内訳（solo_wins/non_solo_wins）を返す純関数`_summarize_market_wins()`を新設した。
+**判定ゲート自体（賞金・没収の実額）は一切変更していない。** ログ・観測経路を新設・変更する際は、
+「判定ロジックが正しく機能している」ことと「その判定結果がログから観測可能である」ことを
+別々に検証すること（本件は前者は最初から正しく、後者だけが欠陥だった）。担保テスト:
+`tests/test_cycle8_double_up_logging.py`。実データ検証: `trial_C_l12_r12_20260828`の
+P03 R9・P11 R12が`solo_only_win`として識別可能になったことを確認済み（`doc/devlog/2026-08-28_213206.md`）。
+
+## API非呼び出しpassは`PassAction.source`でトレーサビリティを持たせる
+
+`llm/llm_agent.py`の`negotiate()`にはAPIを呼ばずに`PassAction`を返す経路が複数ある
+（`cost_exceeded`/`auto_no_news`（`AUTO_PASS_ON_NO_NEWS`）/`budget_blocked`/`parse_failed`等）。
+これらはLLMコールログ（`llm_calls.jsonl`）に対応するレコードを残さないため、pass件数と
+LLMコール件数の突合だけでは原因が判別できない（`trial_C_l12_r12_20260828`のpass 439件中11件が
+該当し、分析2/2の時点では「判別不能」としていた）。
+
+Cycle 8で`PassAction.source`（既定`"llm"`、後方互換）を追加し、`engine/game.py`の
+`NEGOTIATION_ACTION`ログへ`getattr(action, "source", "llm")`を含めるようにした。新しい
+API非呼び出し経路を追加する場合は、必ず対応する`source`値を設定すること。
+`llm_calls.jsonl`（総コール数・有効JSON率の集計元）へ合成レコードを追加する対処は
+`scripts/llm_trial.py`のレポート集計を歪めるため採用しない。担保テスト:
+`tests/test_cycle8_pass_source.py`。
+
+## `strategy.reason_category`は自由記述`reason`を置き換えず併記する
+
+pass等の`strategy.reason`が自由記述のみだと、分析のたびにキーワードマッチに頼らざるを
+得ずコストが増大する（分析2/2実測: pass理由の71.8%がキーワード分類不能）。Cycle 8で
+`llm/response_parser.py`に`normalize_reason_category()`を追加し、既存`normalize_emotion()`と
+同型（列挙外・欠落は`None`、`ParseError`にしない＝リトライを誘発しない）で
+`strategy.reason_category`を導入した。選択肢は対称8種（情報収集・様子見／戦略的沈黙／
+交渉継続待ち／資金・カード制約による断念／その他 等）で、Cycle 5の対称性原則
+（特定の選択肢が有利/不利に見える書き方をしない）に従う。
+
+配置場所は`system_prompt`ではなく交渉プロンプト（`llm/prompt_builder.py`の`build_negotiation_prompt`）
+側。理由は`system_prompt`が7079/7100字で残余21字しかなく（`tests/test_cycle5_prompt_salience.py`が
+機械保証する上限）、reason_categoryの列挙提示（+112字）を追加する余地がないため。新しい
+strategy系フィールドをsystem_prompt側に追加したくなった場合は、まず既存の文字数上限テストで
+残余を確認すること。担保テスト: `tests/test_cycle8_reason_category.py`。

@@ -117,6 +117,10 @@ DMの本文は送信者・宛先の当事者にしか見えない。非当事者
 既存ロジック（`status != ACTIVE`で弾く）にそのまま乗るため対象外になる。詳細は
 `rules/project.md`「§ACTIVEからの唯一の実遷移」を参照。
 
+契約提案者本人による契約は署名フェーズで自動署名済み（`AUTO_COMMIT`扱い）になるため、
+交渉プロンプトの契約セクションには「あなたの署名: 済/未」と自動署名の事実を明記し、
+既に署名済みの契約への再署名試行（`ACTION_ERROR`の原因になっていた）を防ぐ（Cycle 7）。
+
 ## LLMトライアル実行（本番API）
 
 `scripts/llm_trial.py` を直接フォアグラウンド実行すると、Claude/DevRelayセッションのタイムアウトで長時間試合が巻き込まれてkillされることがある。12ラウンドフル試合など時間のかかるトライアルは、必ずデタッチ起動ラッパーを使うこと。
@@ -223,6 +227,13 @@ thinking・xAI等のキャッシュ割引・Anthropicのusage慣習差を正し�
 ```
 
 主要イベント種別: `GAME_START`, `LOAN_CHOSEN`, `MARKET_OPEN`, `NEGOTIATION_ACTION`, `COMMIT`, `AUTO_COMMIT`, `BANKRUPTCY`, `REVEAL`, `MARKET_RESULT`, `TYPE_B_VIOLATION`, `SNAPSHOT`, `TYPE_A_EXECUTION`, `TYPE_A_FAILURE`, `BOUNTY_TRIGGERED`, `ELIMINATION`, `FORCED_LIQUIDATION`, `INTEREST`, `REPAYMENT`, `AUTO_REPAYMENT`, `SURVIVAL_CHECK`, `FINAL_REFLECTION`, `GAME_END`
+
+`NEGOTIATION_ACTION`のpassには`source`（`"llm"`/`"auto_no_news"`/`"cost_exceeded"`/
+`"budget_blocked"`/`"parse_failed"`）が付き、API呼び出しを伴わない自動passの原因を
+ログ単独で追跡できる（Cycle 8）。`DOUBLE_UP_RESOLVED`には`outcome_reason`
+（`non_solo_win`/`solo_only_win`/`no_win`/`eliminated`）と`forfeited_by_solo_only`が付き、
+単独参加市場でしか勝てなかったことによる倍掛け没収を判別できる（Cycle 8、詳細は
+`rules/project.md`参照）。
 
 ## 観戦ビューア / LP
 

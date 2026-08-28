@@ -255,7 +255,7 @@ class TestDoubleUp:
         )
         assert dep.resolved is False
         assert dep.success is False
-        assert dep.from_solo_market is False
+        assert dep.forfeited_by_solo_only is False
 
     def test_s2_game_has_double_up_deposits(self):
         """S2ルールのゲームで倍掛け預託が発生する"""
@@ -357,7 +357,7 @@ class TestDoubleUpSoloExclusion:
 
         assert dep.resolved is True
         assert dep.success is True, "複数人市場で獲得があれば成功すべき"
-        assert dep.from_solo_market is False
+        assert dep.forfeited_by_solo_only is False
 
     def test_all_solo_markets_fails(self):
         """全市場がソロ市場 → 倍掛け失敗"""

@@ -75,7 +75,8 @@ def test_required_beneficiary_sentinel_preserves_non_bounty_semantics():
         "P01", "negotiation",
     )
 
-    assert strategy == {"emotion": "楽"}
+    # Cycle 8: normalize_reason_category が strategy に reason_category=None を付与する
+    assert strategy == {"emotion": "楽", "reason_category": None}
     assert action.__class__.__name__ == "PassAction"
 
 
@@ -320,7 +321,8 @@ def test_h1_transport_round_trips_each_action_through_the_existing_parser(
     canonical = normalize_h1_phase2_transport(_transport(action_type, **values))
     assert set(canonical["action"]) == expected_keys
     strategy, action = parse_response(json.dumps(canonical, ensure_ascii=False), "P01", "negotiation")
-    assert strategy == {"emotion": "楽"}
+    # Cycle 8: normalize_reason_category が strategy に reason_category=None を付与する
+    assert strategy == {"emotion": "楽", "reason_category": None}
     assert action.__class__.__name__ == action_class
 
 

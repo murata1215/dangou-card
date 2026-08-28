@@ -1581,3 +1581,49 @@ C6（L6: `comment`内未エスケープ改行によるstrict JSON失敗）が`ok
   GO基準をすべて満たし、**判定はGO**。二重送信防止・`git status --short logs/llm/`空も再確認。
 - 詳細は `doc/devlog/2026-08-22_153938.md` および
   `doc/trials/final_reflection_smoke2_2026-08-22.md` を参照。
+
+## 2026-08-28: Cycle 7〜8 契約署名UX修正 + trial_C_l12_r12_20260828 全面分析 + 計測ログ欠落修正
+
+`trial_C_l12_r12_20260828`（clean L12×R12実戦）を対象に、実装1件・読み取り専用分析2件・
+観測可能性修正3件をまとめて実施した（本コミットで一括反映、各サイクルの実施時点ではcommit未実施）。
+
+- **Cycle 7（契約二重署名UX修正）**: `ACTION_ERROR` 12件が全件「契約提案者本人による
+  自動署名済み契約への再署名試行」であり、自動署名の事実がプロンプト非表示だったことが
+  原因と特定。`llm/prompt_builder.py` の契約セクションへ「あなたの署名: 済/未」表示と
+  自動署名の事実文を追加し、選べるアクション判定を未署名pending有無ベースに修正。
+  `engine/contracts.py` 側の判定ロジックは無変更（対称性原則を維持、便益文言は既存のまま）。
+  system_prompt残余21字のため配置は交渉プロンプト側（+115〜120字）。新規テスト9件、
+  `pytest` 1410 passed。詳細: `doc/devlog/2026-08-28_054051.md`。
+- **分析1/2・2/2（読み取り専用）**: `trial_C_l12_r12_20260828` の全事実抽出
+  （`doc/analysis/l12_r12_20260828_facts.md`）に続き、原因帰属・総合評定
+  （`doc/analysis/l12_r12_20260828_review.md`）を実施。Free Cash公式・市場高騰判定・
+  強制返済式・利息式・倍掛け払戻・現金収支帳簿を全件独立検算し、いずれも100%一致
+  （135/135・36/36・133/133・135/135・6/6・133/133）。`anonymous_broadcast`/`bounty_post`/
+  `contract_cancel` が0件だったのはプロンプト非提示ではなく、Free Cashの構造的枯渇
+  （135席ラウンド中45.2%が0円）と`card_trade`拒否後の再提案断念が主因と特定。倍掛けの
+  `from_solo_market`フラグが成功分岐内限定のため代数的に到達不能（常にFalse）なデッドコードで
+  あることを`engine/game.py:1120-1230`の精読により確認（判定ロジック自体は正しい、計測欠陥のみ）。
+  生還率41.7%はv0.5目標帯20〜50%内。コード変更0行。詳細: `doc/devlog/2026-08-28_203204.md`。
+- **Cycle 8（計測・ログの欠落修正3件、判定/賞金ロジックは無変更）**:
+  1. 倍掛け`from_solo_market`（到達不能）を`forfeited_by_solo_only`（forfeit分岐で設定・
+     到達可能）へ改称し、`DOUBLE_UP_RESOLVED`の3分岐すべてに`outcome_reason`
+     （`non_solo_win`/`solo_only_win`/`no_win`/`eliminated`）と勝敗内訳を付与する
+     純関数`_summarize_market_wins()`を新設（`engine/game.py`/`engine/models.py`）。
+     実データ再検証でP03 R9・P11 R12が`solo_only_win`として識別可能になったことを確認。
+     追随修正: `scripts/simulate.py`、`scripts/simulate_s2_comparison.py`
+     （`_analyze_double_up()`を正しい集計へ全面差し替え）、`tests/test_s2_rules.py`。
+  2. `PassAction.source`（既定`"llm"`、後方互換）を追加し、`llm/llm_agent.py`の5箇所の
+     API非呼び出しpass経路（`cost_exceeded`/`auto_no_news`/`budget_blocked`/`parse_failed`×2）
+     にsourceを設定。実ログのタイムライン再構成により、従来「対応するLLMコールなし」で
+     原因不明だった11件が全て`AUTO_PASS_ON_NO_NEWS`であることを確定。
+  3. `strategy`へ対称8種の`reason_category`列挙（情報収集・様子見／戦略的沈黙／交渉継続待ち／
+     資金・カード制約／その他 等）をCycle 5対称性原則（評価語彙ゼロ）に従い追加。system_prompt
+     は残余21字のため、交渉プロンプト側（`llm/prompt_builder.py`）に配置（+112字、全予算内）。
+     `llm/response_parser.py`に`normalize_reason_category()`を追加し、既存`normalize_emotion()`
+     と同型で列挙外・欠落は`None`（リトライ誘発なし）。`llm/llm_logger.py`へ初期キー追加。
+  新規テスト25件（`tests/test_cycle8_double_up_logging.py`・`tests/test_cycle8_pass_source.py`・
+  `tests/test_cycle8_reason_category.py`）、既存2ファイル追随修正
+  （`tests/test_s2_rules.py`・`tests/test_phase2_schema.py`）。`uv run pytest -q`は
+  **1435 passed**（旧1410+新規25、回帰0件）、`uv run python scripts/dry_run.py`は
+  **578イベント**（不変）。`git diff engine/game.py`は賞金計算・判定ゲート行を含まないことを
+  確認済み。詳細: `doc/devlog/2026-08-28_213206.md`。

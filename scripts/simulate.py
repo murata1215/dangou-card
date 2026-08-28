@@ -129,14 +129,14 @@ def run_single_game(args: tuple) -> dict[str, Any]:
     for dep in result.double_up_deposits:
         pid_du = dep.player_id
         if pid_du not in player_du_stats:
-            player_du_stats[pid_du] = {"count": 0, "success": 0, "forfeited": 0, "solo_success": 0}
+            player_du_stats[pid_du] = {"count": 0, "success": 0, "forfeited": 0, "solo_forfeit": 0}
         player_du_stats[pid_du]["count"] += 1
         if dep.resolved and dep.success:
             player_du_stats[pid_du]["success"] += 1
-            if dep.from_solo_market:
-                player_du_stats[pid_du]["solo_success"] += 1
         elif dep.resolved and not dep.success:
             player_du_stats[pid_du]["forfeited"] += dep.deposit_amount
+            if dep.forfeited_by_solo_only:
+                player_du_stats[pid_du]["solo_forfeit"] += 1
 
     # 生還者順位
     survivor_ranks = {p.player_id: i + 1 for i, p in enumerate(result.survivors)}
@@ -160,7 +160,7 @@ def run_single_game(args: tuple) -> dict[str, Any]:
             "double_up_count": du.get("count", 0),
             "double_up_success": du.get("success", 0),
             "double_up_forfeited": du.get("forfeited", 0),
-            "double_up_solo_success": du.get("solo_success", 0),
+            "double_up_solo_forfeit": du.get("solo_forfeit", 0),
         })
 
     return {
@@ -445,7 +445,7 @@ def main() -> None:
         "final_cash", "final_debt", "survived", "elimination_reason",
         "elimination_round", "final_rank",
         "double_up_count", "double_up_success", "double_up_forfeited",
-        "double_up_solo_success",
+        "double_up_solo_forfeit",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)

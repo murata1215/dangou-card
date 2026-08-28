@@ -145,8 +145,11 @@ class DoubleUpDeposit(BaseModel):
     success: bool = False
     """成功フラグ"""
 
-    from_solo_market: bool = False
-    """成功時に空き巣（参加者1人）市場で成功したか（指標B用）"""
+    forfeited_by_solo_only: bool = False
+    """没収時、勝利自体はあったが全て空き巣（参加者1人）市場だったため
+    成功判定から除外され没収に至ったか（指標B用。Cycle 8で from_solo_market から改名:
+    旧フィールドは成功分岐の内側にしか記録されず代数的に到達不能だったため、
+    到達可能な forfeit 側の意味に変更した）"""
 
 
 # =============================================================================
@@ -592,6 +595,25 @@ class PassAction(BaseModel):
     """
     type: Literal["pass"] = "pass"
     player_id: str
+
+    source: Literal[
+        "llm", "auto_no_news", "cost_exceeded", "budget_blocked", "parse_failed", "bot",
+    ] = "llm"
+    """
+    Cycle 8: このpassがどの経路で生成されたか（観測可能性の回復のみが目的の
+    フィールドであり、判定・賞金計算には一切使用しない）。
+
+    - "llm": LLMが実際にAPI呼び出しの結果としてpassを選んだ
+    - "auto_no_news": AUTO_PASS_ON_NO_NEWS（新規メッセージ/失敗/通知が
+      無いためAPIを呼ばず自動でpassにした。llm/constants.py参照）
+    - "cost_exceeded": コスト上限超過によりAPIを呼ばずpassにした
+    - "budget_blocked": 予算ブロックによりpassにした
+    - "parse_failed": API応答の解析に失敗しpassにフォールバックした
+    - "bot": ルールベースBotのpass（LLM非経由）
+
+    デフォルトは "llm" のため、既存の `PassAction(player_id=...)` 呼び出しは
+    すべて後方互換（挙動不変）。
+    """
 
 
 class CardTradeProposeAction(BaseModel):

@@ -738,7 +738,10 @@ def _available_negotiation_actions(
     else:
         unavailable.append("contract_propose（発行料の現金不足）")
 
-    if visible_state.get("contracts_pending"):
+    if any(
+        player_state.player_id not in (c.get("signed_by") or [])
+        for c in (visible_state.get("contracts_pending") or [])
+    ):
         _add("contract_sign")
     else:
         unavailable.append("contract_sign（署名できる契約がない）")
@@ -1101,7 +1104,12 @@ def build_negotiation_prompt(
     if pending:
         lines.append("\n## 提案中の正式契約（署名待ち）")
         lines.append(
-            '署名するには {"type": "contract_sign", "contract_id": "契約ID"} を送信してください。'
+            "契約は提案者が自動で署名済みです。すでにあなたが署名済みの契約に再度 contract_sign "
+            "を送っても成立せず、その巡の発言を1回失います。"
+        )
+        lines.append(
+            'あなたが未署名の契約に署名するには '
+            '{"type": "contract_sign", "contract_id": "契約ID"} を送信してください。'
         )
         my_obligations = visible_state.get("my_obligations", [])
         for c in pending:
@@ -1109,8 +1117,14 @@ def build_negotiation_prompt(
             cid = c["contract_id"]
             rc = c["round_created"]
             unsigned = [p for p in c["parties"] if p not in c["signed_by"]]
+            i_signed = player_state.player_id in c["signed_by"]
             lines.append(f"\n### 契約 {cid}（R{rc}提案、提案者: {proposer}）")
             lines.append(f"  当事者: {', '.join(c['parties'])}")
+            lines.append(
+                "  あなたの署名: 済（提案者は自動署名。この契約にこれ以上署名は不要）"
+                if i_signed else
+                "  あなたの署名: 未（あなたが署名すれば契約は成立する）"
+            )
             lines.append(f"  未署名: {', '.join(unsigned)}")
             lines.append("  義務:")
             for ob in c["obligations"]:
@@ -1134,7 +1148,11 @@ def build_negotiation_prompt(
             ]
             if my_new_obs:
                 affected_rounds = sorted({ob["round_num"] for ob in my_new_obs})
-                lines.append("  → 署名した場合、あなたの義務（既存分と合流後）は次のようになります:")
+                lines.append(
+                    "  → この契約が成立した場合、あなたの義務（既存分と合流後）は次のようになります:"
+                    if i_signed else
+                    "  → 署名した場合、あなたの義務（既存分と合流後）は次のようになります:"
+                )
                 for rn in affected_rounds:
                     merged = (
                         [ob for ob in my_obligations if ob["round_num"] == rn]
@@ -1216,6 +1234,11 @@ def build_negotiation_prompt(
     lines.append("  " + " / ".join(available))
     if unavailable:
         lines.append("  いま選べないもの: " + " / ".join(unavailable))
+    lines.append(
+        "\nstrategyには任意で reason_category を1つ含められます: "
+        "情報収集・様子見 / 戦略的沈黙 / 返答待ち / 資金・カード制約 / "
+        "行動枠温存 / 関係構築・合意形成 / 情報発信・牽制 / その他"
+    )
     lines.append(
         f"\n上の一覧から1つ選び、JSON形式で回答してください。"
         f"（market_commitはコミットフェイズで行います。ここでは選べません）\n"

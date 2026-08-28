@@ -88,6 +88,42 @@ def _obligation_status(ob: Obligation, round_num: int) -> str:
     return "upcoming"        # 未到来
 
 
+def _summarize_market_wins(market_results: list, player_id: str) -> dict:
+    """1プレイヤーが当ラウンドで獲得した市場賞金を、空き巣（参加者1人）市場か
+    否かで分類する（Cycle 8: ログ記録専用のヘルパー）。
+
+    判定ロジック（空き巣市場の定義=len(participants)==1、勝者集計）は
+    _process_double_up 内の既存計算（solo_markets / non_solo_winners の算出）と
+    完全に同一の条件式を用いる。**このヘルパーの戻り値は倍掛け成功判定
+    （§6.2ゲート、non_solo_winners[pid] > 0）には一切使用しない**。ログ出力
+    専用であり、賞金額・成功可否の計算経路には影響しない。
+
+    Returns:
+        {"won_any": bool, "solo_wins": int, "non_solo_wins": int,
+         "solo_prize": int, "non_solo_prize": int}
+    """
+    solo_wins = 0
+    non_solo_wins = 0
+    solo_prize = 0
+    non_solo_prize = 0
+    for mr in market_results:
+        if player_id not in mr.winners:
+            continue
+        if len(mr.participants) == 1:
+            solo_wins += 1
+            solo_prize += mr.prize_per_winner
+        else:
+            non_solo_wins += 1
+            non_solo_prize += mr.prize_per_winner
+    return {
+        "won_any": (solo_wins + non_solo_wins) > 0,
+        "solo_wins": solo_wins,
+        "non_solo_wins": non_solo_wins,
+        "solo_prize": solo_prize,
+        "non_solo_prize": non_solo_prize,
+    }
+
+
 class Game:
     """
     談合カードのメインゲームクラス
@@ -402,6 +438,7 @@ class Game:
                     # passは常に成功、枠を消費しない
                     self.logger.log("NEGOTIATION_ACTION", round_num, "negotiation", data={
                         "player_id": pid, "action": "pass", "turn": turn,
+                        "source": getattr(action, "source", "llm"),
                     })
                     continue
 
@@ -1034,9 +1071,9 @@ class Game:
         # S2: 倍掛け処理
         du_success = 0
         du_fail = 0
-        du_solo_success = 0
+        du_solo_forfeit = 0
         if self.config.double_up_enabled:
-            du_success, du_fail, du_solo_success = self._process_double_up(
+            du_success, du_fail, du_solo_forfeit = self._process_double_up(
                 round_num, market_results,
             )
 
@@ -1051,7 +1088,7 @@ class Game:
             "surge_count": surge_count,
             "double_up_success": du_success,
             "double_up_fail": du_fail,
-            "double_up_solo_success": du_solo_success,
+            "double_up_solo_forfeit": du_solo_forfeit,
             "active_deposits": len([d for d in self.double_up_deposits if not d.resolved]),
         })
 
@@ -1104,11 +1141,11 @@ class Game:
         2. 今ラウンドの勝者に倍掛け選択を提示（R12以外）
 
         Returns:
-            (成功数, 失敗数, 空き巣成功数)
+            (成功数, 失敗数, 空き巣のみ勝利による没収数)
         """
         du_success = 0
         du_fail = 0
-        du_solo_success = 0
+        du_solo_forfeit = 0
 
         # 今ラウンドの市場勝者を特定（player_id → 獲得額マップ）
         round_winners: dict[str, int] = {}
@@ -1116,8 +1153,6 @@ class Game:
         non_solo_winners: dict[str, int] = {}
         # 空き巣市場かどうかのマップ（market_id → participants==1）
         solo_markets: set[str] = set()
-        # 勝者がどの市場で勝ったか
-        winner_markets: dict[str, list[str]] = {}
 
         # パス1: ソロ市場の特定
         for mr in market_results:
@@ -1130,9 +1165,6 @@ class Game:
                 round_winners[winner_id] = round_winners.get(winner_id, 0) + mr.prize_per_winner
                 if mr.market_id not in solo_markets:
                     non_solo_winners[winner_id] = non_solo_winners.get(winner_id, 0) + mr.prize_per_winner
-                if winner_id not in winner_markets:
-                    winner_markets[winner_id] = []
-                winner_markets[winner_id].append(mr.market_id)
 
         # Step 1: 前ラウンドの預託を解決
         for dep in self.double_up_deposits:
@@ -1140,39 +1172,54 @@ class Game:
                 continue
             dep.resolved = True
             p = self.players[dep.player_id]
+            # Cycle 8: ログ記録専用の勝敗内訳（判定ロジックには使用しない。
+            # 判定は直後の non_solo_winners[...] > 0 ゲートのみで行う＝無変更）
+            win_summary = _summarize_market_wins(market_results, dep.player_id)
+
             if not p.is_alive:
                 # 脱落済みなら没収
                 self.logger.log("DOUBLE_UP_RESOLVED", round_num, "settlement", data={
                     "player_id": dep.player_id, "result": "forfeit_eliminated",
                     "deposit": dep.deposit_amount,
+                    "outcome_reason": "eliminated",
+                    "solo_wins": win_summary["solo_wins"],
+                    "non_solo_wins": win_summary["non_solo_wins"],
                 })
                 du_fail += 1
                 continue
 
             if dep.player_id in non_solo_winners and non_solo_winners[dep.player_id] > 0:
-                # 成功: 2倍払い出し
+                # 成功: 2倍払い出し（判定条件は無変更）
                 payout = dep.deposit_amount * 2
                 dep.success = True
-                # 空き巣チェック: 成功市場が全て空き巣だったか
-                won_markets = winner_markets.get(dep.player_id, [])
-                all_solo = all(m in solo_markets for m in won_markets)
-                dep.from_solo_market = all_solo
-                if all_solo:
-                    du_solo_success += 1
 
                 p = player_ops.receive(p, payout)
                 self.players[dep.player_id] = p
                 self.logger.log("DOUBLE_UP_RESOLVED", round_num, "settlement", data={
                     "player_id": dep.player_id, "result": "success",
                     "deposit": dep.deposit_amount, "payout": payout,
-                    "from_solo_market": all_solo,
+                    "outcome_reason": "non_solo_win",
+                    "solo_wins": win_summary["solo_wins"],
+                    "non_solo_wins": win_summary["non_solo_wins"],
                 })
                 du_success += 1
             else:
-                # 失敗: 没収
+                # 失敗: 没収。won_any=Trueなのに non_solo_winners が 0 ということは、
+                # 勝利はあったが全て空き巣（参加者1人）市場だったため成功判定から
+                # 除外された（§6.2）ケース＝ solo_only_win。won_any=Falseなら
+                # そもそも当ラウンド無勝利＝ no_win。
+                if win_summary["won_any"]:
+                    outcome_reason = "solo_only_win"
+                    dep.forfeited_by_solo_only = True
+                    du_solo_forfeit += 1
+                else:
+                    outcome_reason = "no_win"
                 self.logger.log("DOUBLE_UP_RESOLVED", round_num, "settlement", data={
                     "player_id": dep.player_id, "result": "forfeit",
                     "deposit": dep.deposit_amount,
+                    "outcome_reason": outcome_reason,
+                    "solo_wins": win_summary["solo_wins"],
+                    "non_solo_wins": win_summary["non_solo_wins"],
                 })
                 du_fail += 1
 
@@ -1225,7 +1272,7 @@ class Game:
                         "success_round": round_num + 1,
                     })
 
-        return du_success, du_fail, du_solo_success
+        return du_success, du_fail, du_solo_forfeit
 
     def _phase_finance(self, round_num: int) -> None:
         """Phase 5: Finance（§5.3）"""

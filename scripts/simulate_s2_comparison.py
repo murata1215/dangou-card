@@ -61,15 +61,15 @@ def run_single_game(args: tuple) -> dict[str, Any]:
         pid_du = dep.player_id
         if pid_du not in player_du_stats:
             player_du_stats[pid_du] = {
-                "count": 0, "success": 0, "forfeited": 0, "solo_success": 0,
+                "count": 0, "success": 0, "forfeited": 0, "solo_forfeit": 0,
             }
         player_du_stats[pid_du]["count"] += 1
         if dep.resolved and dep.success:
             player_du_stats[pid_du]["success"] += 1
-            if dep.from_solo_market:
-                player_du_stats[pid_du]["solo_success"] += 1
         elif dep.resolved and not dep.success:
             player_du_stats[pid_du]["forfeited"] += dep.deposit_amount
+            if dep.forfeited_by_solo_only:
+                player_du_stats[pid_du]["solo_forfeit"] += 1
 
     # 生還者順位
     survivor_ranks = {p.player_id: i + 1 for i, p in enumerate(result.survivors)}
@@ -93,7 +93,7 @@ def run_single_game(args: tuple) -> dict[str, Any]:
             "double_up_count": du.get("count", 0),
             "double_up_success": du.get("success", 0),
             "double_up_forfeited": du.get("forfeited", 0),
-            "double_up_solo_success": du.get("solo_success", 0),
+            "double_up_solo_forfeit": du.get("solo_forfeit", 0),
         })
 
     return {
@@ -110,7 +110,7 @@ def run_single_game(args: tuple) -> dict[str, Any]:
                 "success_round": d.success_round,
                 "resolved": d.resolved,
                 "success": d.success,
-                "from_solo_market": d.from_solo_market,
+                "forfeited_by_solo_only": d.forfeited_by_solo_only,
             }
             for d in result.double_up_deposits
         ],
@@ -238,12 +238,14 @@ def generate_comparison_report(
                  f"({du_stats['success_rate']:.1f}%)")
     lines.append(f"- 倍掛け失敗数: {du_stats['total_fail']} "
                  f"({du_stats['fail_rate']:.1f}%)")
-    lines.append(f"- **空き巣成功数（参加者1人市場で成功）: {du_stats['solo_success']}** "
-                 f"({du_stats['solo_rate']:.1f}% of successes)")
-    lines.append(f"- 空き巣成立した試合数: {du_stats['games_with_solo']}/{num_games}")
+    lines.append(f"- **空き巣のみ勝利による没収数（forfeited_by_solo_only）: "
+                 f"{du_stats['solo_forfeit']}** "
+                 f"({du_stats['solo_rate']:.1f}% of failures)")
+    lines.append(f"- 空き巣のみ勝利による没収が発生した試合数: "
+                 f"{du_stats['games_with_solo']}/{num_games}")
 
     if du_stats['solo_ranks']:
-        lines.append(f"\n### 空き巣成功者の最終順位分布\n")
+        lines.append(f"\n### 空き巣のみ勝利で没収された者の最終順位分布\n")
         lines.append("| 最終順位 | 件数 | 割合 |")
         lines.append("|---------|------|------|")
         for rank in sorted(du_stats['solo_ranks'].keys()):
@@ -420,7 +422,7 @@ def _aggregate_round_snapshots(results: list[dict]) -> dict[int, dict[str, float
         for snap in game.get("round_snapshots", []):
             r = snap["round"]
             for key in ["total_assets", "total_debt", "alive_count", "surge_count",
-                        "double_up_success", "double_up_fail", "double_up_solo_success"]:
+                        "double_up_success", "double_up_fail", "double_up_solo_forfeit"]:
                 agg[r][key].append(snap.get(key, 0))
 
     averaged: dict[int, dict[str, float]] = {}
@@ -463,13 +465,21 @@ def _count_rank_reversals(s1_results: list[dict], s2_results: list[dict]) -> dic
 
 
 def _analyze_double_up(results: list[dict]) -> dict:
-    """倍掛け統計を集計"""
+    """倍掛け統計を集計
+
+    Cycle 8: `from_solo_market` は成功分岐の内側にしか記録されず代数的に
+    到達不能だったため、この集計の `solo_success` は仕様上常に0だった
+    （観測不能だった、であって「空き巣抜け道が存在しない」ことの証明では
+    なかった）。`forfeited_by_solo_only`（没収分岐側で記録、到達可能）へ
+    切り替え、"空き巣のみ勝利による没収数" として集計し直す。判定ロジック
+    （成功/没収の分岐そのもの）はengine側・本関数側とも無変更。
+    """
     total_chosen = 0
     total_success = 0
     total_fail = 0
-    solo_success = 0
+    solo_forfeit = 0
     games_with_solo = 0
-    # 空き巣成功者の最終順位
+    # 空き巣のみ勝利で没収された者の最終順位
     solo_ranks: dict[int, int] = defaultdict(int)
 
     for game in results:
@@ -481,16 +491,16 @@ def _analyze_double_up(results: list[dict]) -> dict:
             if dep["resolved"]:
                 if dep["success"]:
                     total_success += 1
-                    if dep["from_solo_market"]:
-                        solo_success += 1
+                else:
+                    total_fail += 1
+                    if dep.get("forfeited_by_solo_only"):
+                        solo_forfeit += 1
                         game_has_solo = True
                         # この player の最終順位を取得
                         for row in game["rows"]:
                             if row["player_id"] == dep["player_id"]:
                                 solo_ranks[row["final_rank"]] += 1
                                 break
-                else:
-                    total_fail += 1
 
         if game_has_solo:
             games_with_solo += 1
@@ -501,8 +511,8 @@ def _analyze_double_up(results: list[dict]) -> dict:
         "total_fail": total_fail,
         "success_rate": total_success / total_chosen * 100 if total_chosen > 0 else 0,
         "fail_rate": total_fail / total_chosen * 100 if total_chosen > 0 else 0,
-        "solo_success": solo_success,
-        "solo_rate": solo_success / total_success * 100 if total_success > 0 else 0,
+        "solo_forfeit": solo_forfeit,
+        "solo_rate": solo_forfeit / total_fail * 100 if total_fail > 0 else 0,
         "games_with_solo": games_with_solo,
         "solo_ranks": dict(solo_ranks),
     }

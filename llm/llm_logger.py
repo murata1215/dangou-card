@@ -80,6 +80,7 @@ class LLMLogger:
             "error": error,
             "error_type": error_type,
             "emotion": emotion,
+            "reason_category": None,  # Cycle 8: _update_last_log_emotion で後付け
             "reasoning": None,  # CoT: _update_last_log_emotion で後付け
             "finish_reason": finish_reason,
             "reasoning_tokens": usage.get("reasoning_tokens", 0),
