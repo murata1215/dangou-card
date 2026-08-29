@@ -88,42 +88,6 @@ def _obligation_status(ob: Obligation, round_num: int) -> str:
     return "upcoming"        # 未到来
 
 
-def _summarize_market_wins(market_results: list, player_id: str) -> dict:
-    """1プレイヤーが当ラウンドで獲得した市場賞金を、空き巣（参加者1人）市場か
-    否かで分類する（Cycle 8: ログ記録専用のヘルパー）。
-
-    判定ロジック（空き巣市場の定義=len(participants)==1、勝者集計）は
-    _process_double_up 内の既存計算（solo_markets / non_solo_winners の算出）と
-    完全に同一の条件式を用いる。**このヘルパーの戻り値は倍掛け成功判定
-    （§6.2ゲート、non_solo_winners[pid] > 0）には一切使用しない**。ログ出力
-    専用であり、賞金額・成功可否の計算経路には影響しない。
-
-    Returns:
-        {"won_any": bool, "solo_wins": int, "non_solo_wins": int,
-         "solo_prize": int, "non_solo_prize": int}
-    """
-    solo_wins = 0
-    non_solo_wins = 0
-    solo_prize = 0
-    non_solo_prize = 0
-    for mr in market_results:
-        if player_id not in mr.winners:
-            continue
-        if len(mr.participants) == 1:
-            solo_wins += 1
-            solo_prize += mr.prize_per_winner
-        else:
-            non_solo_wins += 1
-            non_solo_prize += mr.prize_per_winner
-    return {
-        "won_any": (solo_wins + non_solo_wins) > 0,
-        "solo_wins": solo_wins,
-        "non_solo_wins": non_solo_wins,
-        "solo_prize": solo_prize,
-        "non_solo_prize": non_solo_prize,
-    }
-
-
 class Game:
     """
     談合カードのメインゲームクラス
@@ -209,6 +173,9 @@ class Game:
 
         # S2: 倍掛け預託リスト
         self.double_up_deposits: list[DoubleUpDeposit] = []
+
+        # v0.8 E11: 直近Settlementで解決された倍掛け一覧（visible_state公開用の下地）
+        self._last_double_ups_resolved: list[dict] = []
 
         # S2: ラウンドスナップショット（指標収集用）
         self._round_snapshots: list[dict] = []
@@ -477,6 +444,39 @@ class Game:
         for tp in self.trade_proposals:
             if tp.status == CardTradeStatus.PROPOSED and tp.round_proposed == round_num:
                 tp.status = CardTradeStatus.EXPIRED
+                # v0.8 I2: 提案者へ通知（自動失効）
+                bucket = self._contract_notices.setdefault(tp.proposer, [])
+                bucket.append({
+                    "turn": self.config.negotiation_max_turns,
+                    "kind": "trade_expired",
+                    "trade_id": tp.trade_id,
+                    "with_player": tp.with_player,
+                })
+                if len(bucket) > self._CONTRACT_NOTICE_MAX:
+                    del bucket[: -self._CONTRACT_NOTICE_MAX]
+
+        # ラウンド末: 当該ラウンドで提案され署名が揃わなかった契約を自動失効（v0.8 D5）
+        for i, c in enumerate(self.contracts):
+            if c.status == ContractStatus.PROPOSED and c.round_created == round_num:
+                self.contracts[i] = c.model_copy(update={"status": ContractStatus.EXPIRED})
+                proposer = self.contracts[i].proposer
+                if proposer in self.players and self.players[proposer].is_alive:
+                    unsigned = [p for p in c.parties if p not in c.signed_by]
+                    bucket = self._contract_notices.setdefault(proposer, [])
+                    bucket.append({
+                        "turn": self.config.negotiation_max_turns,
+                        "kind": "contract_expired",
+                        "contract_id": c.contract_id,
+                        "unsigned_by": unsigned,
+                    })
+                    if len(bucket) > self._CONTRACT_NOTICE_MAX:
+                        del bucket[: -self._CONTRACT_NOTICE_MAX]
+                self.logger.log("CONTRACT_EXPIRED", round_num, "negotiation", data={
+                    "contract_id": c.contract_id,
+                    "proposer": proposer,
+                    "parties": list(c.parties),
+                    "signed_by": list(c.signed_by),
+                })
 
     _ACTION_FAILURE_MEMO_MAX = 12
     """本人へ返す不成立記録の保持上限（1ラウンド最大10アクション＋余裕）"""
@@ -512,6 +512,35 @@ class Game:
         bucket.append(entry)
         if len(bucket) > self._ACTION_FAILURE_MEMO_MAX:
             del bucket[: -self._ACTION_FAILURE_MEMO_MAX]
+
+    def _notify_contracts_expired_by_elimination(
+        self, before_contracts: list[Contract], eliminated_pid: str,
+    ) -> None:
+        """脱落によりPROPOSED→EXPIREDへ遷移した契約について、提案者へ通知する（v0.8 D5）。
+
+        elim_ops.forced_liquidation() 呼び出し直後、self.contracts が更新された後に呼ぶこと。
+        before_contracts には呼び出し前の self.contracts のスナップショット（浅いコピーで可、
+        Contractはmodel_copyで再生成されるため参照比較で十分）を渡す。
+        """
+        before_by_id = {c.contract_id: c for c in before_contracts}
+        for c in self.contracts:
+            prev = before_by_id.get(c.contract_id)
+            if prev is None or prev.status == c.status:
+                continue
+            if c.status != ContractStatus.EXPIRED or prev.status != ContractStatus.PROPOSED:
+                continue
+            proposer = c.proposer
+            if proposer in self.players and self.players[proposer].is_alive:
+                unsigned = [p for p in c.parties if p not in c.signed_by]
+                bucket = self._contract_notices.setdefault(proposer, [])
+                bucket.append({
+                    "turn": 0,
+                    "kind": "contract_expired",
+                    "contract_id": c.contract_id,
+                    "unsigned_by": unsigned,
+                })
+                if len(bucket) > self._CONTRACT_NOTICE_MAX:
+                    del bucket[: -self._CONTRACT_NOTICE_MAX]
 
     def _execute_negotiation_action(
         self, action: Action, pid: str, round_num: int, turn: int,
@@ -900,10 +929,12 @@ class Game:
             # Entry Fee支払い（§4.2: 必須支払い）
             if not player_ops.can_pay(p, self.config.entry_fee):
                 # 破産→即時脱落（§1.2, §4.4）
+                _contracts_before = list(self.contracts)
                 p, self.contracts, record = elim_ops.forced_liquidation(
                     p, "bankruptcy", round_num, self.contracts,
                 )
                 self.players[pid] = p
+                self._notify_contracts_expired_by_elimination(_contracts_before, pid)
                 self.logger.log("BANKRUPTCY", round_num, "commit", data={
                     "player_id": pid,
                     "reason": "Cannot pay entry fee",
@@ -979,10 +1010,12 @@ class Game:
                         self.contracts, pid, round_num,
                     )
                 ]
+                _contracts_before = list(self.contracts)
                 p, self.contracts, record = elim_ops.forced_liquidation(
                     p, "contract_violation", round_num, self.contracts,
                 )
                 self.players[pid] = p
+                self._notify_contracts_expired_by_elimination(_contracts_before, pid)
                 self.logger.log("AUTO_COMMIT_FAILURE", round_num, "commit", data={
                     "player_id": pid,
                     **record,
@@ -1045,13 +1078,21 @@ class Game:
                     agent.note_auto_commit(reject_reason)
 
     def _phase_settlement(self, round_num: int) -> None:
-        """Phase 4: Reveal & Settlement（§5.2）+ S2倍掛け処理"""
+        """Phase 4: Reveal & Settlement（§5.2）+ S2倍掛け処理
+
+        v0.8 D2: 前ラウンド預託の解決（旧Step1）はexecute_settlement()内部
+        （Step2市場結果確定後・Step3型B監査前）へ移設済み。ここでは
+        execute_settlement()が返すdu_summaryからカウンタを受け取り、
+        今ラウンド勝者へのTAKE/DOUBLE提示（_process_double_up、旧Step2）のみを
+        Settlement後に呼ぶ。
+        """
         (
             self.players,
             self.contracts,
             self.bounties,
             new_carryovers,
             market_results,
+            du_summary,
         ) = settlement_ops.execute_settlement(
             self.players,
             self._current_markets,
@@ -1061,6 +1102,7 @@ class Game:
             round_num,
             self.config,
             self.logger,
+            double_up_deposits=self.double_up_deposits if self.config.double_up_enabled else None,
         )
 
         # S2: 霧のラウンドで使用されたカードを記録
@@ -1068,14 +1110,13 @@ class Game:
             for c in self._current_commits:
                 self._fog_card_ids.add(c.card.card_id)
 
-        # S2: 倍掛け処理
-        du_success = 0
-        du_fail = 0
-        du_solo_forfeit = 0
+        # S2: 倍掛け処理（前R預託の解決結果はexecute_settlement内で確定済み）
+        du_success = du_summary.get("success", 0)
+        du_fail = du_summary.get("fail", 0)
+        du_solo_forfeit = du_summary.get("solo_forfeit", 0)
+        self._last_double_ups_resolved = du_summary.get("resolved", [])
         if self.config.double_up_enabled:
-            du_success, du_fail, du_solo_forfeit = self._process_double_up(
-                round_num, market_results,
-            )
+            self._process_double_up(round_num, market_results)
 
         # S2: ラウンドスナップショット記録
         surge_count = sum(1 for mr in market_results if mr.surged)
@@ -1133,20 +1174,15 @@ class Game:
 
     def _process_double_up(
         self, round_num: int, market_results: list[MarketResult],
-    ) -> tuple[int, int, int]:
+    ) -> None:
         """
-        S2: 倍掛け処理
+        S2: 倍掛け処理 — 今ラウンドの勝者への選択提示（v0.8 D2）
 
-        1. 前ラウンドの預託を解決（今ラウンドの市場結果で判定）
-        2. 今ラウンドの勝者に倍掛け選択を提示（R12以外）
-
-        Returns:
-            (成功数, 失敗数, 空き巣のみ勝利による没収数)
+        前ラウンド預託の解決（旧Step1）は execute_settlement() 内部へ移設済み
+        （settlement.execute_settlement() の呼び出し元 _phase_settlement()
+        が既に解決結果=du_summaryを受け取っている）。ここでは今ラウンドの
+        市場勝者にTAKE/DOUBLEを提示する（旧Step2、R12以外）。
         """
-        du_success = 0
-        du_fail = 0
-        du_solo_forfeit = 0
-
         # 今ラウンドの市場勝者を特定（player_id → 獲得額マップ）
         round_winners: dict[str, int] = {}
         # ソロ市場を除外した勝者マップ（倍掛け成功判定用, §6.2）
@@ -1166,64 +1202,7 @@ class Game:
                 if mr.market_id not in solo_markets:
                     non_solo_winners[winner_id] = non_solo_winners.get(winner_id, 0) + mr.prize_per_winner
 
-        # Step 1: 前ラウンドの預託を解決
-        for dep in self.double_up_deposits:
-            if dep.resolved or dep.success_round != round_num:
-                continue
-            dep.resolved = True
-            p = self.players[dep.player_id]
-            # Cycle 8: ログ記録専用の勝敗内訳（判定ロジックには使用しない。
-            # 判定は直後の non_solo_winners[...] > 0 ゲートのみで行う＝無変更）
-            win_summary = _summarize_market_wins(market_results, dep.player_id)
-
-            if not p.is_alive:
-                # 脱落済みなら没収
-                self.logger.log("DOUBLE_UP_RESOLVED", round_num, "settlement", data={
-                    "player_id": dep.player_id, "result": "forfeit_eliminated",
-                    "deposit": dep.deposit_amount,
-                    "outcome_reason": "eliminated",
-                    "solo_wins": win_summary["solo_wins"],
-                    "non_solo_wins": win_summary["non_solo_wins"],
-                })
-                du_fail += 1
-                continue
-
-            if dep.player_id in non_solo_winners and non_solo_winners[dep.player_id] > 0:
-                # 成功: 2倍払い出し（判定条件は無変更）
-                payout = dep.deposit_amount * 2
-                dep.success = True
-
-                p = player_ops.receive(p, payout)
-                self.players[dep.player_id] = p
-                self.logger.log("DOUBLE_UP_RESOLVED", round_num, "settlement", data={
-                    "player_id": dep.player_id, "result": "success",
-                    "deposit": dep.deposit_amount, "payout": payout,
-                    "outcome_reason": "non_solo_win",
-                    "solo_wins": win_summary["solo_wins"],
-                    "non_solo_wins": win_summary["non_solo_wins"],
-                })
-                du_success += 1
-            else:
-                # 失敗: 没収。won_any=Trueなのに non_solo_winners が 0 ということは、
-                # 勝利はあったが全て空き巣（参加者1人）市場だったため成功判定から
-                # 除外された（§6.2）ケース＝ solo_only_win。won_any=Falseなら
-                # そもそも当ラウンド無勝利＝ no_win。
-                if win_summary["won_any"]:
-                    outcome_reason = "solo_only_win"
-                    dep.forfeited_by_solo_only = True
-                    du_solo_forfeit += 1
-                else:
-                    outcome_reason = "no_win"
-                self.logger.log("DOUBLE_UP_RESOLVED", round_num, "settlement", data={
-                    "player_id": dep.player_id, "result": "forfeit",
-                    "deposit": dep.deposit_amount,
-                    "outcome_reason": outcome_reason,
-                    "solo_wins": win_summary["solo_wins"],
-                    "non_solo_wins": win_summary["non_solo_wins"],
-                })
-                du_fail += 1
-
-        # Step 2: 今ラウンドの勝者に倍掛け選択を提示（R12以外、R11が最後）
+        # 今ラウンドの勝者に倍掛け選択を提示（R12以外、R11が最後）
         if round_num < self.config.num_rounds:
             for winner_id, prize_won in round_winners.items():
                 p = self.players[winner_id]
@@ -1272,8 +1251,6 @@ class Game:
                         "success_round": round_num + 1,
                     })
 
-        return du_success, du_fail, du_solo_forfeit
-
     def _phase_finance(self, round_num: int) -> None:
         """Phase 5: Finance（§5.3）"""
         self.players, self.contracts = finance_ops.execute_finance(
@@ -1285,6 +1262,10 @@ class Game:
             # R1-11のrepayはNegotiation中に即時処理済み。
             # Financeでの任意返済は追加分のみ（現状は空）
             pending_repayments={},
+        )
+        # v0.8 I1: 残存義務ゼロになったACTIVE契約（ゾンビ契約）をCLOSEDへ畳む
+        self.contracts = contract_ops.close_contracts_without_remaining_obligations(
+            self.contracts, round_num,
         )
 
     def _phase_reflection(self, round_num: int) -> None:
@@ -1951,7 +1932,9 @@ class Game:
                     "cancelled_round": c.cancelled_round,
                 }
                 for c in self.contracts
-                if c.status.value in ("active", "completed", "cancelled")
+                # v0.8 D5/I1: expired（署名不成立で失効）・closed（残存義務ゼロで畳んだ
+                # ゾンビ契約）も生のstatus文字列のまま公示に含める。
+                if c.status.value in ("active", "completed", "cancelled", "expired", "closed")
             ],
             "bounties_public": [
                 {"bounty_id": b.bounty_id, "amount": b.amount,

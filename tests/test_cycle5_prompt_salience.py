@@ -215,7 +215,9 @@ class TestClosingEnumeration:
         assert "ここではdm/broadcast/transfer/repay/pass等を選択" not in prompt
 
     def test_low_cash_marks_contract_propose_unavailable(self):
-        config = GameConfig.baseline_v1_s2(12)
+        # v0.8 D1でbaseline_v1_s2はcontract_fee=0（無料化）になったため、
+        # 「発行料の現金不足」表示の回帰確認には非0の手数料を明示指定する。
+        config = GameConfig.baseline_v1_s2(12).model_copy(update={"contract_fee": 100_000})
         player = _make_player(cash=50_000, debt=0)  # < contract_fee(100,000)
         vs = _base_visible_state()
         prompt = build_negotiation_prompt(player, 5, 1, vs, config)
@@ -500,7 +502,9 @@ class TestActionDescriptionMapping:
         assert "。10万円" not in available
 
     def test_unavailable_phrases_unchanged(self):
-        config = GameConfig.baseline_v1_s2(12)
+        # v0.8 D1でbaseline_v1_s2はcontract_fee=0（無料化）になったため、
+        # 「発行料の現金不足」表示の回帰確認には非0の手数料を明示指定する。
+        config = GameConfig.baseline_v1_s2(12).model_copy(update={"contract_fee": 100_000})
         player = _make_player(cash=500_000, debt=0)
         vs = _base_visible_state()
         prompt = build_negotiation_prompt(player, 5, 1, vs, config)

@@ -7,7 +7,7 @@
 
 from typing import Any
 
-from engine.models import PlayerState, Contract, Obligation
+from engine.models import PlayerState, Contract, ContractStatus, Obligation
 from engine import player as player_ops
 
 
@@ -83,6 +83,10 @@ def expire_obligations_for_player(
     - 脱落者が義務者(obligor)または相手方(counterparty)である未履行義務のみ失効
     - 生存者間の義務は継続
     - 「3者契約で生贄を脱落させて全体解除」は不可能
+    - 脱落者が当事者であるPROPOSED（署名待ち）契約はEXPIREDへ遷移する（v0.8 D5）。
+      署名が永久に揃わない状態を防ぐため。ACTIVE契約はこの遷移の対象外（義務の
+      失効のみで、契約自体のstatusはACTIVEのまま。ゾンビ化判定はv0.8 I1の
+      close_contracts_without_remaining_obligations() が別途行う）。
 
     Args:
         player_id: 脱落者のプレイヤーID
@@ -93,6 +97,9 @@ def expire_obligations_for_player(
     """
     updated: list[Contract] = []
     for contract in contracts:
+        if contract.status == ContractStatus.PROPOSED and player_id in contract.parties:
+            updated.append(contract.model_copy(update={"status": ContractStatus.EXPIRED}))
+            continue
         new_obligations: list[Obligation] = []
         for ob in contract.obligations:
             if (not ob.is_fulfilled and not ob.is_expired and

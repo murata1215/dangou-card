@@ -17,6 +17,49 @@ from engine.models import (
 )
 
 
+def normalize_type_b_card_details(details: dict[str, Any]) -> dict[str, Any]:
+    """
+    type_b_card 義務の details キー正規化
+
+    LLMが "card" や "rank" キーで送信する場合があるため "card_rank" に統一する。
+    判定ロジック(audit_type_b)・autocommit・プロンプト表示が全て "card_rank" を
+    参照するため、入口1箇所で正規化して全消費者を修正する。
+    create_contract（契約作成時）と validate_action（contract_propose検証時、v0.8 D6）
+    の両方から呼ばれる共通ヘルパー。
+
+    Args:
+        details: 義務のdetails辞書（呼び出し元でコピー済みであること）
+
+    Returns:
+        card_rank キーに正規化済みのdetails辞書（同じdictを変更して返す）
+    """
+    if "card_rank" not in details:
+        if "card" in details:
+            details["card_rank"] = details.pop("card")
+        elif "rank" in details:
+            details["card_rank"] = details.pop("rank")
+    return details
+
+
+def validate_type_b_card_details(details: dict[str, Any]) -> str | None:
+    """
+    正規化済み type_b_card 義務の details を検証する
+
+    Args:
+        details: normalize_type_b_card_details() 済みのdetails辞書
+
+    Returns:
+        不正ならエラーメッセージ、問題なければNone
+    """
+    rank_name = details.get("card_rank")
+    if rank_name is None or rank_name not in CardRank.__members__:
+        return (
+            f"Invalid type_b_card obligation: card_rank={rank_name!r} "
+            f"(valid: {', '.join(CardRank.__members__)})"
+        )
+    return None
+
+
 def create_contract(
     proposer: str,
     parties: list[str],
@@ -41,27 +84,13 @@ def create_contract(
     for i, term in enumerate(terms):
         details = dict(term.get("details", {}))
 
-        # type_b_card 義務の details キー正規化:
-        # LLMが "card" や "rank" キーで送信する場合があるため "card_rank" に統一。
-        # 判定ロジック(audit_type_b)・autocommit・プロンプト表示が全て
-        # "card_rank" を参照するため、入口1箇所で正規化して全消費者を修正。
-        if term.get("ob_type") == "type_b_card" and "card_rank" not in details:
-            if "card" in details:
-                details["card_rank"] = details.pop("card")
-            elif "rank" in details:
-                details["card_rank"] = details.pop("rank")
-
-        # type_b_card 義務のバリデーション:
-        # 正規化しても card_rank が取得できない、または CardRank enum に
-        # 存在しないrank名の場合、silent脱落トラップを防ぐため契約提案を弾く。
-        # 呼び出し元のP2防御層(game.py)でキャッチされアクション不成立になる。
         if term.get("ob_type") == "type_b_card":
-            rank_name = details.get("card_rank")
-            if rank_name is None or rank_name not in CardRank.__members__:
-                raise ValueError(
-                    f"Invalid type_b_card obligation: card_rank={rank_name!r} "
-                    f"(valid: {', '.join(CardRank.__members__)})"
-                )
+            details = normalize_type_b_card_details(details)
+            error = validate_type_b_card_details(details)
+            if error is not None:
+                # silent脱落トラップを防ぐため契約提案を弾く。
+                # 呼び出し元のP2防御層(game.py)でキャッチされアクション不成立になる。
+                raise ValueError(error)
 
         ob = Obligation(
             obligation_id=f"{contract_id}_OB{i + 1:02d}",
@@ -360,20 +389,38 @@ def get_all_type_b_for_player(
     return result
 
 
+def is_obligation_pending(ob: Obligation, round_num: int) -> bool:
+    """
+    義務が「未到来・未履行・未失効」（＝まだ解除で失効させる余地がある）かを判定する
+
+    型B義務は正常履行でも is_fulfilled が立たない（audit_type_b は違反者のみを返す
+    仕様のため）が、「未到来」（round_num >= 現在R）で絞ることで、既に監査済みの
+    義務（round_num < 現在R）を誤って「解除可能」に含めない。
+
+    Negotiationは当該ラウンドのCommit/Settlementより前に走るため、
+    round_num == 現在R の義務はまだ未判定であり「未到来」に含める。
+
+    Args:
+        ob: 対象義務
+        round_num: 現在のラウンド番号
+
+    Returns:
+        未到来・未履行・未失効ならTrue
+    """
+    return ob.round_num >= round_num and not ob.is_fulfilled and not ob.is_expired
+
+
 def can_cancel_contract(
     contract: Contract,
     round_num: int,
 ) -> tuple[bool, str | None]:
     """
-    全当事者合意による契約解除（§6）の可否を導出する
+    全当事者合意による契約解除（§6）の可否を導出する（v0.8 D4）
 
     永続的な「ロック済み」状態は持たず、義務のフラグと round_num から毎回導出する。
-    型B義務は正常履行でも is_fulfilled が立たない（audit_type_b は違反者のみを返す
-    仕様のため）。したがって「一度でも履行/監査済み」を捕捉するには
-    ob.round_num < round_num（=当該義務の期限Settlementを通過済み）も見る必要がある。
-
-    Negotiationは当該ラウンドのCommit/Settlementより前に走るため、
-    round_num == 現在R の義務はまだ未判定であり解除可能。
+    ACTIVE契約に「未到来（round_num >= 現在R）・未履行・未失効」な義務が1件でも
+    あれば解除可能。履行済み・監査済みの過去の義務は解除可否に影響しない
+    （解除してもロールバックされないため、ブロックする理由がない）。
 
     Args:
         contract: 対象契約
@@ -384,16 +431,10 @@ def can_cancel_contract(
     """
     if contract.status != ContractStatus.ACTIVE:
         return False, f"Contract {contract.contract_id} is not active"
-    for ob in contract.obligations:
-        if ob.is_fulfilled:
-            return False, f"Contract {contract.contract_id} has a fulfilled obligation"
-        if ob.is_expired:
-            return False, f"Contract {contract.contract_id} has an expired obligation"
-        if ob.round_num < round_num:
-            return False, (
-                f"Contract {contract.contract_id} has an audited obligation "
-                f"(R{ob.round_num})"
-            )
+    if not any(is_obligation_pending(ob, round_num) for ob in contract.obligations):
+        return False, (
+            f"Contract {contract.contract_id} has no remaining future obligations to cancel"
+        )
     return True, None
 
 
@@ -436,9 +477,12 @@ def request_cancel(
 
     if required and required <= set(new_requested):
         # 生存する全当事者の同意が揃った → 解除成立
+        # 「未到来（round_num >= 現在R）・未履行・未失効」な義務のみを失効させる。
+        # 履行済み・監査済み（過去R）の義務はロールバックせず据え置く（v0.8 D4）。
         new_obligations = [
-            ob if (ob.is_fulfilled or ob.is_expired)
-            else ob.model_copy(update={"is_expired": True})
+            ob.model_copy(update={"is_expired": True})
+            if is_obligation_pending(ob, round_num)
+            else ob
             for ob in contract.obligations
         ]
         return contract.model_copy(update={
@@ -450,3 +494,74 @@ def request_cancel(
         }), True
 
     return contract.model_copy(update={"cancel_requested_by": new_requested}), False
+
+
+def close_contracts_without_remaining_obligations(
+    contracts: list[Contract],
+    round_num: int,
+) -> list[Contract]:
+    """
+    残存義務ゼロのACTIVE契約を CLOSED にする（v0.8 I1・ゾンビ契約整理）
+
+    「未到来（round_num >= 現在R）・未履行・未失効」な義務が1件もないACTIVE契約は、
+    全義務が履行済み・失効済みで今後何も起こらない「ゾンビ契約」であるため、
+    CLOSEDへ遷移させて my_contracts / contracts_pending から除外できるようにする。
+
+    既にACTIVE以外（PROPOSED/CANCELLED/EXPIRED/CLOSED）の契約はそのまま返す
+    （冪等・複数箇所からの呼び出しに対して安全）。
+
+    Args:
+        contracts: 全契約リスト
+        round_num: 現在のラウンド番号
+
+    Returns:
+        更新後の契約リスト（新しいリスト。各要素は変更があったものだけ新インスタンス）
+    """
+    result = []
+    for c in contracts:
+        if c.status == ContractStatus.ACTIVE and not any(
+            is_obligation_pending(ob, round_num) for ob in c.obligations
+        ):
+            result.append(c.model_copy(update={"status": ContractStatus.CLOSED}))
+        else:
+            result.append(c)
+    return result
+
+
+def count_reserved_card_obligations(
+    contracts: list[Contract],
+    player_id: str,
+    rank: "CardRank",
+    round_num: int,
+) -> int:
+    """
+    プレイヤーが義務者（obligor）である契約上、今後カード引渡しが必要な件数を数える
+    （v0.8 D8・契約で使用予定のカードのトレード禁止）
+
+    対象は ACTIVE 契約の「未到来（round_num >= 現在R）・未履行・未失効」な
+    type_b_card 義務のうち、指定ランクを要求するもの。
+
+    Args:
+        contracts: 全契約リスト
+        player_id: 義務者のプレイヤーID
+        rank: 対象カードランク
+        round_num: 現在のラウンド番号
+
+    Returns:
+        予約件数n（手札の当該ランク枚数がこれ以下ならトレード不可）
+    """
+    n = 0
+    for c in contracts:
+        if c.status != ContractStatus.ACTIVE:
+            continue
+        for ob in c.obligations:
+            if ob.obligor != player_id:
+                continue
+            if ob.ob_type != ObligationType.TYPE_B_CARD:
+                continue
+            if not is_obligation_pending(ob, round_num):
+                continue
+            ob_rank = ob.details.get("card_rank")
+            if ob_rank == rank.name:
+                n += 1
+    return n

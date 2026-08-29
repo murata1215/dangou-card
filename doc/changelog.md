@@ -1,5 +1,51 @@
 # Changelog
 
+## 2026-08-29: サイクル8.1（一部実装）: v0.8エンジン差分 — 契約無料化・倍掛け解決順序・解除条件緩和・署名待ち失効・ゾンビ契約整理・terms検証
+
+`doc/analysis/prompt_engine_audit_20260829.md`で確定した実挙動をもとに、v0.8決定分の
+うちD1/D2/D4/D5/D6/I1相当の6項目をエンジン側に実装した。D3/D7/D8/I2/I3/S4は本サイクルでは
+未着手（続きは次サイクル）。プロンプト文面・仕様書の更新は対象外（次タスク）。
+
+- **D1 契約発行料の無料化**: `GameConfig.baseline_v1_s2()`に`contract_fee=0`を追加。
+  徴収・検証コードは残置（`default_20()`等の既定100,000は不変）。`tests/test_s2_rules.py`に
+  S2提案で現金が減らないことを確認するテストを追加。
+- **D2 前R倍掛け判定をSettlement内へ移動**: 従来`game._process_double_up()`Step1にあった
+  前R預託の解決（成功→2倍払出/失敗→没収）を`engine/settlement.py`の新関数
+  `resolve_double_up_deposits()`へ切り出し、`execute_settlement()`のMarket Settlement直後・
+  型B監査の前で呼ぶよう変更。払出が同一R内の型Aスナップショットに反映されるようになった。
+  今Rの勝者へのTAKE/DOUBLE提示（Step2相当）は従来どおりSettlement後のまま。
+  `_summarize_market_wins()`をgame.pyからsettlement.pyへ移設。
+- **D4 部分履行後の契約解除を許可**: `can_cancel_contract()`の判定を「1件でも履行/監査/
+  失効済み義務があれば解除不可」から「ACTIVEかつ未到来（`round_num >= 現在R`）で未履行・
+  未失効の義務が1件以上あれば解除可」に変更。解除は未到来義務のみ失効させ、履行済み・
+  監査済み義務は巻き戻さない。`tests/test_contract_cancel.py::TestCanCancelContract`を
+  新条件で全面更新。
+- **D5 署名待ち提案のR末失効**: `ContractStatus.EXPIRED`を新設。PROPOSEDのまま提案ラウンド
+  が終わった契約、または署名前に当事者が脱落した契約をEXPIREDへ遷移させ、提案者へ通知
+  （`contract_expired`）を積む。
+- **I1 ゾンビ契約の自動CLOSED**: `ContractStatus.CLOSED`を新設。
+  `close_contracts_without_remaining_obligations()`をSettlement後・Finance後・Negotiation
+  終了時の3箇所で走らせ、未到来の未履行・未失効義務が0件のACTIVE契約をCLOSEDにする。
+  `my_contracts`/`contracts_pending`からは除外、`contracts_public`にはstatusとして残る。
+- **D6 契約terms検証**: `ContractProposeAction.validate()`に`with_players`の重複/自己参照
+  チェック、各termの`obligor`/`counterparty`が当事者集合内か、`round_num`が
+  `現在R〜num_rounds`の範囲内か、`type_b_market`/`type_b_no_market`の`market_id`が実在市場か、
+  `type_a_payment`の`amount`が正整数か、を追加。不正時はvalidate段階で不成立（枠は消費、
+  理由が`my_failed_actions`に載る）。新規`tests/test_contract_terms_validation.py`（20件）。
+- **`llm/prompt_builder.py`**: 新規notice kind（`contract_expired`等）で誤った固定文言を
+  描画しないよう`_render_contract_notice_block()`に最小限の防御分岐を追加（文言の追加・変更
+  なし、`cancel_completed`/`cancel_requested`の既存文言は無変更）。
+
+**未着手（次サイクルへ持ち越し）**: D3（DOUBLE即死ガード）、D7（カードトレード1R1回を成立
+ベースに）、D8（契約中カードのトレード禁止）、I2（トレード拒否・失効通知）、I3
+（visible_state公開情報追加）、S4（預託金脱落時テストの明示）。D2のSettlement内統合テスト
+（「払出が同Rの型A支払原資になる」ケース）も本サイクルでは未追加。
+
+テスト: `uv run pytest -q` **1467 passed**（既存1441 + 新規26、回帰0件）。LLM APIは
+一切呼んでいない（`llm/adapters.py`未import、`logs/llm/`に新規エントリなし）。
+関連: `rules/project.md`（S2契約発行料の上書き方針・Settlement内倍掛け解決順序・terms検証・
+ACTIVEからの実遷移の各節）。
+
 ## 2026-08-27: Cycle 6.1: thinking×temperature競合の修正、xAI reserve実測反映、Phase2上限追随
 
 Cycle 6監査で判明した3件の保留事項（Moonshot/Anthropicのthinking×temperature 400、

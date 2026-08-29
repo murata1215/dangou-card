@@ -583,17 +583,18 @@ def _render_contract_notice_block(visible_state: dict[str, Any]) -> list[str]:
     notices = visible_state.get("my_contract_notices") or []
     if not notices:
         return []
-    lines: list[str] = ["\n## 📩 あなたが当事者の契約に関する通知"]
+    lines: list[str] = []
     for n in notices:
         cid = n.get("contract_id", "?")
         by = n.get("by", "?")
         turn = n.get("turn", "?")
-        if n.get("kind") == "cancel_completed":
+        kind = n.get("kind")
+        if kind == "cancel_completed":
             lines.append(
                 f'  [巡{turn}] {cid} は生存する全当事者の合意で解除されました'
                 '（残義務は発火しません）。'
             )
-        else:
+        elif kind == "cancel_requested":
             requested = n.get("cancel_requested_by") or []
             pending = n.get("pending") or []
             cancel_example = f'{{"type": "contract_cancel", "contract_id": "{cid}"}}'
@@ -603,7 +604,14 @@ def _render_contract_notice_block(visible_state: dict[str, Any]) -> list[str]:
                 f' あなたも {cancel_example} を出せば解除が進みます。'
                 '出さなければ契約は有効なままで、義務違反は従来どおり判定されます。'
             )
-    return lines
+        else:
+            # v0.8で追加されたnotice kind（contract_expired/trade_*等）は
+            # 誤った文言（解除通知向けの固定文）で描画しないよう、ここではskipする。
+            # 描画対応は次タスクで行う（Plan Cycle 8.1「やらないこと」参照）。
+            continue
+    if not lines:
+        return []
+    return ["\n## 📩 あなたが当事者の契約に関する通知"] + lines
 
 
 def _render_action_feedback_block(visible_state: dict[str, Any]) -> list[str]:

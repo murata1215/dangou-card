@@ -166,3 +166,127 @@ class TestNegotiationPromptPendingContracts:
 
         assert "提案中の正式契約" not in prompt
         assert "署名待ち" not in prompt
+
+
+# =========================================================================
+# v0.8 D5: 署名待ち(PROPOSED)契約の失効
+# =========================================================================
+
+def _make_game_for_expiry(num_players: int = 4):
+    """E5テスト用の実Gameインスタンス（StubAgentは常にpassするため
+    ラウンド末の自動失効ロジックだけを純粋に検証できる）"""
+    from engine.config import GameConfig as _GameConfig
+    from engine.events import EventLogger
+    from engine.game import Game
+    from engine.negotiation import StubAgent
+
+    config = _GameConfig.baseline_v1(num_players).model_copy(
+        update={"num_rounds": 12, "negotiation_max_turns": 1},
+    )
+    agents = {f"P{i+1:02d}": StubAgent() for i in range(num_players)}
+    game = Game(config=config, agents=agents, seed=1, logger=EventLogger())
+    game._setup()
+    game._phase_market_open(1)
+    return game
+
+
+def _proposed_contract_awaiting_signature(round_created: int) -> Contract:
+    ob = make_obligation(
+        "OB_E5_01", "C_e5_test",
+        obligor="P01", counterparty="P02",
+        ob_type=ObligationType.TYPE_A_PAYMENT,
+        round_num=round_created + 2,
+        details={"amount": 100000},
+    )
+    return Contract(
+        contract_id="C_e5_test",
+        proposer="P01",
+        parties=["P01", "P02"],
+        signed_by=["P01"],  # P02が未署名のまま
+        obligations=[ob],
+        round_created=round_created,
+        status=ContractStatus.PROPOSED,
+    )
+
+
+class TestProposedContractExpiresAtRoundEnd:
+    """v0.8 D5: 当該ラウンドで提案され署名が揃わなかったPROPOSED契約は
+    ラウンド末にEXPIREDへ遷移する"""
+
+    def test_unsigned_proposed_contract_expires_same_round(self):
+        game = _make_game_for_expiry()
+        game.contracts = [_proposed_contract_awaiting_signature(round_created=1)]
+
+        game._phase_negotiation(1)
+
+        assert len(game.contracts) == 1
+        assert game.contracts[0].status == ContractStatus.EXPIRED
+
+    def test_proposer_receives_contract_expired_notice(self):
+        game = _make_game_for_expiry()
+        game.contracts = [_proposed_contract_awaiting_signature(round_created=1)]
+
+        game._phase_negotiation(1)
+
+        notices = game._contract_notices.get("P01", [])
+        kinds = [n["kind"] for n in notices]
+        assert "contract_expired" in kinds
+        notice = next(n for n in notices if n["kind"] == "contract_expired")
+        assert notice["contract_id"] == "C_e5_test"
+        assert notice["unsigned_by"] == ["P02"]
+
+    def test_expired_contract_excluded_from_pending_and_my_contracts(self):
+        game = _make_game_for_expiry()
+        game.contracts = [_proposed_contract_awaiting_signature(round_created=1)]
+
+        game._phase_negotiation(1)
+
+        state = game._build_visible_state(2, for_player_id="P02")
+        assert state["contracts_pending"] == []
+        assert state["my_contracts"] == []
+
+    def test_expired_contract_shown_in_contracts_public_raw_status(self):
+        game = _make_game_for_expiry()
+        game.contracts = [_proposed_contract_awaiting_signature(round_created=1)]
+
+        game._phase_negotiation(1)
+
+        state = game._build_visible_state(2, for_player_id="P03")
+        public = [c for c in state["contracts_public"] if c["contract_id"] == "C_e5_test"]
+        assert len(public) == 1
+        assert public[0]["status"] == "expired"
+
+    def test_proposed_contract_from_earlier_round_not_expired_by_later_round_end(self):
+        """round_created != round_num（前ラウンド以前の提案）はこの巡の
+        ラウンド末失効の対象にならない（同ラウンド提案分のみが対象）"""
+        game = _make_game_for_expiry()
+        game.contracts = [_proposed_contract_awaiting_signature(round_created=1)]
+
+        game._phase_negotiation(2)
+
+        assert game.contracts[0].status == ContractStatus.PROPOSED
+
+
+class TestProposedContractExpiresOnPartyElimination:
+    """v0.8 D5: PROPOSED契約の当事者が署名前に脱落した場合も
+    その時点でEXPIREDへ遷移し、生存する提案者に通知される"""
+
+    def test_party_elimination_expires_proposed_contract(self):
+        from engine import elimination as elim_ops
+
+        game = _make_game_for_expiry()
+        contract = _proposed_contract_awaiting_signature(round_created=1)
+        game.contracts = [contract]
+
+        before = list(game.contracts)
+        p02 = game.players["P02"]
+        game.players["P02"] = p02.model_copy(update={
+            "is_alive": False, "elimination_reason": "bankruptcy", "elimination_round": 1,
+        })
+        game.contracts = elim_ops.expire_obligations_for_player("P02", game.contracts)
+        game._notify_contracts_expired_by_elimination(before, "P02")
+
+        assert game.contracts[0].status == ContractStatus.EXPIRED
+        notices = game._contract_notices.get("P01", [])
+        kinds = [n["kind"] for n in notices]
+        assert "contract_expired" in kinds

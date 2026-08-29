@@ -266,47 +266,66 @@ counterpartyには何も出ない）(b) `ob.round_num >= round_num`のみを対�
 `contracts_pending`と同じ`for_player_id in c.parties`条件で当事者限定、
 `for_player_id=None`（観戦用呼び出し）では`my_contracts`キー自体が生えない。
 
-なお`engine/contracts.py`の`ContractStatus.COMPLETED`/`EXPIRED`はenumとして
-定義されているが、代入箇所がコードベース全体でゼロ（`sign_contract()`が
-`PROPOSED→ACTIVE`にするのみ）。`contracts_public`/`my_contracts`が「義務が全部消化済みでも
-契約自体はactiveと表示される」のはこの仕様どおりであり、`ob_status`（義務単位）
-を見て判断する必要がある。義務レベルの状態を持たないのは意図的な設計（契約自体の
-COMPLETED/EXPIRED遷移を実装するとエンジン判定ロジック側の`status != ACTIVE`
-continueに影響するため見送った）。
+なお`engine/contracts.py`の`ContractStatus.COMPLETED`はenumとして定義されているが、
+代入箇所がコードベース全体でゼロのまま（`sign_contract()`が`PROPOSED→ACTIVE`にするのみ）。
+一方`EXPIRED`（PROPOSED→EXPIRED、署名不成立のまま失効）と`CLOSED`（ACTIVE→CLOSED、未到来の
+残存義務ゼロの「ゾンビ契約」を畳む）はv0.8サイクル8.1で実装され、代入箇所を持つようになった
+（詳細は次節）。`contracts_public`/`my_contracts`が「義務が全部消化済みでも契約自体はactiveと
+表示される」ケースは、CLOSEDへの自動掃引（Settlement後・Finance後・Negotiation終了時の3箇所
+限定）が走るまでの間に限られ、それ以外は`ob_status`（義務単位）を見て判断する必要がある。
 
-### `ACTIVE`からの唯一の実遷移: 全当事者合意による`CANCELLED`（§6・contract_cancel）
+### `ACTIVE`からの実遷移: `CANCELLED`（全当事者合意）/ `CLOSED`（残存義務ゼロ、v0.8）
 
-上記の「ACTIVEは変化しない」という前提には、**全当事者合意による解除**という
-唯一の例外がある。同一R・同一市場に両立不能な条件（例: TWO_PAIR要求とONE_PAIR要求）の
-契約が二重に成立すると、1ラウンドに出せるカードは1枚しかないためどちらかが必ず
-型B違反で脱落する。これを「旧契約を全員合意で解除→新条件で`contract_propose`」の
-2ステップで解消できるようにしたのが`contract_cancel`アクション（単一アクション、
-提案/署名の2段構成にはしない。合意対象が`contract_id`だけで完全に決まるため）。
+上記の「ACTIVEは変化しない」という前提には、2つの例外がある。1つ目は**全当事者合意による
+解除**。同一R・同一市場に両立不能な条件（例: TWO_PAIR要求とONE_PAIR要求）の契約が二重に
+成立すると、1ラウンドに出せるカードは1枚しかないためどちらかが必ず型B違反で脱落する。これを
+「旧契約を全員合意で解除→新条件で`contract_propose`」の2ステップで解消できるようにしたのが
+`contract_cancel`アクション（単一アクション、提案/署名の2段構成にはしない。合意対象が
+`contract_id`だけで完全に決まるため）。
 
 **可否判定は永続フラグを持たず、既存の義務フラグから毎回導出する**
-（`engine/contracts.py:can_cancel_contract()`）:
+（`engine/contracts.py:can_cancel_contract()`）。**v0.8 D4（サイクル8.1）で条件を緩和**し、
+「未到来義務を含め1件でも履行/違反/監査済みの義務があれば契約全体が解除不可」という
+旧制約を撤廃した:
 
 ```
-解除可能 ⟺ contract.status == ACTIVE かつ、全 obligation について
-    not ob.is_fulfilled          # 型A履行済みでない
-  かつ not ob.is_expired          # 脱落による失効でない
-  かつ ob.round_num >= 現在R      # 未来Rが期限（今Rが期限までは解除可）
+解除可能 ⟺ contract.status == ACTIVE かつ、
+  「round_num >= 現在R（未到来）かつ 未履行 かつ 未失効」を満たす obligation が
+  1件以上存在する
 ```
 
-型B義務は正常に守っても`is_fulfilled`が立たない（`audit_type_b()`は違反者だけを
-返す仕様）ため、`ob.round_num < round_num`を「既に監査済み＝実績あり」の代理指標として
-使う。これにより「一部当事者だけが履行/違反した後にこっそり解除して証拠を消す」ことを防ぐ。
+履行済み・監査済み（過去R扱い）の義務は解除の可否判定そのものから除外される（それらは
+巻き戻されず、契約が残す「実績」としてそのまま残る）。解除成立時に失効するのは未到来義務の
+みで、既に履行/監査済みの義務は不変。型B義務は正常に守っても`is_fulfilled`が立たない
+（`audit_type_b()`は違反者だけを返す仕様）ため、「既に監査済み＝実績あり」の判定には
+引き続き`ob.round_num < 現在R`を代理指標として使う（v0.4以来変更なし）。
 
 生存する全当事者が同じ`contract_cancel`を出した時点で`CANCELLED`に遷移する
 （`request_cancel()`）。1人でも出していなければ元の契約は`ACTIVE`のまま
-（`cancel_requested_by`にPIDが積まれるだけ）。脱落者の同意は不要（行動できないため）。
+（`cancel_requested_by`にPIDが積まれるだけ、Rを跨いで永続）。脱落者の同意は不要
+（行動できないため）。
 
-`CANCELLED`は既存の全ての`contract.status != ContractStatus.ACTIVE`継続チェック
-（`get_active_type_b_obligations`/`get_active_type_a_obligations`/
+2つ目の例外が**残存義務ゼロによる`CLOSED`**（v0.8 I1・サイクル8.1）。全ての義務が
+履行済み・失効済み（監査済み含む）になり、未到来の未履行・未失効義務が0件になった
+ACTIVE契約を`close_contracts_without_remaining_obligations()`が`CLOSED`へ遷移させる
+（判定はSettlement後・Finance後・Negotiation終了時の3箇所で実行）。`CLOSED`は解除同意
+（`cancel_requested_by`）を経由しない自動遷移で、通知は発生しない。
+
+`CANCELLED`/`CLOSED`はいずれも既存の全ての`contract.status != ContractStatus.ACTIVE`
+継続チェック（`get_active_type_b_obligations`/`get_active_type_a_obligations`/
 `get_all_type_b_for_player`/`my_contracts`/`my_obligations`）に自動的に乗るため、
-Settlement/監査/自動代行Commitのロジックは一切変更していない。解除の事実（`cancelled_round`）は
-契約ID・当事者・statusと同じ公開粒度で`contracts_public`/Viewerに残り続ける
-（条項`terms`は従来どおりgod限定のまま）。
+Settlement/監査/自動代行Commitのロジックは変更していない。解除・終了の事実
+（`cancelled_round`、CLOSED移行）は契約ID・当事者・statusと同じ公開粒度で
+`contracts_public`/Viewerに残り続ける（条項`terms`は従来どおりgod限定のまま）。
+`my_contracts`/`contracts_pending`からはCLOSED/EXPIRED契約を除外する（v0.8）。
+
+### 署名待ち提案のR末失効（`EXPIRED`、v0.8 D5・サイクル8.1）
+
+`PROPOSED`のまま提案ラウンドが終了した契約、または署名成立前に当事者が脱落した契約は
+`ContractStatus.EXPIRED`へ遷移する。旧実装は署名待ち契約が失効せず全12R残存し続け、当事者
+脱落後も`PROPOSED`のまま残るバグがあった（`doc/analysis/prompt_engine_audit_20260829.md`§2）。
+EXPIRED化と同時に提案者へ`contract_expired`通知を積む。`my_contracts`/`contracts_pending`は
+PROPOSEDのみを対象とする既存フィルタにより、EXPIRED契約は自然に一覧から消える。
 
 ### `contract_cancel`はAUTO_PASSの起床条件から独立している（第3の起床トリガ）
 
@@ -587,3 +606,43 @@ pass等の`strategy.reason`が自由記述のみだと、分析のたびにキ�
 機械保証する上限）、reason_categoryの列挙提示（+112字）を追加する余地がないため。新しい
 strategy系フィールドをsystem_prompt側に追加したくなった場合は、まず既存の文字数上限テストで
 残余を確認すること。担保テスト: `tests/test_cycle8_reason_category.py`。
+
+## S2契約発行料は`baseline_v1_s2()`のみ0円へ上書きする（v0.8 D1・サイクル8.1）
+
+`doc/analysis/prompt_engine_audit_20260829.md`§1で「発行料は提案実行時に即時徴収され、
+未署名のまま失効しても返還されない」実挙動を確定した上で、v0.8はS2ルールとして発行料自体を
+廃止する決定（D1）をした。実装は`GameConfig.baseline_v1_s2()`のプリセット辞書に
+`contract_fee: 0`を追加するのみで、徴収コード（`engine/game.py`のcontract_propose処理）と
+検証コード（`engine/actions.py`のFree Cashチェック）はどちらも削除していない。`default_20()`等
+S2以外のプリセットはクラス既定値（100,000）のまま変わらないため、発行料ありの旧挙動を確認する
+既存テスト（`tests/test_acceptance.py::test_15`）は無改修で残る。新設定の挙動は
+`tests/test_s2_rules.py::TestS2Integration::test_s2_contract_propose_free`が担保する。
+
+## 前R倍掛け預託の解決はSettlement内・Market Settlementの直後に行う（v0.8 D2・サイクル8.1）
+
+`doc/analysis/prompt_engine_audit_20260829.md`§10で、前R倍掛け預託の解決（成功→2倍払出/
+失敗→没収）が`execute_settlement()`の**外**（`game._process_double_up()`Step1、Settlement
+呼び出しの前後どちらでもない独立処理）で行われており、その払出が同一Rの型A履行判定用
+スナップショット（`engine/settlement.py`のStep4相当）に反映されないことを確定した。v0.8 D2で
+この解決ロジックを`engine.settlement.resolve_double_up_deposits()`として切り出し、
+`execute_settlement()`内部・Market Settlement直後／型B監査の前に呼ぶよう変更した。これにより
+「前Rの倍掛けが成功して増えた現金を、同じRの型A契約の支払原資に充てる」という設計意図どおりの
+順序になった。今Rの新規勝者へのTAKE/DOUBLE提示と預託金の天引き（Step2相当）はSettlement**後**
+のまま変更していない（提示にはSettlement結果が要るため順序を変えられない）。`game.py`側の
+`_process_double_up()`はStep2（提示・天引き）のみを残し、Step1は削除。旧テストで
+`game._process_double_up(round_num, results)`を直接呼んでいた箇所は
+`settlement_ops.resolve_double_up_deposits(players, results, deposits, round_num, logger)`へ
+移行済み（`tests/test_s2_rules.py`）。**未完了**: 「払出が同Rの型A支払原資になる」ケースの
+統合テスト（`tests/test_atomic.py`等）は本サイクルでは未追加。次サイクルで追加すること。
+
+## 契約terms検証はvalidate段階で行い、P2防御層のValueError捕捉に頼らない（v0.8 D6・サイクル8.1）
+
+`doc/analysis/prompt_engine_audit_20260829.md`§3・§7で、`contract_propose`の`round_num`
+（過去R指定可）・`with_players`外の`obligor`/`counterparty`・存在しない`market_id`・
+負/0の`amount`がいずれも無検証で受理されることを確定した。特に過去R指定は、成立直後から
+`can_cancel_contract()`の「未到来義務なし」判定に引っかかり**永久に解除できない契約**を
+生む致命的な罠だった。v0.8 D6で`ContractProposeAction.validate()`に検証を追加し、
+不正なterms/round_num/market_id/amountはvalidate段階で`ActionResult(False, 理由)`として
+不成立にする（アクション枠は消費、理由は`my_failed_actions`に載る。発行料は返還されない）。
+`type_b_card`の`card_rank`検証（`engine/contracts.py`側、別名正規化含む）は変更していない。
+担保テスト: `tests/test_contract_terms_validation.py`。

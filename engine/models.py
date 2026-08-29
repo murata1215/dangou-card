@@ -335,12 +335,20 @@ class ContractStatus(str, Enum):
     """全義務履行済み（未使用: 代入箇所なし。rules/project.md参照）"""
 
     EXPIRED = "expired"
-    """全義務失効済み（未使用: 代入箇所なし。rules/project.md参照）"""
+    """署名成立前に失効（v0.8 D5）。PROPOSEDのまま提案ラウンド終了、または署名前に
+    当事者が脱落した場合に遷移する。PROPOSEDからの遷移先（ACTIVEには一度もならない）。"""
 
     CANCELLED = "cancelled"
-    """全当事者合意による解除済み（§6・contract_cancel）。ACTIVEからの唯一の実遷移先。
-    義務が1件でも履行/違反/監査済み（round_num < 現在R）になった契約は解除できない
-    （engine/contracts.py の can_cancel_contract() が導出、永続フラグは持たない）。"""
+    """全当事者合意による解除済み（§6・contract_cancel）。ACTIVEからの遷移先の一つ。
+    解除成立時点で「未到来（round_num >= 現在R）・未履行・未失効」だった義務のみを
+    失効させる（履行済み・監査済みの義務はロールバックしない）。1件以上の未到来義務が
+    存在する契約のみ解除可能（engine/contracts.py の can_cancel_contract() が導出）。"""
+
+    CLOSED = "closed"
+    """未到来の残存義務がゼロになったACTIVE契約の終端ステータス（v0.8 I1）。
+    全義務が履行済み・失効済み（監査済み含む）になった「ゾンビ契約」を畳むために使う。
+    ACTIVEからの遷移先の一つ（engine/contracts.py の
+    close_contracts_without_remaining_obligations() が導出）。"""
 
 
 class Contract(BaseModel):

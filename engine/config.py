@@ -303,4 +303,7 @@ class GameConfig(BaseModel):
             "card_trade_enabled": True,
             "memory_enabled": True,
             "final_reflection_enabled": True,
+            # v0.8 D1: 契約発行料を無料化。デフォルト(100,000)は温存し、
+            # S2プリセットでのみ0円に上書きする。
+            "contract_fee": 0,
         })

@@ -1506,7 +1506,10 @@ def test_phase2_core18_reservations_cover_model_overrides_and_flag_h4_cap_gap():
     # Cycle 6.1（2026-08-27）: H4/M4のhidden_thinking_reserve_tokens引き上げ
     # （H4 1536→9728, M4 1024→2560）でCORE_18予約合計が$0.24067398→$0.37276999に増加。
     # max_cost引き上げ($0.25→$0.40)により sum(...) <= max_cost は引き続き真。H1は無関係のため不変。
-    assert reservations["H1"] == pytest.approx(0.031845, abs=1e-12)
+    # Cycle 8.1（2026-08-29）: v0.8 D1で契約発行料をbaseline_v1_s2のみ0円化した結果、
+    # system prompt内「発行料{N}万円」表示が10→0になりsystem prompt長が7,079→7,076字に
+    # 減少（3文字減）。H1予約額が$0.031845→$0.03184へ微減したため五度目の期待値更新。
+    assert reservations["H1"] == pytest.approx(0.03184, abs=1e-12)
     for key in ("H1", "H2", "H4"):
         assert reservations[key] > 0.02
         if key != "H4":

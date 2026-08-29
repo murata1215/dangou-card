@@ -78,7 +78,8 @@ class TestCanCancelContract:
         ok, reason = contract_ops.can_cancel_contract(c, round_num=5)
         assert ok is True
 
-    def test_fulfilled_obligation_blocks(self):
+    def test_fulfilled_obligation_only_blocks(self):
+        """唯一の義務が履行済み（過去）→ 残存する未到来義務がないため解除不可（v0.8 D4）"""
         ob = Obligation(
             obligation_id="C1_OB01", contract_id="C1", obligor="P01", counterparty="P02",
             ob_type=ObligationType.TYPE_A_PAYMENT, round_num=5, details={"amount": 1},
@@ -87,9 +88,10 @@ class TestCanCancelContract:
         c = make_contract("C1", "P01", ["P01", "P02"], [ob])
         ok, reason = contract_ops.can_cancel_contract(c, round_num=6)
         assert ok is False
-        assert "fulfilled" in reason
+        assert "no remaining future obligations" in reason
 
-    def test_expired_obligation_blocks(self):
+    def test_expired_obligation_only_blocks(self):
+        """唯一の義務が失効済み → 残存する未到来義務がないため解除不可（v0.8 D4）"""
         ob = Obligation(
             obligation_id="C1_OB01", contract_id="C1", obligor="P01", counterparty="P02",
             ob_type=ObligationType.TYPE_B_MARKET, round_num=5, details={"market_id": "M01"},
@@ -98,16 +100,43 @@ class TestCanCancelContract:
         c = make_contract("C1", "P01", ["P01", "P02"], [ob])
         ok, reason = contract_ops.can_cancel_contract(c, round_num=6)
         assert ok is False
-        assert "expired" in reason
+        assert "no remaining future obligations" in reason
 
-    def test_type_b_normal_fulfillment_blocks_via_round_num(self):
-        """型B義務は正常履行でもis_fulfilledが立たない。round_num<現在Rで捕捉する"""
+    def test_type_b_normal_fulfillment_only_blocks_via_round_num(self):
+        """型B義務は正常履行でもis_fulfilledが立たないが、round_num<現在Rなら
+        「未到来」に該当せず残存義務なしとして解除不可になる（v0.8 D4）"""
         ob = make_obligation("C1_OB01", "C1", "P01", "P02", ObligationType.TYPE_B_CARD, round_num=5,
                               details={"card_rank": "ONE_PAIR"})
         c = make_contract("C1", "P01", ["P01", "P02"], [ob])
         ok, reason = contract_ops.can_cancel_contract(c, round_num=6)
         assert ok is False
-        assert "audited" in reason
+        assert "no remaining future obligations" in reason
+
+    def test_fulfilled_past_plus_future_obligation_cancellable(self):
+        """R5履行済み義務 + R9未到来義務 → 未到来義務が残っているため解除可（v0.8 D4）"""
+        ob1 = Obligation(
+            obligation_id="C1_OB01", contract_id="C1", obligor="P01", counterparty="P02",
+            ob_type=ObligationType.TYPE_A_PAYMENT, round_num=5, details={"amount": 1},
+            is_fulfilled=True,
+        )
+        ob2 = make_obligation("C1_OB02", "C1", "P01", "P02", ObligationType.TYPE_A_PAYMENT, round_num=9)
+        c = make_contract("C1", "P01", ["P01", "P02"], [ob1, ob2])
+        ok, reason = contract_ops.can_cancel_contract(c, round_num=6)
+        assert ok is True
+        assert reason is None
+
+    def test_no_future_obligations_blocks(self):
+        """全義務が未到来でない（過去・履行済み・失効済み） → 解除不可（v0.8 D4）"""
+        ob1 = Obligation(
+            obligation_id="C1_OB01", contract_id="C1", obligor="P01", counterparty="P02",
+            ob_type=ObligationType.TYPE_A_PAYMENT, round_num=3, details={"amount": 1},
+            is_fulfilled=True,
+        )
+        ob2 = make_obligation("C1_OB02", "C1", "P01", "P02", ObligationType.TYPE_A_PAYMENT, round_num=4)
+        c = make_contract("C1", "P01", ["P01", "P02"], [ob1, ob2])
+        ok, reason = contract_ops.can_cancel_contract(c, round_num=6)
+        assert ok is False
+        assert "no remaining future obligations" in reason
 
     def test_type_b_violated_blocks(self):
         ob = Obligation(
@@ -133,14 +162,15 @@ class TestCanCancelContract:
         assert ok is False
         assert "not active" in reason
 
-    def test_mixed_past_and_future_obligations_blocks_whole_contract(self):
-        """R3済み義務+R5未到来義務の混在契約は、契約全体が解除不可(単位は契約)"""
+    def test_mixed_past_and_future_obligations_cancellable(self):
+        """R3済み義務+R5未到来義務の混在契約は、未到来義務が残っているため解除可
+        （v0.8 D4: 判定は契約単位だが「1件でも未到来義務があれば可」に変更）"""
         ob1 = make_obligation("C1_OB01", "C1", "P01", "P02", ObligationType.TYPE_A_PAYMENT, round_num=3)
         ob2 = make_obligation("C1_OB02", "C1", "P01", "P02", ObligationType.TYPE_A_PAYMENT, round_num=5)
         c = make_contract("C1", "P01", ["P01", "P02"], [ob1, ob2])
         ok, reason = contract_ops.can_cancel_contract(c, round_num=4)
-        assert ok is False
-        assert "audited" in reason
+        assert ok is True
+        assert reason is None
 
 
 # =============================================================================
@@ -245,7 +275,7 @@ class TestSettlementIntegration:
         market = make_market("M01", 1_000_000)
         logger = EventLogger()
 
-        players, contracts, _, _, _ = execute_settlement(
+        players, contracts, _, _, _, _ = execute_settlement(
             players, [market], commits, [c], [], round_num=3,
             config=GameConfig.baseline_v1(2), logger=logger,
         )
@@ -266,7 +296,7 @@ class TestSettlementIntegration:
         market = make_market("M01", 1_000_000)
         logger = EventLogger()
 
-        players, contracts, _, _, _ = execute_settlement(
+        players, contracts, _, _, _, _ = execute_settlement(
             players, [market], commits, [c], [], round_num=3,
             config=GameConfig.baseline_v1(2), logger=logger,
         )
@@ -289,7 +319,7 @@ class TestSettlementIntegration:
         logger = EventLogger()
         p02_cash_before = players["P02"].cash
 
-        players, contracts, _, _, _ = execute_settlement(
+        players, contracts, _, _, _, _ = execute_settlement(
             players, [market], commits, [c], [], round_num=3,
             config=GameConfig.baseline_v1(2), logger=logger,
         )
@@ -326,7 +356,7 @@ class TestSettlementIntegration:
         market = make_market("M01", 1_000_000)
         logger = EventLogger()
 
-        players, contracts, _, _, _ = execute_settlement(
+        players, contracts, _, _, _, _ = execute_settlement(
             players, [market], commits, [c_old, c_new], [], round_num=3,
             config=GameConfig.baseline_v1(2), logger=logger,
         )
@@ -347,9 +377,11 @@ class TestReCheckAtFinalConsent:
         assert cancelled is False
 
         # R4時点で最終同意前に再チェック（validate_actionが行う）
+        # 唯一の義務がR3で未到来でなくなった（round_num=3 < 現在R=4）ため、
+        # 残存する未到来義務がなく解除不可（v0.8 D4）
         ok, reason = contract_ops.can_cancel_contract(c, round_num=4)
         assert ok is False
-        assert "audited" in reason
+        assert "no remaining future obligations" in reason
 
     def test_contract_stays_active_not_silently_removed(self):
         ob = make_obligation("C1_OB01", "C1", "P01", "P02", ObligationType.TYPE_A_PAYMENT, round_num=3)
@@ -431,7 +463,7 @@ class TestValidateActionContractCancel:
             action, players["P01"], GameConfig.baseline_v1(2), players, round_num=6, contracts=[contract],
         )
         assert result.success is False
-        assert "fulfilled" in result.reason
+        assert "no remaining future obligations" in result.reason
 
     def test_expired_obligation(self):
         ob = Obligation(
@@ -446,7 +478,7 @@ class TestValidateActionContractCancel:
             action, players["P01"], GameConfig.baseline_v1(2), players, round_num=6, contracts=[contract],
         )
         assert result.success is False
-        assert "expired" in result.reason
+        assert "no remaining future obligations" in result.reason
 
     def test_double_consent(self):
         contract, players = self._setup()

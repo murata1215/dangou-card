@@ -8,12 +8,18 @@ Cycle 8 修正1: 倍掛け単独市場除外のログ記録テスト
 
 判定ロジック（成功/没収の分岐そのもの、§6.2ゲート）は無変更であることを
 「払戻額・没収額が従来どおり」というアサーションで担保する（賞金回帰ガード）。
+
+v0.8 D2: 解決ロジックは game._process_double_up() から
+engine.settlement.resolve_double_up_deposits() へ移設された
+（execute_settlement()内部・Step2直後で呼ばれる）。このテストは
+移設後の関数を直接呼んで検証する。
 """
 
 from engine.config import GameConfig
 from engine.models import Card, CardRank, DoubleUpDeposit, MarketCommit, MarketResult
 from engine.game import Game
 from engine.events import EventLogger
+from engine import settlement as settlement_ops
 from tests.test_s2_rules import _make_bot_agents
 
 
@@ -67,7 +73,7 @@ class TestDoubleUpOutcomeReasonNonSoloWin:
         game.double_up_deposits.append(dep)
 
         results = [_make_market_result("M01", "P01", 500_000, 3)]
-        game._process_double_up(2, results)
+        settlement_ops.resolve_double_up_deposits(game.players, results, game.double_up_deposits, 2, game.logger)
 
         assert dep.resolved is True
         assert dep.success is True
@@ -101,7 +107,7 @@ class TestDoubleUpOutcomeReasonSoloOnlyWin:
             _make_market_result("M02", "P02", 100_000, 1),  # 別プレイヤーのソロ
         ]
         cash_before = game.players["P01"].cash
-        game._process_double_up(2, results)
+        settlement_ops.resolve_double_up_deposits(game.players, results, game.double_up_deposits, 2, game.logger)
 
         assert dep.resolved is True
         assert dep.success is False
@@ -130,7 +136,7 @@ class TestDoubleUpOutcomeReasonNoWin:
 
         results = [_make_market_result("M01", "P02", 500_000, 3)]
         cash_before = game.players["P01"].cash
-        game._process_double_up(2, results)
+        settlement_ops.resolve_double_up_deposits(game.players, results, game.double_up_deposits, 2, game.logger)
 
         assert dep.resolved is True
         assert dep.success is False
@@ -160,7 +166,7 @@ class TestDoubleUpOutcomeReasonEliminated:
 
         # 脱落済みなら勝敗にかかわらず没収（非単独市場で勝っていても没収）
         results = [_make_market_result("M01", "P01", 500_000, 3)]
-        game._process_double_up(2, results)
+        settlement_ops.resolve_double_up_deposits(game.players, results, game.double_up_deposits, 2, game.logger)
 
         assert dep.resolved is True
         assert dep.success is False

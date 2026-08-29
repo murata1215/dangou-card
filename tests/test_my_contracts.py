@@ -380,3 +380,59 @@ class TestC90159021ScenarioReproduction:
         assert "残っている義務はありません" in prompt
         # 記憶ブロックにも契約優先の注記が出ている
         assert "あなたが当事者の正式契約" in prompt.split("## あなたの記憶")[1].split("##")[0]
+
+
+# =====================================================================
+# D. v0.8 I1: ゾンビ契約のCLOSED化
+# =====================================================================
+
+class TestZombieContractClosed:
+    def test_counterparty_eliminated_no_remaining_obligations_closes_contract(self):
+        """相手が脱落し残存義務ゼロになったACTIVE契約は、
+        close_contracts_without_remaining_obligations() 後にCLOSEDへ遷移し、
+        my_contracts から消える（v0.8 I1）"""
+        from engine import contracts as contract_ops
+
+        game = _make_game()
+        game.contracts = [_c90159021_contract()]
+        _eliminate(game, "P09", 6, "contract_violation")
+        game.contracts = elim_ops.expire_obligations_for_player("P09", game.contracts)
+        # ここまでは既存挙動（ACTIVEのまま・my_contractsに残る）と同じ
+        assert game.contracts[0].status == ContractStatus.ACTIVE
+
+        # v0.8 I1: Settlement/Finance末に呼ばれるゾンビ契約整理を明示的に実行
+        game.contracts = contract_ops.close_contracts_without_remaining_obligations(
+            game.contracts, round_num=12,
+        )
+        assert game.contracts[0].status == ContractStatus.CLOSED
+
+        state = game._build_visible_state(12, for_player_id="P03")
+        assert state["my_contracts"] == []
+
+    def test_closed_shown_in_contracts_public_raw_status(self):
+        """CLOSEDはcontracts_publicには生ステータス文字列のまま残る（v0.8 I1）"""
+        from engine import contracts as contract_ops
+
+        game = _make_game()
+        game.contracts = [_c90159021_contract()]
+        _eliminate(game, "P09", 6, "contract_violation")
+        game.contracts = elim_ops.expire_obligations_for_player("P09", game.contracts)
+        game.contracts = contract_ops.close_contracts_without_remaining_obligations(
+            game.contracts, round_num=12,
+        )
+
+        state = game._build_visible_state(12, for_player_id="P03")
+        public = [c for c in state["contracts_public"] if c["contract_id"] == "C_90159021"]
+        assert len(public) == 1
+        assert public[0]["status"] == "closed"
+
+    def test_active_contract_with_future_obligation_not_closed(self):
+        """未到来義務が残るACTIVE契約はCLOSEDにならない（回帰防止）"""
+        from engine import contracts as contract_ops
+
+        game = _make_game()
+        game.contracts = [_c90159021_contract()]
+        game.contracts = contract_ops.close_contracts_without_remaining_obligations(
+            game.contracts, round_num=1,
+        )
+        assert game.contracts[0].status == ContractStatus.ACTIVE

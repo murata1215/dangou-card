@@ -11,6 +11,7 @@ from engine.models import (
     Market, MarketCommit, MarketResult, Card, CardRank, PlayerState, DoubleUpDeposit,
 )
 from engine import market as market_ops
+from engine import settlement as settlement_ops
 from engine.game import Game, GameResult
 from engine.events import EventLogger
 from engine.negotiation import StubAgent
@@ -279,7 +280,12 @@ class TestDoubleUp:
 
 
 class TestDoubleUpSoloExclusion:
-    """倍掛け成功判定からのソロ市場除外テスト（§6.2）"""
+    """倍掛け成功判定からのソロ市場除外テスト（§6.2）
+
+    v0.8 D2: 前ラウンド預託の解決ロジックは game._process_double_up() から
+    engine.settlement.resolve_double_up_deposits() へ移設された（execute_settlement()
+    内部・Step2直後で呼ばれる）。このテストは移設後の関数を直接呼んで検証する。
+    """
 
     def _make_game_with_player(self, player_id: str = "P01") -> Game:
         """プレイヤーが初期化済みの Game を作成"""
@@ -320,7 +326,7 @@ class TestDoubleUpSoloExclusion:
         game.double_up_deposits.append(dep)
 
         results = [self._make_market_result("M01", "P01", 500_000, 1)]
-        game._process_double_up(2, results)
+        settlement_ops.resolve_double_up_deposits(game.players, results, game.double_up_deposits, 2, game.logger)
 
         assert dep.resolved is True
         assert dep.success is False, "ソロ市場のみでの賞金獲得は倍掛け失敗すべき"
@@ -335,7 +341,7 @@ class TestDoubleUpSoloExclusion:
         game.double_up_deposits.append(dep)
 
         results = [self._make_market_result("M01", "P01", 500_000, 3)]
-        game._process_double_up(2, results)
+        settlement_ops.resolve_double_up_deposits(game.players, results, game.double_up_deposits, 2, game.logger)
 
         assert dep.resolved is True
         assert dep.success is True, "複数人市場での賞金獲得は倍掛け成功すべき"
@@ -353,7 +359,7 @@ class TestDoubleUpSoloExclusion:
             self._make_market_result("M01", "P01", 300_000, 1),  # ソロ
             self._make_market_result("M02", "P01", 200_000, 2),  # 複数人
         ]
-        game._process_double_up(2, results)
+        settlement_ops.resolve_double_up_deposits(game.players, results, game.double_up_deposits, 2, game.logger)
 
         assert dep.resolved is True
         assert dep.success is True, "複数人市場で獲得があれば成功すべき"
@@ -373,7 +379,7 @@ class TestDoubleUpSoloExclusion:
             self._make_market_result("M02", "P01", 200_000, 1),  # ソロ
             self._make_market_result("M03", "P02", 100_000, 1),  # 別プレイヤー
         ]
-        game._process_double_up(2, results)
+        settlement_ops.resolve_double_up_deposits(game.players, results, game.double_up_deposits, 2, game.logger)
 
         assert dep.resolved is True
         assert dep.success is False, "全市場ソロでは倍掛け失敗すべき"
@@ -388,7 +394,7 @@ class TestDoubleUpSoloExclusion:
         game.double_up_deposits.append(dep)
 
         results = [self._make_market_result("M01", "P02", 500_000, 3)]
-        game._process_double_up(2, results)
+        settlement_ops.resolve_double_up_deposits(game.players, results, game.double_up_deposits, 2, game.logger)
 
         assert dep.resolved is True
         assert dep.success is False
@@ -467,6 +473,30 @@ class TestS2Integration:
         assert c2.survival_cash == 2_000_000
         assert c2.mandatory_repay_enabled is True
         assert c2.card_trade_enabled is True
+        assert c2.contract_fee == 0  # v0.8 D1: 契約発行料を無料化
+
+    def test_s2_contract_propose_free(self):
+        """v0.8 D1: baseline_v1_s2では契約提案でcashが減らない"""
+        from engine.models import ContractProposeAction
+        from engine import actions as action_ops
+        from tests.conftest import make_player
+
+        config = GameConfig.baseline_v1_s2(num_players=4)
+        p01 = make_player("P01", cash=0, debt=0)
+        p02 = make_player("P02", cash=0, debt=0)
+        players = {"P01": p01, "P02": p02}
+
+        action = ContractProposeAction(
+            player_id="P01",
+            with_players=["P02"],
+            terms=[{
+                "obligor": "P01", "counterparty": "P02",
+                "ob_type": "type_a_payment", "round_num": 5,
+                "details": {"amount": 100_000},
+            }],
+        )
+        result = action_ops.validate_action(action, p01, config, players, round_num=1)
+        assert result.success
 
 
 # === ヘルパー ===

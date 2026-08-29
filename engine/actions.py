@@ -13,10 +13,12 @@ from engine.models import (
     AnonymousBroadcastAction,
     BountyPostAction, BountyCancelAction, TransferAction, RepayAction,
     PassAction, CardTradeProposeAction, CardTradeAcceptAction, CardTradeRejectAction,
-    PlayerState, CardRank, Contract, ContractStatus,
+    PlayerState, CardRank, Contract, ContractStatus, ObligationType,
 )
 from engine.config import GameConfig
-from engine.contracts import can_cancel_contract
+from engine.contracts import (
+    can_cancel_contract, normalize_type_b_card_details, validate_type_b_card_details,
+)
 
 
 class ActionResult:
@@ -122,6 +124,69 @@ def validate_action(
             target = players.get(target_pid)
             if target is None or not target.is_alive:
                 return ActionResult(False, f"Counterparty {target_pid} is not alive")
+
+        # v0.8 D6: terms検証。silent脱落トラップ（実行時例外での不成立）を避け、
+        # ここでActionResult(False, reason)として明示的に不成立を返す。
+        if not action.with_players:
+            return ActionResult(False, "with_players must not be empty")
+        if action.player_id in action.with_players:
+            return ActionResult(False, "with_players must not include the proposer")
+        if len(set(action.with_players)) != len(action.with_players):
+            return ActionResult(False, "with_players must not contain duplicates")
+
+        parties = {action.player_id, *action.with_players}
+        valid_market_ids = {f"M{i+1:02d}" for i in range(config.num_markets)}
+
+        if not action.terms:
+            return ActionResult(False, "terms must not be empty")
+
+        for term in action.terms:
+            obligor = term.get("obligor")
+            counterparty = term.get("counterparty")
+            ob_type = term.get("ob_type")
+            term_round = term.get("round_num")
+            details = dict(term.get("details", {}))
+
+            if obligor not in parties:
+                return ActionResult(False, f"obligor {obligor!r} is not a party of this contract")
+            if counterparty not in parties:
+                return ActionResult(
+                    False, f"counterparty {counterparty!r} is not a party of this contract",
+                )
+            if obligor == counterparty:
+                return ActionResult(False, "obligor and counterparty must differ")
+
+            if not isinstance(term_round, int) or isinstance(term_round, bool):
+                return ActionResult(False, f"round_num must be an int, got {term_round!r}")
+            if not (round_num <= term_round <= config.num_rounds):
+                return ActionResult(
+                    False,
+                    f"round_num {term_round} is out of range "
+                    f"({round_num}..{config.num_rounds})",
+                )
+
+            if ob_type == ObligationType.TYPE_A_PAYMENT.value:
+                amount = details.get("amount")
+                if not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0:
+                    return ActionResult(
+                        False, f"type_a_payment amount must be a positive int, got {amount!r}",
+                    )
+            elif ob_type in (
+                ObligationType.TYPE_B_MARKET.value, ObligationType.TYPE_B_NO_MARKET.value,
+            ):
+                market_id = details.get("market_id")
+                if market_id not in valid_market_ids:
+                    return ActionResult(
+                        False, f"Invalid market_id: {market_id!r} (valid: {sorted(valid_market_ids)})",
+                    )
+            elif ob_type == ObligationType.TYPE_B_CARD.value:
+                details = normalize_type_b_card_details(details)
+                error = validate_type_b_card_details(details)
+                if error is not None:
+                    return ActionResult(False, error)
+            else:
+                return ActionResult(False, f"Unknown ob_type: {ob_type!r}")
+
         return ActionResult(True)
 
     if isinstance(action, ContractSignAction):
