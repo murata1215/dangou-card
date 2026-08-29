@@ -410,6 +410,78 @@ def is_obligation_pending(ob: Obligation, round_num: int) -> bool:
     return ob.round_num >= round_num and not ob.is_fulfilled and not ob.is_expired
 
 
+def count_committed_type_b_cards(
+    contracts: list["Contract"],
+    player_id: str,
+    card_rank_name: str,
+    round_num: int,
+) -> int:
+    """
+    ACTIVE契約の type_b_card 義務のうち、player_id が義務者で当該ランクの
+    カードを使う「未到来・未履行・未失効」なものを数える（v0.8 D8）
+
+    PROPOSED（未署名）契約の義務は数えない——署名前は当人を拘束しないため。
+    get_active_type_b_obligations（round_num完全一致・Settlement Step3専用）は
+    流用しない。E8は「将来Rの義務も拘束する」必要があり、条件を広げると
+    型B監査の意味が変わってしまうため、is_obligation_pending を再利用する。
+
+    Args:
+        contracts: 全契約リスト
+        player_id: 検査対象のプレイヤーID（義務者）
+        card_rank_name: カードランク名（例: "HIGH_CARD"）
+        round_num: 現在のラウンド番号
+
+    Returns:
+        当該ランクを拘束している義務の件数
+    """
+    count = 0
+    for contract in contracts:
+        if contract.status != ContractStatus.ACTIVE:
+            continue
+        for ob in contract.obligations:
+            if (ob.obligor == player_id
+                    and ob.ob_type == ObligationType.TYPE_B_CARD
+                    and ob.details.get("card_rank") == card_rank_name
+                    and is_obligation_pending(ob, round_num)):
+                count += 1
+    return count
+
+
+def is_card_tradable(
+    contracts: list["Contract"] | None,
+    player: PlayerState,
+    card_rank_name: str,
+    round_num: int,
+) -> bool:
+    """
+    指定ランクのカードを1枚トレードで手放してよいか判定する（v0.8 D8）
+
+    手札の当該ランク枚数が拘束枚数（count_committed_type_b_cards）を上回るなら
+    1枚は手放せる。ONE_PAIR/HIGH_CARDのように2枚持ちで義務が1件なら1枚は可。
+
+    Args:
+        contracts: 全契約リスト（None/空なら検証をスキップしTrueを返す。
+            呼び出し側の責務——このモジュールはランク名の妥当性を検証しない）
+        player: 手放そうとしているプレイヤーの状態
+        card_rank_name: 手放そうとしているカードランク名
+        round_num: 現在のラウンド番号
+
+    Returns:
+        手放してよいならTrue
+    """
+    if not contracts:
+        return True
+    try:
+        rank = CardRank[card_rank_name]
+    except KeyError:
+        return True
+    hand_count = sum(1 for c in player.hand if c.rank == rank)
+    committed = count_committed_type_b_cards(
+        contracts, player.player_id, card_rank_name, round_num,
+    )
+    return hand_count > committed
+
+
 def can_cancel_contract(
     contract: Contract,
     round_num: int,

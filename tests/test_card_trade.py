@@ -378,15 +378,32 @@ class TestBroadcastProposal:
         p03_proposal = next(tp for tp in proposals if tp.with_player == "P03")
         assert p03_proposal.status == CardTradeStatus.EXPIRED
 
-    def test_broadcast_counts_as_one_action(self):
-        """ブロードキャスト1回＝1枠"""
+    def test_propose_does_not_consume_trade_slot(self):
+        """v0.8 E7: 提案だけでは枠を消費しない（成立ベースに変更）"""
         game = self._make_game()
         action = CardTradeProposeAction(
             player_id="P01", with_players=["P02", "P03", "P04"],
             give_card="HIGH_CARD", receive_card="HIGH_CARD",
         )
         game._execute_negotiation_action_inner(action, "P01", 1, 1)
+        assert game._trade_counts["P01"] == 0
+
+    def test_accept_consumes_both_slots(self):
+        """v0.8 E7: 受諾成立で提案者・受諾者の双方が枠を消費する"""
+        game = self._make_game()
+        action = CardTradeProposeAction(
+            player_id="P01", with_players=["P02", "P03", "P04"],
+            give_card="HIGH_CARD", receive_card="HIGH_CARD",
+        )
+        game._execute_negotiation_action_inner(action, "P01", 1, 1)
+        assert game._trade_counts["P01"] == 0
+
+        p02_proposal = next(tp for tp in game.trade_proposals if tp.with_player == "P02")
+        accept = CardTradeAcceptAction(player_id="P02", trade_id=p02_proposal.trade_id)
+        game._execute_negotiation_action_inner(accept, "P02", 1, 1)
+
         assert game._trade_counts["P01"] == 1
+        assert game._trade_counts["P02"] == 1
 
 
 class TestRejectAction:
@@ -436,6 +453,356 @@ class TestRejectAction:
         game._execute_negotiation_action_inner(accept, "P02", 1, 3)
         # status は REJECTED のまま（ACCEPTED にならない）
         assert tp.status == CardTradeStatus.REJECTED
+
+    def test_reject_notifies_proposer(self):
+        """v0.8 E10: 拒否は提案者へ trade_rejected 通知が届く"""
+        game = self._make_game_with_proposal()
+        tp = game.trade_proposals[0]
+        reject = CardTradeRejectAction(player_id="P02", trade_id=tp.trade_id)
+        game._execute_negotiation_action_inner(reject, "P02", 1, 2)
+
+        notices = game._contract_notices.get("P01", [])
+        matches = [n for n in notices if n["kind"] == "trade_rejected"]
+        assert len(matches) == 1
+        assert matches[0]["trade_id"] == tp.trade_id
+        assert matches[0]["with_player"] == "P02"
+
+
+class TestSelfTradeProhibition:
+    """v0.8 G1: 自己トレード禁止（E7で提案が枠を消費しなくなり自己受諾が
+    到達可能になったための必須の防御）"""
+
+    def _make_players(self):
+        return {
+            "P01": make_player("P01", cash=5_000_000, debt=3_000_000),
+            "P02": make_player("P02", cash=5_000_000, debt=3_000_000),
+        }
+
+    def _make_config(self):
+        return GameConfig.baseline_v1(8).model_copy(update={"card_trade_enabled": True})
+
+    def _make_game(self):
+        config = GameConfig.baseline_v1_s2(8)
+        agents = {f"P{i+1:02d}": StubAgent() for i in range(8)}
+        logger = EventLogger()
+        game = Game(config=config, agents=agents, seed=42, logger=logger)
+        game._setup()
+        game._phase_market_open(1)
+        game._trade_counts = {pid: 0 for pid in game.players}
+        return game
+
+    def test_self_only_target_rejected_by_validation(self):
+        """自分1人だけが宛先 → validate_action で不成立"""
+        players = self._make_players()
+        action = CardTradeProposeAction(
+            player_id="P01", with_players=["P01"],
+            give_card="HIGH_CARD", receive_card="HIGH_CARD",
+        )
+        result = action_ops.validate_action(
+            action, players["P01"], self._make_config(), players, round_num=1,
+        )
+        assert not result.success
+        assert "yourself" in result.reason.lower()
+
+    def test_broadcast_with_self_mixed_still_valid(self):
+        """自分を含むブロードキャストでも、自分以外の宛先がいれば成立する"""
+        players = self._make_players()
+        action = CardTradeProposeAction(
+            player_id="P01", with_players=["P01", "P02"],
+            give_card="HIGH_CARD", receive_card="HIGH_CARD",
+        )
+        result = action_ops.validate_action(
+            action, players["P01"], self._make_config(), players, round_num=1,
+        )
+        assert result.success
+
+    def test_self_target_skipped_at_apply(self):
+        """apply層: 自分宛のみのブロードキャストは提案が1件も生成されない"""
+        game = self._make_game()
+        action = CardTradeProposeAction(
+            player_id="P01", with_players=["P01"],
+            give_card="HIGH_CARD", receive_card="HIGH_CARD",
+        )
+        game._execute_negotiation_action_inner(action, "P01", 1, 1)
+        assert game.trade_proposals == []
+
+    def test_broadcast_self_mixed_skips_only_self_at_apply(self):
+        """apply層: 自分を含むブロードキャストは自分宛だけがスキップされる"""
+        game = self._make_game()
+        action = CardTradeProposeAction(
+            player_id="P01", with_players=["P01", "P02"],
+            give_card="HIGH_CARD", receive_card="HIGH_CARD",
+        )
+        game._execute_negotiation_action_inner(action, "P01", 1, 1)
+        targets = {tp.with_player for tp in game.trade_proposals}
+        assert targets == {"P02"}
+
+    def test_cash_conservation_regression(self):
+        """複製バグ回帰: トレード成立後も全プレイヤーの現金合計が保存される"""
+        game = self._make_game()
+        cash_before = sum(p.cash for p in game.players.values())
+
+        action = CardTradeProposeAction(
+            player_id="P01", with_players=["P02"],
+            give_card="HIGH_CARD", receive_card="FLUSH",
+            cash_amount=100_000,
+        )
+        game._execute_negotiation_action_inner(action, "P01", 1, 1)
+        tp = game.trade_proposals[0]
+        accept = CardTradeAcceptAction(player_id="P02", trade_id=tp.trade_id)
+        game._execute_negotiation_action_inner(accept, "P02", 1, 1)
+
+        cash_after = sum(p.cash for p in game.players.values())
+        assert cash_after == cash_before
+
+
+class TestTradeSlotBasedOnCompletion:
+    """v0.8 E7/E7b: トレード枠は「成立」ベース。提案の失効で枠は消費されず、
+    上限到達で他の未成立提案が掃き寄せ失効する"""
+
+    def _make_game(self):
+        config = GameConfig.baseline_v1_s2(8)
+        agents = {f"P{i+1:02d}": StubAgent() for i in range(8)}
+        logger = EventLogger()
+        game = Game(config=config, agents=agents, seed=42, logger=logger)
+        game._setup()
+        game._phase_market_open(1)
+        game._trade_counts = {pid: 0 for pid in game.players}
+        return game
+
+    def test_expired_proposal_does_not_consume_slot_then_accept_still_works(self):
+        """提案が失効しても枠は消費されず、後続の提案が受諾で成立する"""
+        game = self._make_game()
+        action1 = CardTradeProposeAction(
+            player_id="P01", with_players=["P02"],
+            give_card="HIGH_CARD", receive_card="HIGH_CARD",
+        )
+        game._execute_negotiation_action_inner(action1, "P01", 1, 1)
+        tp1 = game.trade_proposals[0]
+        reject = CardTradeRejectAction(player_id="P02", trade_id=tp1.trade_id)
+        game._execute_negotiation_action_inner(reject, "P02", 1, 2)
+        assert game._trade_counts["P01"] == 0
+
+        action2 = CardTradeProposeAction(
+            player_id="P01", with_players=["P03"],
+            give_card="ONE_PAIR", receive_card="ONE_PAIR",
+        )
+        game._execute_negotiation_action_inner(action2, "P01", 1, 3)
+        tp2 = next(tp for tp in game.trade_proposals if tp.with_player == "P03")
+        accept = CardTradeAcceptAction(player_id="P03", trade_id=tp2.trade_id)
+        game._execute_negotiation_action_inner(accept, "P03", 1, 4)
+
+        assert tp2.status == CardTradeStatus.ACCEPTED
+        assert game._trade_counts["P01"] == 1
+        assert game._trade_counts["P03"] == 1
+
+    def test_success_blocks_further_propose_for_both_parties(self):
+        """成立後は提案者・受諾者ともに新規提案が上限で不成立になる"""
+        game = self._make_game()
+        action1 = CardTradeProposeAction(
+            player_id="P01", with_players=["P02"],
+            give_card="HIGH_CARD", receive_card="HIGH_CARD",
+        )
+        game._execute_negotiation_action_inner(action1, "P01", 1, 1)
+        tp1 = game.trade_proposals[0]
+        accept = CardTradeAcceptAction(player_id="P02", trade_id=tp1.trade_id)
+        game._execute_negotiation_action_inner(accept, "P02", 1, 2)
+        assert game._trade_counts["P01"] == 1
+        assert game._trade_counts["P02"] == 1
+
+        # 提案者P01は新規提案しても apply 側の防御チェックで即 return（提案が作られない）
+        action2 = CardTradeProposeAction(
+            player_id="P01", with_players=["P03"],
+            give_card="ONE_PAIR", receive_card="ONE_PAIR",
+        )
+        game._execute_negotiation_action_inner(action2, "P01", 1, 3)
+        assert not any(tp.with_player == "P03" for tp in game.trade_proposals)
+
+    def test_sibling_supersede_across_offer_ids_when_capped(self):
+        """v0.8 E7b: 同一offer_idでない別提案も、当事者が上限に達したら掃き寄せ失効する"""
+        game = self._make_game()
+        action1 = CardTradeProposeAction(
+            player_id="P01", with_players=["P02"],
+            give_card="HIGH_CARD", receive_card="HIGH_CARD",
+        )
+        game._execute_negotiation_action_inner(action1, "P01", 1, 1)
+        action2 = CardTradeProposeAction(
+            player_id="P01", with_players=["P03"],
+            give_card="ONE_PAIR", receive_card="ONE_PAIR",
+        )
+        game._execute_negotiation_action_inner(action2, "P01", 1, 2)
+
+        tp1 = next(tp for tp in game.trade_proposals if tp.with_player == "P02")
+        tp2 = next(tp for tp in game.trade_proposals if tp.with_player == "P03")
+        assert tp1.offer_id != tp2.offer_id
+
+        accept = CardTradeAcceptAction(player_id="P02", trade_id=tp1.trade_id)
+        game._execute_negotiation_action_inner(accept, "P02", 1, 3)
+
+        assert tp1.status == CardTradeStatus.ACCEPTED
+        assert tp2.status == CardTradeStatus.EXPIRED
+
+        notices = game._contract_notices.get("P01", [])
+        matches = [n for n in notices if n["kind"] == "trade_superseded"]
+        assert len(matches) == 1
+        assert matches[0]["trade_id"] == tp2.trade_id
+        assert matches[0]["accepted_trade_id"] == tp1.trade_id
+
+    def test_failed_funds_notifies_both_parties(self):
+        """v0.8 E10: 受諾時の資金不足EXPIREDは提案者・受諾者の双方に通知される"""
+        game = self._make_game()
+        action = CardTradeProposeAction(
+            player_id="P01", with_players=["P02"],
+            give_card="HIGH_CARD", receive_card="HIGH_CARD",
+            cash_amount=100_000,
+        )
+        game._execute_negotiation_action_inner(action, "P01", 1, 1)
+        tp = game.trade_proposals[0]
+
+        # 提案後に提案者の現金が尽きた状態を模擬（再検証で不成立になる）
+        p01 = game.players["P01"]
+        game.players["P01"] = p01.model_copy(update={"cash": 0})
+
+        accept = CardTradeAcceptAction(player_id="P02", trade_id=tp.trade_id)
+        game._execute_negotiation_action_inner(accept, "P02", 1, 2)
+
+        assert tp.status == CardTradeStatus.EXPIRED
+        p01_notices = [n for n in game._contract_notices.get("P01", []) if n["kind"] == "trade_failed_funds"]
+        p02_notices = [n for n in game._contract_notices.get("P02", []) if n["kind"] == "trade_failed_funds"]
+        assert len(p01_notices) == 1
+        assert len(p02_notices) == 1
+        assert p01_notices[0]["trade_id"] == tp.trade_id
+        assert p02_notices[0]["trade_id"] == tp.trade_id
+
+
+class TestContractCommittedCardNotTradable:
+    """v0.8 E8: 契約で使用予定のカードはトレードできない"""
+
+    def _make_players(self):
+        return {
+            "P01": make_player("P01", cash=5_000_000, debt=3_000_000),
+            "P02": make_player("P02", cash=5_000_000, debt=3_000_000),
+        }
+
+    def _make_config(self):
+        return GameConfig.baseline_v1(8).model_copy(update={"card_trade_enabled": True})
+
+    def _make_contract_with_card_obligation(self, obligor: str, card_rank: str, round_num: int):
+        from engine.models import ObligationType
+        from tests.conftest import make_contract, make_obligation
+        ob = make_obligation("C1_OB01", "C1", obligor, "PXX", ObligationType.TYPE_B_CARD,
+                              round_num=round_num, details={"card_rank": card_rank})
+        return make_contract("C1", obligor, [obligor, "PXX"], [ob])
+
+    def test_propose_blocked_when_only_copy_committed(self):
+        """1枚しか無いランクが契約で拘束されていれば提案不可"""
+        players = self._make_players()
+        p01 = players["P01"].model_copy(update={
+            "hand": [c for c in players["P01"].hand if c.card_id == "HIGH_CARD_1"],
+        })
+        players["P01"] = p01
+        contract = self._make_contract_with_card_obligation("P01", "HIGH_CARD", round_num=5)
+        action = CardTradeProposeAction(
+            player_id="P01", with_players=["P02"],
+            give_card="HIGH_CARD", receive_card="HIGH_CARD",
+        )
+        result = action_ops.validate_action(
+            action, players["P01"], self._make_config(), players, round_num=3,
+            contracts=[contract],
+        )
+        assert not result.success
+        assert "契約" in result.reason
+
+    def test_propose_allowed_when_extra_copy_available(self):
+        """2枚持ちで義務1件なら1枚は提案可能"""
+        players = self._make_players()
+        contract = self._make_contract_with_card_obligation("P01", "HIGH_CARD", round_num=5)
+        action = CardTradeProposeAction(
+            player_id="P01", with_players=["P02"],
+            give_card="HIGH_CARD", receive_card="HIGH_CARD",
+        )
+        result = action_ops.validate_action(
+            action, players["P01"], self._make_config(), players, round_num=3,
+            contracts=[contract],
+        )
+        assert result.success
+
+    def test_propose_allowed_when_obligation_in_past_round(self):
+        """過去Rの義務はブロックしない"""
+        players = self._make_players()
+        p01 = players["P01"].model_copy(update={
+            "hand": [c for c in players["P01"].hand if c.card_id == "HIGH_CARD_1"],
+        })
+        players["P01"] = p01
+        contract = self._make_contract_with_card_obligation("P01", "HIGH_CARD", round_num=2)
+        action = CardTradeProposeAction(
+            player_id="P01", with_players=["P02"],
+            give_card="HIGH_CARD", receive_card="HIGH_CARD",
+        )
+        result = action_ops.validate_action(
+            action, players["P01"], self._make_config(), players, round_num=3,
+            contracts=[contract],
+        )
+        assert result.success
+
+    def test_propose_without_contracts_kwarg_skips_check(self):
+        """contracts 未指定なら E8 検証はスキップされる（後方互換）"""
+        players = self._make_players()
+        p01 = players["P01"].model_copy(update={
+            "hand": [c for c in players["P01"].hand if c.card_id == "HIGH_CARD_1"],
+        })
+        players["P01"] = p01
+        action = CardTradeProposeAction(
+            player_id="P01", with_players=["P02"],
+            give_card="HIGH_CARD", receive_card="HIGH_CARD",
+        )
+        result = action_ops.validate_action(
+            action, players["P01"], self._make_config(), players, round_num=3,
+        )
+        assert result.success
+
+    def test_accept_blocked_when_accepter_card_committed(self):
+        """受諾者の差し出すカードが契約で拘束されていればブロック"""
+        from engine.models import CardTradeProposal
+        players = self._make_players()
+        p02 = players["P02"].model_copy(update={
+            "hand": [c for c in players["P02"].hand if c.card_id == "HIGH_CARD_1"],
+        })
+        players["P02"] = p02
+        contract = self._make_contract_with_card_obligation("P02", "HIGH_CARD", round_num=5)
+        proposal = CardTradeProposal(
+            trade_id="T_e8accept1", offer_id="", proposer="P01", with_player="P02",
+            give_card_rank="FLUSH", receive_card_rank="HIGH_CARD", round_proposed=3,
+        )
+        action = CardTradeAcceptAction(player_id="P02", trade_id=proposal.trade_id)
+        result = action_ops.validate_action(
+            action, players["P02"], self._make_config(), players, round_num=3,
+            contracts=[contract], trade_proposals=[proposal],
+        )
+        assert not result.success
+        assert "契約" in result.reason
+
+    def test_accept_blocked_when_proposer_card_committed(self):
+        """提案者側の渡すカードが契約で拘束されていればブロック（提案者側）"""
+        from engine.models import CardTradeProposal
+        players = self._make_players()
+        p01 = players["P01"].model_copy(update={
+            "hand": [c for c in players["P01"].hand if c.card_id == "HIGH_CARD_1"],
+        })
+        players["P01"] = p01
+        contract = self._make_contract_with_card_obligation("P01", "HIGH_CARD", round_num=5)
+        proposal = CardTradeProposal(
+            trade_id="T_e8accept2", offer_id="", proposer="P01", with_player="P02",
+            give_card_rank="HIGH_CARD", receive_card_rank="FLUSH", round_proposed=3,
+        )
+        action = CardTradeAcceptAction(player_id="P02", trade_id=proposal.trade_id)
+        result = action_ops.validate_action(
+            action, players["P02"], self._make_config(), players, round_num=3,
+            contracts=[contract], trade_proposals=[proposal],
+        )
+        assert not result.success
+        assert "契約" in result.reason
+        assert "提案者側" in result.reason
 
 
 class TestRoundEndExpiration:

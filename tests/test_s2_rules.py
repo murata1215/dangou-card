@@ -9,6 +9,8 @@ import pytest
 from engine.config import GameConfig
 from engine.models import (
     Market, MarketCommit, MarketResult, Card, CardRank, PlayerState, DoubleUpDeposit,
+    ObligationType,
+    CardTradeProposeAction, CardTradeAcceptAction,
 )
 from engine import market as market_ops
 from engine import settlement as settlement_ops
@@ -16,6 +18,7 @@ from engine.game import Game, GameResult
 from engine.events import EventLogger
 from engine.negotiation import StubAgent
 from bots import BOT_REGISTRY, DEFAULT_ROSTER
+from tests.conftest import make_player, make_market, make_contract, make_obligation
 
 
 # === 霧のラウンド ===
@@ -497,6 +500,178 @@ class TestS2Integration:
         )
         result = action_ops.validate_action(action, p01, config, players, round_num=1)
         assert result.success
+
+
+# === v0.8 E11: visible_state 公開情報追加 ===
+
+class TestVisibleStatePublicKeysE11:
+    """_build_visible_state の新規公開キー（trades_completed/double_ups_resolved/
+    total_prize_budget/my_trades_this_round）のテスト"""
+
+    def _make_game(self, config: GameConfig) -> Game:
+        agents = _make_bot_agents()
+        game = Game(config=config, agents=agents, seed=42)
+        from engine import player as player_ops
+        for pid in agents:
+            game.players[pid] = player_ops.create_player(pid, 3_000_000)
+        return game
+
+    def test_total_prize_budget_matches_config_formula(self):
+        """S2 baseline: total_prize_budget が market.py の最終市場倍率適用式と一致する"""
+        config = GameConfig.default_8_s2()
+        game = self._make_game(config)
+        state = game._build_visible_state(1, for_player_id="P01")
+        expected = (
+            sum(config.prize_tiers[:config.num_rounds])
+            + config.prize_tiers[config.num_rounds - 1] * (config.final_market_multiplier - 1)
+        )
+        assert state["total_prize_budget"] == expected
+
+    def test_total_prize_budget_present_without_for_player_id(self):
+        """公開情報は for_player_id=None（全体向け）でも含まれる"""
+        config = GameConfig.default_8_s2()
+        game = self._make_game(config)
+        state = game._build_visible_state(1, for_player_id=None)
+        assert "total_prize_budget" in state
+        assert "trades_completed" in state
+        assert "double_ups_resolved" in state
+        assert "my_trades_this_round" not in state  # 当事者限定情報は含まれない
+
+    def test_double_ups_resolved_reflects_last_summary(self):
+        config = GameConfig.default_8_s2()
+        game = self._make_game(config)
+        game._last_double_ups_resolved = [
+            {"player_id": "P01", "deposit": 100_000, "result": "success", "payout": 200_000},
+        ]
+        state = game._build_visible_state(2, for_player_id="P01")
+        assert state["double_ups_resolved"] == game._last_double_ups_resolved
+
+    def test_trades_completed_only_includes_accepted(self):
+        """成立（ACCEPTED）したトレードのみが公開され、カード・現金は含まれない"""
+        config = GameConfig.baseline_v1_s2(8)
+        agents = _make_stub_agents(8)
+        game = Game(config=config, agents=agents, seed=42)
+        game._setup()
+        game._phase_market_open(1)
+        game._trade_counts = {pid: 0 for pid in game.players}
+
+        action = CardTradeProposeAction(
+            player_id="P01", with_players=["P02"],
+            give_card="HIGH_CARD", receive_card="HIGH_CARD",
+        )
+        game._execute_negotiation_action_inner(action, "P01", 1, 1)
+        tp = game.trade_proposals[0]
+        accept = CardTradeAcceptAction(player_id="P02", trade_id=tp.trade_id)
+        game._execute_negotiation_action_inner(accept, "P02", 1, 2)
+
+        state = game._build_visible_state(1, for_player_id="P04")
+        assert state["trades_completed"] == [{"round": 1, "players": sorted(["P01", "P02"])}]
+        for entry in state["trades_completed"]:
+            assert "give_card_rank" not in entry
+            assert "cash_amount" not in entry
+
+    def test_my_trades_this_round_only_for_proposer_this_round(self):
+        """my_trades_this_round は自分が提案者、かつ当該ラウンドの分のみを返す"""
+        config = GameConfig.baseline_v1_s2(8)
+        agents = _make_stub_agents(8)
+        game = Game(config=config, agents=agents, seed=42)
+        game._setup()
+        game._phase_market_open(1)
+        game._trade_counts = {pid: 0 for pid in game.players}
+
+        action = CardTradeProposeAction(
+            player_id="P01", with_players=["P02"],
+            give_card="HIGH_CARD", receive_card="HIGH_CARD",
+        )
+        game._execute_negotiation_action_inner(action, "P01", 1, 1)
+
+        state_p01 = game._build_visible_state(1, for_player_id="P01")
+        assert len(state_p01["my_trades_this_round"]) == 1
+        assert state_p01["my_trades_this_round"][0]["with_player"] == "P02"
+
+        # 受信者（提案者ではない）には出ない
+        state_p02 = game._build_visible_state(1, for_player_id="P02")
+        assert state_p02["my_trades_this_round"] == []
+
+
+# === v0.8 E2: 前ラウンド倍掛け成功の払出が同ラウンド型A支払の原資になる ===
+
+class TestDoubleUpPayoutFundsSameRoundTypeA:
+    """execute_settlement() のStep2.5（倍掛け解決）→Step4（スナップショット）→
+    Step5（型A執行）の順序により、前ラウンド倍掛け成功の2倍払出が同ラウンドの
+    型A支払原資として使えることを検証する（v0.8 D2の接続テスト、前セッションの穴埋め）"""
+
+    def _commit(self, pid: str, market_id: str, rank: CardRank) -> MarketCommit:
+        return MarketCommit(player_id=pid, market_id=market_id, card=Card(rank=rank, card_id=f"{rank.name}_1"))
+
+    def _make_config(self) -> GameConfig:
+        # entry_fee はプールへの抽象加算（プレイヤーの実際の現金からは引かれない）
+        # であり、市場賞金だけを制御量にしたいので0にする（本テストの対象外の交絡を除去）
+        return GameConfig.baseline_v1(2).model_copy(update={"entry_fee": 0})
+
+    def test_payout_funds_type_a_obligation_success(self):
+        """前R預託 → 今R非ソロ勝利で払出が入り、型A支払（20万）が成立し生存する"""
+        ob = make_obligation(
+            "C1_OB01", "C1", "P01", "P02", ObligationType.TYPE_A_PAYMENT,
+            round_num=2, details={"amount": 200_000},
+        )
+        c = make_contract("C1", "P01", ["P01", "P02"], [ob])
+
+        players = {"P01": make_player("P01", cash=0, debt=0), "P02": make_player("P02", cash=0, debt=0)}
+        commits = [
+            self._commit("P01", "M01", CardRank.FULL_HOUSE),
+            self._commit("P02", "M01", CardRank.HIGH_CARD),
+        ]
+        market = make_market("M01", 100_000)
+        dep = DoubleUpDeposit(
+            player_id="P01", deposit_amount=100_000,
+            deposited_round=1, success_round=2,
+        )
+        logger = EventLogger()
+
+        players, contracts, _, _, _, du_summary = settlement_ops.execute_settlement(
+            players, [market], commits, [c], [], round_num=2,
+            config=self._make_config(), logger=logger,
+            double_up_deposits=[dep],
+        )
+
+        assert dep.resolved is True
+        assert dep.success is True, "非ソロ市場勝利のため倍掛け成功のはず"
+        resolved = du_summary["resolved"][0]
+        assert resolved["payout"] == 200_000
+
+        # 型A義務（20万）は市場賞金（10万）だけでは払えないが、倍掛け払出（20万）を
+        # 加えた cash=30万 の free_cash で払える → 生存し、TYPE_A_EXECUTIONが発火する
+        assert players["P01"].is_alive is True
+        type_a_events = [e for e in logger.events if e.event_type == "TYPE_A_EXECUTION"]
+        assert len(type_a_events) == 1
+
+    def test_without_payout_type_a_obligation_fails_and_eliminates(self):
+        """払出が無い（前R預託なし）場合は同条件でも型A支払が不成立となり脱落する"""
+        ob = make_obligation(
+            "C1_OB01", "C1", "P01", "P02", ObligationType.TYPE_A_PAYMENT,
+            round_num=2, details={"amount": 200_000},
+        )
+        c = make_contract("C1", "P01", ["P01", "P02"], [ob])
+
+        players = {"P01": make_player("P01", cash=0, debt=0), "P02": make_player("P02", cash=0, debt=0)}
+        commits = [
+            self._commit("P01", "M01", CardRank.FULL_HOUSE),
+            self._commit("P02", "M01", CardRank.HIGH_CARD),
+        ]
+        market = make_market("M01", 100_000)
+        logger = EventLogger()
+
+        players, contracts, _, _, _, du_summary = settlement_ops.execute_settlement(
+            players, [market], commits, [c], [], round_num=2,
+            config=self._make_config(), logger=logger,
+            double_up_deposits=[],
+        )
+
+        # cash=10万（市場賞金のみ）では20万の型A義務を払えない → 不履行→脱落
+        assert players["P01"].is_alive is False
+        type_a_events = [e for e in logger.events if e.event_type == "TYPE_A_EXECUTION"]
+        assert type_a_events == []
 
 
 # === ヘルパー ===

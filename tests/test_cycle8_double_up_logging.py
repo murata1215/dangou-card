@@ -177,3 +177,67 @@ class TestDoubleUpOutcomeReasonEliminated:
         assert data["outcome_reason"] == "eliminated"
         # 勝敗集計は行うが判定には使わない
         assert data["non_solo_wins"] == 1
+
+
+class TestDoubleUpPayoutSubjectToFinance:
+    """v0.8 E12: 倍掛け成功のpayoutはplayer.cashへ通常どおり反映され、
+    直後のFinanceフェイズ（利息計上・強制最低返済）の対象になる
+    （E2「payout有りの型A成功」に対し、こちらはFinance連動を検証する）"""
+
+    def test_success_payout_is_subject_to_interest_and_mandatory_repay(self):
+        from engine import finance as finance_ops
+        from engine import player as player_ops
+
+        game = _make_game_with_player()
+        dep = DoubleUpDeposit(
+            player_id="P01", deposit_amount=100_000,
+            deposited_round=1, success_round=2,
+        )
+        game.double_up_deposits.append(dep)
+        # 借金を負わせて強制最低返済の対象にする
+        p = game.players["P01"]
+        game.players["P01"] = p.model_copy(update={"debt_balance": 1_000_000, "cash": 0})
+
+        results = [_make_market_result("M01", "P01", 500_000, 3)]
+        settlement_ops.resolve_double_up_deposits(
+            game.players, results, game.double_up_deposits, 2, game.logger,
+        )
+
+        assert dep.success is True
+        cash_after_double_up = game.players["P01"].cash
+        assert cash_after_double_up == 200_000  # 倍掛け払出のみ（市場賞金自体は別ステップの対象外）
+
+        updated_players, _ = finance_ops.execute_finance(
+            game.players, 2, game.config, [], game.logger,
+        )
+
+        # 期待値はengine/finance.pyと同式（player_ops.apply_interest /
+        # compute_mandatory_repayment）で独立に算出し、賞金回帰ガードとする
+        expected_after_interest = player_ops.apply_interest(
+            p.model_copy(update={"debt_balance": 1_000_000}), game.config.interest_rate,
+        )
+        expected_min_repay = player_ops.compute_mandatory_repayment(
+            expected_after_interest.debt_balance,
+            game.config.num_rounds - 2 + 1,
+            game.config.mandatory_repay_k,
+        )
+
+        interest_events = [
+            e for e in game.logger.events
+            if e.event_type == "INTEREST" and e.data["player_id"] == "P01"
+        ]
+        assert interest_events
+        assert interest_events[-1].data["new_debt"] == expected_after_interest.debt_balance
+
+        repay_events = [
+            e for e in game.logger.events
+            if e.event_type == "MANDATORY_REPAY" and e.data["player_id"] == "P01"
+        ]
+        assert repay_events
+        assert repay_events[-1].data["amount"] == expected_min_repay
+
+        p01_after = updated_players["P01"]
+        # 倍掛け払出後のcashから強制最低返済額が引かれている（payoutが原資に含まれた証拠）
+        assert p01_after.cash == cash_after_double_up - expected_min_repay
+        assert p01_after.debt_balance == expected_after_interest.debt_balance - expected_min_repay
+        assert p01_after.is_alive is True

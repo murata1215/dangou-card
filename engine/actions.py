@@ -13,11 +13,13 @@ from engine.models import (
     AnonymousBroadcastAction,
     BountyPostAction, BountyCancelAction, TransferAction, RepayAction,
     PassAction, CardTradeProposeAction, CardTradeAcceptAction, CardTradeRejectAction,
+    CardTradeProposal, CardTradeStatus,
     PlayerState, CardRank, Contract, ContractStatus, ObligationType,
 )
 from engine.config import GameConfig
 from engine.contracts import (
     can_cancel_contract, normalize_type_b_card_details, validate_type_b_card_details,
+    is_card_tradable,
 )
 
 
@@ -49,6 +51,8 @@ def validate_action(
     round_num: int,
     anon_broadcast_count: int = 0,
     contracts: list[Contract] | None = None,
+    trade_counts: dict[str, int] | None = None,
+    trade_proposals: list[CardTradeProposal] | None = None,
 ) -> ActionResult:
     """
     アクションのバリデーションを行う
@@ -63,9 +67,17 @@ def validate_action(
         players: 全プレイヤーの状態辞書
         round_num: 現在のラウンド番号
         anon_broadcast_count: 当該ラウンドの匿名通信使用回数
-        contracts: 全契約リスト（ContractCancelActionの検証にのみ使用。
-            省略時（None/空）は contract_cancel が常に不成立になる。
-            既存の呼び出し元との互換のためキーワード引数・デフォルトNoneとする）
+        contracts: 全契約リスト（ContractCancelActionの検証、および
+            CardTradeProposeAction/CardTradeAcceptActionのE8検証に使用。
+            省略時（None/空）は contract_cancel が常に不成立になり、
+            E8検証はスキップされる。既存の呼び出し元との互換のため
+            キーワード引数・デフォルトNoneとする）
+        trade_counts: 当該ラウンドの「成立済み」トレード回数
+            {player_id: 件数}（v0.8 E7）。Noneなら回数枠検証をスキップする
+            （既存の呼び出し元との互換のためキーワード引数・デフォルトNone）
+        trade_proposals: 全トレード提案リスト（v0.8 E7/E8。
+            CardTradeAcceptActionの検証で対象提案を引くために使用）。
+            Noneなら提案者側の検証をスキップする
 
     Returns:
         ActionResult（成功/失敗+理由）
@@ -263,6 +275,11 @@ def validate_action(
             return ActionResult(False, "No target players specified")
         if len(action.with_players) > config.card_trade_broadcast_max:
             return ActionResult(False, f"Too many targets: {len(action.with_players)} > {config.card_trade_broadcast_max}")
+        # v0.8 G1: 自分自身とはトレードできない（E7で提案時の枠消費が無くなり、
+        # 自己受諾が到達可能になったための必須の防御）
+        others = [t for t in action.with_players if t != player.player_id]
+        if not others:
+            return ActionResult(False, "Cannot trade with yourself")
         try:
             give_rank = CardRank[action.give_card]
         except KeyError:
@@ -275,17 +292,49 @@ def validate_action(
             return ActionResult(False, f"Invalid card rank: {action.receive_card}")
         if action.cash_amount > 0 and action.cash_amount > player.free_cash:
             return ActionResult(False, "Insufficient free cash for trade payment")
+        # v0.8 E7: 「1R1回」は成立ベース。提案時点で今R成立済み回数のみ検査する
+        # （提案は枠を消費しない。受諾で初めて双方の枠を消費する）
+        if trade_counts is not None and trade_counts.get(player.player_id, 0) >= config.card_trade_max_per_round:
+            return ActionResult(False, "今ラウンドのトレード回数上限")
+        # v0.8 E8: 契約で使用予定のカードは手放せない
+        if not is_card_tradable(contracts, player, action.give_card, round_num):
+            return ActionResult(False, "契約で使用予定のカードはトレードできません")
         # 生存宛先が1人もいなければ不成立。1人でも生きていれば提案は成立させ、
-        # 脱落宛先は engine/game.py:536-539 の既存スキップに委ねる。
+        # 脱落宛先は engine/game.py の既存スキップに委ねる。
         if not any(
             (t := players.get(p)) is not None and t.is_alive
-            for p in action.with_players
+            for p in others
         ):
             return ActionResult(False, "No living target for card trade")
         return ActionResult(True)
 
     if isinstance(action, CardTradeAcceptAction):
-        # カードトレード受諾: trade_id の存在チェックは execute 側で行う
+        # カードトレード受諾: trade_id の存在チェックは execute 側で行う。
+        # v0.8 E7/E8: 対象提案が判明し、かつ自分宛の場合のみ回数枠・拘束カードを
+        # 検査する。見つからない/自分宛でない場合は従来どおり ActionResult(True) とし、
+        # apply側のsilent return（不成立扱い）に委ねる（既存テスト互換）。
+        proposal = None
+        if trade_proposals:
+            for tp in trade_proposals:
+                if tp.trade_id == action.trade_id and tp.status == CardTradeStatus.PROPOSED:
+                    proposal = tp
+                    break
+        if proposal is not None and proposal.with_player == player.player_id:
+            if trade_counts is not None:
+                if trade_counts.get(player.player_id, 0) >= config.card_trade_max_per_round:
+                    return ActionResult(False, "今ラウンドのトレード回数上限")
+                if trade_counts.get(proposal.proposer, 0) >= config.card_trade_max_per_round:
+                    return ActionResult(False, "今ラウンドのトレード回数上限（提案者側）")
+            # v0.8 E8: 受諾者が渡すカード・提案者が渡すカードの双方を再検証する
+            # （提案後に当事者が新たに契約を結んで拘束された場合、受諾させると
+            # 確定で型B違反→脱落となるため）
+            if not is_card_tradable(contracts, player, proposal.receive_card_rank, round_num):
+                return ActionResult(False, "契約で使用予定のカードはトレードできません")
+            proposer_state = players.get(proposal.proposer)
+            if proposer_state is not None and not is_card_tradable(
+                contracts, proposer_state, proposal.give_card_rank, round_num,
+            ):
+                return ActionResult(False, "契約で使用予定のカードはトレードできません（提案者側）")
         return ActionResult(True)
 
     if isinstance(action, CardTradeRejectAction):

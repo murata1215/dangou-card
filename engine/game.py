@@ -399,6 +399,8 @@ class Game:
                     action, p, self.config, self.players,
                     round_num, self._anon_broadcast_counts.get(pid, 0),
                     contracts=self.contracts,
+                    trade_counts=self._trade_counts,
+                    trade_proposals=self.trade_proposals,
                 )
 
                 if isinstance(action, PassAction):
@@ -445,15 +447,12 @@ class Game:
             if tp.status == CardTradeStatus.PROPOSED and tp.round_proposed == round_num:
                 tp.status = CardTradeStatus.EXPIRED
                 # v0.8 I2: 提案者へ通知（自動失効）
-                bucket = self._contract_notices.setdefault(tp.proposer, [])
-                bucket.append({
+                self._push_contract_notice(tp.proposer, {
                     "turn": self.config.negotiation_max_turns,
                     "kind": "trade_expired",
                     "trade_id": tp.trade_id,
                     "with_player": tp.with_player,
                 })
-                if len(bucket) > self._CONTRACT_NOTICE_MAX:
-                    del bucket[: -self._CONTRACT_NOTICE_MAX]
 
         # ラウンド末: 当該ラウンドで提案され署名が揃わなかった契約を自動失効（v0.8 D5）
         for i, c in enumerate(self.contracts):
@@ -462,15 +461,12 @@ class Game:
                 proposer = self.contracts[i].proposer
                 if proposer in self.players and self.players[proposer].is_alive:
                     unsigned = [p for p in c.parties if p not in c.signed_by]
-                    bucket = self._contract_notices.setdefault(proposer, [])
-                    bucket.append({
+                    self._push_contract_notice(proposer, {
                         "turn": self.config.negotiation_max_turns,
                         "kind": "contract_expired",
                         "contract_id": c.contract_id,
                         "unsigned_by": unsigned,
                     })
-                    if len(bucket) > self._CONTRACT_NOTICE_MAX:
-                        del bucket[: -self._CONTRACT_NOTICE_MAX]
                 self.logger.log("CONTRACT_EXPIRED", round_num, "negotiation", data={
                     "contract_id": c.contract_id,
                     "proposer": proposer,
@@ -478,11 +474,33 @@ class Game:
                     "signed_by": list(c.signed_by),
                 })
 
+        # v0.8 E9-3rd: Negotiation中の脱落（破産・契約違反）でゾンビ契約化した
+        # ACTIVE契約をここでも畳む。Settlement Step8後・Finance後の2箇所だけでは、
+        # Negotiation中に forced_liquidation が呼ばれてから次のSettlementまでの間、
+        # 残存義務ゼロのACTIVE契約が contracts_public / my_contracts に誤って
+        # 生きたまま表示される穴があった（rules/project.md・changelogはドキュメント先行で
+        # 3箇所目として記載済みだったが未接続だった）。
+        self.contracts = contract_ops.close_contracts_without_remaining_obligations(
+            self.contracts, round_num,
+        )
+
     _ACTION_FAILURE_MEMO_MAX = 12
     """本人へ返す不成立記録の保持上限（1ラウンド最大10アクション＋余裕）"""
 
     _CONTRACT_NOTICE_MAX = 12
     """本人へ返す契約解除通知の保持上限（_ACTION_FAILURE_MEMO_MAX と同じ作法）"""
+
+    def _push_contract_notice(self, pid: str, notice: dict[str, Any]) -> None:
+        """本人限定の通知を1件積む（上限 _CONTRACT_NOTICE_MAX 付き、v0.8 E10）。
+
+        既存の4箇所（トレード失効・契約失効×2・契約解除）で重複していた
+        「setdefault→append→上限トリム」を1箇所へ集約する純粋なリファクタ。
+        engine判定ロジックには影響しない——表示・起床専用の私的情報。
+        """
+        bucket = self._contract_notices.setdefault(pid, [])
+        bucket.append(dict(notice))
+        if len(bucket) > self._CONTRACT_NOTICE_MAX:
+            del bucket[: -self._CONTRACT_NOTICE_MAX]
 
     def _record_action_failure(
         self, pid: str, action: Action, reason: str | None,
@@ -532,15 +550,12 @@ class Game:
             proposer = c.proposer
             if proposer in self.players and self.players[proposer].is_alive:
                 unsigned = [p for p in c.parties if p not in c.signed_by]
-                bucket = self._contract_notices.setdefault(proposer, [])
-                bucket.append({
+                self._push_contract_notice(proposer, {
                     "turn": 0,
                     "kind": "contract_expired",
                     "contract_id": c.contract_id,
                     "unsigned_by": unsigned,
                 })
-                if len(bucket) > self._CONTRACT_NOTICE_MAX:
-                    del bucket[: -self._CONTRACT_NOTICE_MAX]
 
     def _execute_negotiation_action(
         self, action: Action, pid: str, round_num: int, turn: int,
@@ -665,10 +680,7 @@ class Game:
                         if p != pid and p in self.players and self.players[p].is_alive
                     ]
                     for p in recipients:
-                        bucket = self._contract_notices.setdefault(p, [])
-                        bucket.append(dict(notice))
-                        if len(bucket) > self._CONTRACT_NOTICE_MAX:
-                            del bucket[: -self._CONTRACT_NOTICE_MAX]
+                        self._push_contract_notice(p, notice)
 
                     self.logger.log("NEGOTIATION_ACTION", round_num, "negotiation", data={
                         "player_id": pid, "action": "contract_cancel",
@@ -754,6 +766,9 @@ class Game:
                 return
             if round_num > self.config.card_trade_last_round:
                 return
+            # v0.8 E7: 「1R1回」は成立ベース。self._trade_counts は「今R成立済み」
+            # 回数のみを表すようになったため、提案時点でこのチェックは通常
+            # 不成立にならない（受諾で初めて枠を消費する）。防御として残す。
             if self._trade_counts.get(pid, 0) >= self.config.card_trade_max_per_round:
                 return
 
@@ -761,6 +776,9 @@ class Game:
             created_ids = []
 
             for target_pid in action.with_players:
+                # v0.8 G1: 自分自身とはトレードできない
+                if target_pid == pid:
+                    continue
                 target = self.players.get(target_pid)
                 if target is None or not target.is_alive:
                     continue
@@ -787,7 +805,7 @@ class Game:
                 created_ids.append(trade_id)
 
             if created_ids:
-                self._trade_counts[pid] = self._trade_counts.get(pid, 0) + 1
+                # v0.8 E7: 提案は枠を消費しない（受諾成立時のみ双方消費する）
                 self.logger.log("NEGOTIATION_ACTION", round_num, "negotiation", data={
                     "player_id": pid, "action": "card_trade_propose",
                     "offer_id": offer_id,
@@ -812,9 +830,13 @@ class Game:
                 return
             if round_num > self.config.card_trade_last_round:
                 return
+            # v0.8 E7: 「1R1回」は成立ベース。受諾者・提案者の双方が
+            # まだ枠を持っていることを確認する（validate_action で検証済みだが、
+            # propose/accept 間で状態が動きうるためここでも防御する）。
             if self._trade_counts.get(pid, 0) >= self.config.card_trade_max_per_round:
                 return
-            # 提案者の枠は propose 時に消費済み — accept 時には再チェックしない
+            if self._trade_counts.get(proposal.proposer, 0) >= self.config.card_trade_max_per_round:
+                return
 
             proposer_state = self.players[proposal.proposer]
             accepter_state = self.players[pid]
@@ -831,12 +853,32 @@ class Game:
                 proposal.status = CardTradeStatus.EXPIRED
                 return
 
-            # 現金再検証
+            # 現金再検証（v0.8 E10: 資金不足によるEXPIREDは双方へ通知）
             if proposal.cash_amount > 0 and proposal.cash_amount > proposer_state.free_cash:
                 proposal.status = CardTradeStatus.EXPIRED
+                self._push_contract_notice(proposal.proposer, {
+                    "turn": turn, "kind": "trade_failed_funds",
+                    "trade_id": proposal.trade_id, "with_player": pid,
+                    "cash_amount": proposal.cash_amount, "short_side": "proposer",
+                })
+                self._push_contract_notice(pid, {
+                    "turn": turn, "kind": "trade_failed_funds",
+                    "trade_id": proposal.trade_id, "with_player": proposal.proposer,
+                    "cash_amount": proposal.cash_amount, "short_side": "proposer",
+                })
                 return
             if proposal.cash_amount < 0 and abs(proposal.cash_amount) > accepter_state.free_cash:
                 proposal.status = CardTradeStatus.EXPIRED
+                self._push_contract_notice(proposal.proposer, {
+                    "turn": turn, "kind": "trade_failed_funds",
+                    "trade_id": proposal.trade_id, "with_player": pid,
+                    "cash_amount": proposal.cash_amount, "short_side": "accepter",
+                })
+                self._push_contract_notice(pid, {
+                    "turn": turn, "kind": "trade_failed_funds",
+                    "trade_id": proposal.trade_id, "with_player": proposal.proposer,
+                    "cash_amount": proposal.cash_amount, "short_side": "accepter",
+                })
                 return
 
             # アトミック実行: カード交換
@@ -854,16 +896,31 @@ class Game:
             self.players[proposal.proposer] = proposer_state
             self.players[pid] = accepter_state
             proposal.status = CardTradeStatus.ACCEPTED
+            # v0.8 E7: 成立ベース。受諾者・提案者の双方の枠を消費する
             self._trade_counts[pid] = self._trade_counts.get(pid, 0) + 1
-            # 提案者の枠は propose 時に消費済み — accept で再加算しない
+            self._trade_counts[proposal.proposer] = self._trade_counts.get(proposal.proposer, 0) + 1
 
-            # 同一 offer_id の残りの提案を EXPIRED に（v0.7.1 ブロードキャスト）
-            if proposal.offer_id:
-                for tp in self.trade_proposals:
-                    if (tp.offer_id == proposal.offer_id
-                            and tp.trade_id != proposal.trade_id
-                            and tp.status == CardTradeStatus.PROPOSED):
-                        tp.status = CardTradeStatus.EXPIRED
+            # v0.8 E7b: 同一offer_idの残りの提案（既存）に加え、今回の成立で
+            # 枠上限に達した当事者が絡む他の PROPOSED 提案もまとめて EXPIRED にする。
+            # 放置すると相手が毎巡 accept を試み、不成立でアクション枠だけ溶かす
+            # （監査で確認済みの反復不成立パターンの再来を防ぐ）。
+            capped_players = {
+                p for p in (proposal.proposer, pid)
+                if self._trade_counts.get(p, 0) >= self.config.card_trade_max_per_round
+            }
+            for tp in self.trade_proposals:
+                if tp.trade_id == proposal.trade_id or tp.status != CardTradeStatus.PROPOSED:
+                    continue
+                same_offer = bool(proposal.offer_id) and tp.offer_id == proposal.offer_id
+                involves_capped = tp.proposer in capped_players or tp.with_player in capped_players
+                if not (same_offer or involves_capped):
+                    continue
+                tp.status = CardTradeStatus.EXPIRED
+                self._push_contract_notice(tp.proposer, {
+                    "turn": turn, "kind": "trade_superseded",
+                    "trade_id": tp.trade_id, "with_player": tp.with_player,
+                    "accepted_trade_id": proposal.trade_id,
+                })
 
             self.logger.log("NEGOTIATION_ACTION", round_num, "negotiation", data={
                 "player_id": pid, "action": "card_trade_accept",
@@ -879,6 +936,11 @@ class Game:
                 if tp.trade_id == action.trade_id and tp.status == CardTradeStatus.PROPOSED:
                     if pid == tp.with_player:
                         tp.status = CardTradeStatus.REJECTED
+                        # v0.8 I2: 提案者へ通知（拒否）
+                        self._push_contract_notice(tp.proposer, {
+                            "turn": turn, "kind": "trade_rejected",
+                            "trade_id": tp.trade_id, "with_player": pid,
+                        })
                         self.logger.log("NEGOTIATION_ACTION", round_num, "negotiation", data={
                             "player_id": pid, "action": "card_trade_reject",
                             "trade_id": tp.trade_id, "proposer": tp.proposer,
@@ -1224,6 +1286,33 @@ class Game:
 
                 eligible_prize = prize_won - du_payout_this_round
                 if eligible_prize <= 0:
+                    continue
+
+                # v0.8 E3: 即死ガード（D3・I4）。預託すると強制最低返済を
+                # 賄えなくなる/現金が足りない選択をLLMに提示しない。
+                # 式は engine/finance.py Step1(利息計上)/Step2(強制最低返済)と同一。
+                after = player_ops.apply_interest(p, self.config.interest_rate)
+                min_repay = 0
+                if self.config.mandatory_repay_enabled and after.debt_balance > 0:
+                    min_repay = player_ops.compute_mandatory_repayment(
+                        after.debt_balance,
+                        self.config.num_rounds - round_num + 1,
+                        self.config.mandatory_repay_k,
+                    )
+                if p.cash < eligible_prize or (p.cash - eligible_prize) < min_repay:
+                    self.logger.log("DOUBLE_UP_BLOCKED", round_num, "settlement", data={
+                        "player_id": winner_id,
+                        "eligible_prize": eligible_prize,
+                        "cash": p.cash,
+                        "min_repay": min_repay,
+                    })
+                    self._push_contract_notice(winner_id, {
+                        "turn": 0,
+                        "kind": "double_up_blocked",
+                        "eligible_prize": eligible_prize,
+                        "cash": p.cash,
+                        "min_repay": min_repay,
+                    })
                     continue
 
                 agent = self.agents[winner_id]
@@ -1950,6 +2039,24 @@ class Game:
                  "success_round": d.success_round}
                 for d in self.double_up_deposits if not d.resolved
             ],
+            # v0.8 E11: 成立済みトレードの公開情報（カード・現金は含めない）。
+            "trades_completed": [
+                {"round": tp.round_proposed, "players": sorted([tp.proposer, tp.with_player])}
+                for tp in self.trade_proposals
+                if tp.status == CardTradeStatus.ACCEPTED
+            ],
+            # v0.8 E11: 今R解決分の倍掛け結果（settlement.resolve_double_up_deposits
+            # が生成した形式をそのまま公開。engine/game.py:178, 1179 で格納済み）。
+            "double_ups_resolved": [dict(d) for d in self._last_double_ups_resolved],
+            # v0.8 E11: 総賞金予算。engine/market.py の最終市場倍率適用式と一致させる。
+            "total_prize_budget": (
+                sum(self.config.prize_tiers[:self.config.num_rounds])
+                + (
+                    self.config.prize_tiers[self.config.num_rounds - 1]
+                    * (self.config.final_market_multiplier - 1)
+                    if self.config.final_market_multiplier > 1 else 0
+                )
+            ),
         }
 
         # 当事者向け: 提案中の契約（当事者のみ閲覧可能）
@@ -2099,5 +2206,20 @@ class Game:
                     }
                 pending_trades.append(entry)
             state["trades_pending"] = pending_trades
+
+            # v0.8 E11: 自分が提案した、今Rのトレード（成立/失効含む）
+            state["my_trades_this_round"] = [
+                {
+                    "trade_id": tp.trade_id,
+                    "offer_id": tp.offer_id,
+                    "with_player": tp.with_player,
+                    "give_card_rank": tp.give_card_rank,
+                    "receive_card_rank": tp.receive_card_rank,
+                    "cash_amount": tp.cash_amount,
+                    "status": tp.status.value,
+                }
+                for tp in self.trade_proposals
+                if tp.proposer == for_player_id and tp.round_proposed == round_num
+            ][-12:]
 
         return state
