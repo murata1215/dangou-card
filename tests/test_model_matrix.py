@@ -1509,7 +1509,11 @@ def test_phase2_core18_reservations_cover_model_overrides_and_flag_h4_cap_gap():
     # Cycle 8.1（2026-08-29）: v0.8 D1で契約発行料をbaseline_v1_s2のみ0円化した結果、
     # system prompt内「発行料{N}万円」表示が10→0になりsystem prompt長が7,079→7,076字に
     # 減少（3文字減）。H1予約額が$0.031845→$0.03184へ微減したため五度目の期待値更新。
-    assert reservations["H1"] == pytest.approx(0.03184, abs=1e-12)
+    # Cycle 8.2（2026-08-29）: v0.8プロンプト文面の一括修正でRULES_SUMMARYの契約・
+    # アクション枠節の文言を実装事実に合わせて拡充した結果、system prompt長が
+    # 7,076→8,177字に増加。H1予約額が$0.03184→$0.03459へ増加したため六度目の期待値更新
+    # （max_cost_per_model以内には収まる。判断1・判断2に基づく変更）。
+    assert reservations["H1"] == pytest.approx(0.03459, abs=1e-12)
     for key in ("H1", "H2", "H4"):
         assert reservations[key] > 0.02
         if key != "H4":

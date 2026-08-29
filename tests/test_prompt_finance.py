@@ -194,10 +194,20 @@ class TestD3MandatoryRepayForecastMatchesEngine:
         assert f"{after_interest.debt_balance}円" in prompt
         assert f"除数（このラウンドを含む残りラウンド数{expected_divisor}" in prompt
         assert f"= {expected_repay}円" in prompt
-        assert f"強制最低返済額との差額: {cash - expected_repay}円" in prompt
-        # Cycle 2.2 wording-only fix: 結果断定・警告記号を排し数値事実のみにする
-        assert "⚠" not in prompt
-        assert "不足します" not in prompt
+        # v0.8サイクル8.2 2-1で「差引後の現金見込み」行がEntry Fee込みの1行式へ統合。
+        # commit context なので Entry Fee {config.entry_fee}円も差し引かれる。
+        deficit_after_fee = cash - config.entry_fee - expected_repay
+        forecast_line = (
+            f"今R賞金0の場合の現金見込み: {cash}円 − Entry Fee {config.entry_fee}円"
+            f" − 強制返済 {expected_repay}円 = {deficit_after_fee}円"
+        )
+        assert forecast_line in prompt
+        # Cycle 2.2 wording-only fix: 数値見込み行そのものには結果断定・警告記号を含めない
+        # （不足時の警告は独立した別行として許可。Judgment 2の行単位スコープ）
+        for line in prompt.split("\n"):
+            if line.strip().startswith("今R賞金0の場合の現金見込み"):
+                assert "⚠" not in line
+                assert "不足します" not in line
         assert "MANDATORY_REPAY_FAILED" not in prompt
 
     def test_p01_r11_case_matches_engine_exactly(self):
@@ -235,10 +245,15 @@ class TestD3MandatoryRepayForecastMatchesEngine:
             cash=84_063, debt_balance=450_596, forecast_round=9, config=config,
         )
         text = "\n".join(lines)
-        assert "差引後の現金見込み: 84063円 − 114339円 = -30276円" in text
-        assert "強制最低返済額との差額: -30276円" in text
-        assert "⚠" not in text
-        assert "不足します" not in text and "MANDATORY_REPAY_FAILED" not in text
+        # v0.8サイクル8.2 2-1で1行式へ統合（entry_fee_deduction省略時はEntry Fee行なし）
+        assert "今R賞金0の場合の現金見込み: 84063円 − 強制返済 114339円 = -30276円" in text
+        # Judgment 2: 数値見込み行そのものには結果断定・警告記号を含めない
+        # （不足時の⚠警告は独立した別行として許可）
+        for line in lines:
+            if line.strip().startswith("今R賞金0の場合の現金見込み"):
+                assert "⚠" not in line
+                assert "不足します" not in line
+        assert "MANDATORY_REPAY_FAILED" not in text
 
 
 # ---------------------------------------------------------------------------
@@ -271,9 +286,14 @@ class TestD4DoubleUpFinanceForecast:
         assert "Finance後の現金見込み: -298733円" in prompt
         assert "DOUBLE選択時のFinance後現金見込み: -298733円" in prompt
         assert "強制最低返済額649587円に対する差額: -298733円" in prompt
-        # Cycle 2 wording-only fix: 結果断定・警告記号を排し数値事実のみにする
-        assert "⚠" not in prompt
-        assert "不足します" not in prompt
+        # Cycle 2 wording-only fix: 「この選択の直後」ブロックの数値見込み行そのものには
+        # 結果断定・警告記号を含めない（v0.8サイクル8.2 A2で追加された次R見通しブロックは
+        # 独立した⚠警告行を持つため、ここでは同ブロック内に限定してスコープする）
+        immediate_block = prompt.split("## この選択の直後に実行される処理")[1].split(
+            "## DOUBLEを選んだ場合の次ラウンド"
+        )[0]
+        assert "⚠" not in immediate_block
+        assert "不足します" not in immediate_block
         assert "MANDATORY_REPAY_FAILED" not in prompt
 
     def test_take_side_has_no_deficit_when_sufficient(self):

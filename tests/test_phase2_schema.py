@@ -212,8 +212,11 @@ def test_gemini_phase2_overrides_and_reserves_are_model_specific():
     # Cycle 8.1（2026-08-29）: v0.8 D1で契約発行料をbaseline_v1_s2のみ0円化した結果、
     # system prompt内「発行料{N}万円」表示が10→0になりsystem prompt長が7,079→7,076字に
     # 減少（3文字減）したため、五度目の期待値更新。
-    assert mm._phase2_worst_case_cost(MODEL_REGISTRY["M3"], system, 512) == pytest.approx(0.0158745)
-    assert mm._phase2_worst_case_cost(MODEL_REGISTRY["H3"], system, 912) == pytest.approx(0.025966)
+    # Cycle 8.2（2026-08-29）: v0.8プロンプト文面の一括修正でRULES_SUMMARYの契約・
+    # アクション枠節の文言を実装事実に合わせて拡充した結果、system prompt長が
+    # 7,076→8,177字に増加したため、六度目の期待値更新。M3/H3とも引き続き0.03未満。
+    assert mm._phase2_worst_case_cost(MODEL_REGISTRY["M3"], system, 512) == pytest.approx(0.016701)
+    assert mm._phase2_worst_case_cost(MODEL_REGISTRY["H3"], system, 912) == pytest.approx(0.027068)
     assert mm._phase2_worst_case_cost(MODEL_REGISTRY["M3"], system, 512) < 0.03
     assert mm._phase2_worst_case_cost(MODEL_REGISTRY["H3"], system, 912) < 0.03
 

@@ -7,9 +7,9 @@ Cycle 8 修正3: strategyへのカテゴリenum追加テスト
 - 列挙外の値は None にする
 - 欠落時も None にする（ParseErrorにしない＝リトライを誘発しない）
 - 交渉プロンプトの user prompt 側に全8候補が出現する（system prompt側は
-  7100字上限の残余21字しかないため対象外。plan判断のとおり）
-- 既存のシステムプロンプト/交渉プロンプトの文字数予算（7100字 / 6400字 / 3550字）
-  を超えない
+  文字数上限の残余が乏しいため対象外。plan判断のとおり）
+- 既存のシステムプロンプト/交渉プロンプトの文字数予算（v0.8サイクル8.2で
+  8300字 / 7100字 / 3550字へ改定）を超えない
 - 追加ブロックに評価語彙（既存test_prompt_finance.pyのADVICE_WORDS/
   JUDGMENT_WORDSと同一手法）が含まれない
 - llm_logger.log_call() の初期エントリに reason_category キーがあり、
@@ -81,7 +81,7 @@ class TestNegotiationPromptCategoryEnumeration:
             assert cat in prompt, f"候補 '{cat}' が交渉プロンプトに出現しません"
 
     def test_reason_category_not_in_system_prompt(self):
-        """system_promptの7100字上限（残余21字）には入らない配置判断の裏付け"""
+        """system_promptの文字数上限には入らない配置判断の裏付け"""
         config = GameConfig.baseline_v1_s2(12)
         prompt = build_system_prompt("P01", config)
         assert "reason_category" not in prompt
@@ -93,7 +93,8 @@ class TestPromptLengthBudgetUnaffected:
     def test_system_prompt_length_budget_unaffected(self):
         config = GameConfig.baseline_v1_s2(12)
         prompt = build_system_prompt("P01", config)
-        assert len(prompt) <= 7100, len(prompt)
+        # v0.8サイクル8.2でtest_cycle5_prompt_salience.pyと同じ8300字上限へ改定
+        assert len(prompt) <= 8300, len(prompt)
 
     def test_negotiation_prompt_length_budget_unaffected(self):
         config = GameConfig.baseline_v1_s2(12)
@@ -129,7 +130,8 @@ class TestPromptLengthBudgetUnaffected:
             trades_pending=[trade_pending],
         )
         worst_prompt = build_negotiation_prompt(player, 6, 5, worst_vs, config, memory=memory)
-        assert len(worst_prompt) <= 6400, len(worst_prompt)
+        # v0.8サイクル8.2でtest_cycle5_prompt_salience.pyと同じ7100字上限へ改定
+        assert len(worst_prompt) <= 7100, len(worst_prompt)
 
         std_vs = _base_visible_state(
             markets=[{"market_id": "M01", "prize_pool": 900_000, "base_prize": 900_000, "carryover": 0}],

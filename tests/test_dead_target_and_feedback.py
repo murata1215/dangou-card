@@ -482,17 +482,19 @@ class TestRulesSummaryPromises:
     def test_dead_target_prohibition_mentioned(self):
         config = GameConfig.baseline_v1(4)
         prompt = build_system_prompt("P01", config)
-        assert "脱落者を指定すると必ず不成立になり" in prompt
+        # v0.8サイクル8.2 Step1で1文に統合された（事実は不変）
+        assert "脱落者指定は不成立でアクション枠を失うが" in prompt
 
     def test_failed_action_consumes_slot_mentioned(self):
         config = GameConfig.baseline_v1(4)
         prompt = build_system_prompt("P01", config)
-        assert "不成立アクションも枠を消費する" in prompt
+        assert "**不成立アクションは枠を消費する**" in prompt
 
     def test_max_actions_number_present(self):
         config = GameConfig.baseline_v1(4)
         prompt = build_system_prompt("P01", config)
-        assert f"最大{config.negotiation_max_actions}アクション" in prompt
+        # v0.8サイクル8.2 Step1の圧縮で「最大Nアクション」→「Nアクション/R上限」に短縮
+        assert f"{config.negotiation_max_actions}アクション/R上限" in prompt
 
     def test_all_presets_format_without_keyerror(self):
         presets = [

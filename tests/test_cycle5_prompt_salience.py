@@ -89,8 +89,11 @@ class TestActionBenefitSymmetry:
     def test_contract_benefit_wording(self):
         config = GameConfig.baseline_v1_s2(12)
         prompt = build_system_prompt("P01", config)
-        assert "システムが自動で監査・執行" in prompt
-        assert "裏切りに機械的なコストを付けられる" in prompt
+        # v0.8サイクル8.2 Step1でRULES_SUMMARYの契約節が圧縮され、
+        # 「システムが自動で監査・執行」→「システムが自動執行/自動監査」に言い換えられた
+        # （事実は不変。文言のみ）
+        assert "システムが自動執行/自動監査" in prompt
+        assert "縛る効果" in prompt
 
     def test_no_new_format_placeholder(self):
         """全プリセットでKeyErrorなし・新セクション内に未置換の{}が残らない"""
@@ -115,19 +118,21 @@ class TestNeutralizedWarnings:
     def test_failed_action_slot_has_avoidance(self):
         config = GameConfig.baseline_v1_s2(12)
         prompt = build_system_prompt("P01", config)
-        assert "不成立アクションも枠を消費する" in prompt
-        assert "出す前に確認すれば避けられる" in prompt
+        # v0.8サイクル8.2 Step1の圧縮で強調表現(**...**)付きに言い換えられた
+        assert "**不成立アクションは枠を消費する**" in prompt
+        assert "宛先が「生存者」欄にあるか・Free Cash十分か確認すれば避けられる" in prompt
 
     def test_dead_target_has_avoidance(self):
         config = GameConfig.baseline_v1_s2(12)
         prompt = build_system_prompt("P01", config)
-        assert "脱落者を指定すると必ず不成立になり" in prompt
-        assert "生存者欄から選ぶ限りこれは起きない" in prompt
+        # v0.8サイクル8.2 Step1で1文に統合された（事実は不変）
+        assert "脱落者指定は不成立でアクション枠を失うが" in prompt
+        assert "生存者欄から選ぶ限り起きない" in prompt
 
     def test_double_contract_warning_has_remedy(self):
         config = GameConfig.baseline_v1_s2(12)
         prompt = build_system_prompt("P01", config)
-        assert "旧契約を全員で解除 → 新条件で contract_propose" in prompt
+        assert "「旧契約を全員で解除→新条件でcontract_propose」" in prompt
         assert "二重に結ぶと必ず型B違反で脱落します" not in prompt
 
     def test_eliminations_block_is_neutral(self):
@@ -293,7 +298,8 @@ class TestOneMarketPerRound:
             l for l in prompt.splitlines() if "市場参加につきEntry Fee" in l
         )
         assert "10万円" in entry_line
-        assert "1ラウンド1市場なので毎ラウンド" in entry_line
+        # v0.8サイクル8.2 Step1で「1ラウンド1市場なので毎ラウンド」→「1R1市場なので毎R」に短縮
+        assert "1R1市場なので毎R" in entry_line
 
 
 class TestDoubleUpRestatement:
@@ -395,7 +401,10 @@ class TestPromptLengthBudget:
             trades_pending=[trade_pending],
         )
         worst_prompt = build_negotiation_prompt(player, 6, 5, worst_vs, config, memory=memory)
-        assert len(worst_prompt) <= 6400, len(worst_prompt)
+        # v0.8サイクル8.2でFinance見込みの1行式統合・公開情報ブロック・署名待ち契約の
+        # 受取プレビュー等を追加したため、worst caseの実測値が6599→6609字に増加。
+        # 実測6609字を100単位切り上げ+約5%の安全マージンを取り7100へ改定（判断1）
+        assert len(worst_prompt) <= 7100, len(worst_prompt)
 
         std_vs = _base_visible_state(
             markets=[{"market_id": "M01", "prize_pool": 900_000, "base_prize": 900_000, "carryover": 0}],
@@ -409,7 +418,9 @@ class TestPromptLengthBudget:
     def test_system_prompt_length_budget(self):
         config = GameConfig.baseline_v1_s2(12)
         prompt = build_system_prompt("P01", config)
-        assert len(prompt) <= 7100, len(prompt)
+        # Cycle 8.2 Step0実測: 8,177字（H1予約額0.03459 <= 0.035の制約から
+        # 逆算した8,300を上限とする。Step1のRULES_SUMMARY圧縮後もこの範囲内）
+        assert len(prompt) <= 8300, len(prompt)
 
 
 class TestActionDescriptionMapping:
@@ -485,9 +496,11 @@ class TestActionDescriptionMapping:
         prompt = build_negotiation_prompt(player, 5, 1, self._pending_fixture(), config)
         available, _ = _extract_available_unavailable(prompt)
         entry = next(e for e in available.split(" / ") if e.startswith("contract_propose"))
-        assert "口頭合意" in entry
-        assert "正式契約" in entry
-        assert "発行料" in entry
+        # v0.8サイクル8.2 2-7で説明文を仕様文言へ変更。baseline_v1_s2はcontract_fee=0の
+        # ため「発行料」は出ず「無料」になる（fee>0の場合はtest_fees_follow_configで確認）
+        assert "正式契約を提案" in entry
+        assert "相手が署名すれば成立" in entry
+        assert "無料" in entry
 
     def test_fees_follow_config(self):
         config = GameConfig.baseline_v1_s2(12)

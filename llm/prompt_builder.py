@@ -210,6 +210,8 @@ def _compute_finance_forecast(
     cash: int,
     forecast_round: int,
     config: GameConfig,
+    *,
+    entry_fee_deduction: int = 0,
 ) -> dict[str, int]:
     """
     Financeフェイズ（利息計上→強制最低返済）の結果を副作用なしに事前計算する
@@ -219,15 +221,19 @@ def _compute_finance_forecast(
 
     Args:
         debt_balance: 利息計上前の借金残高
-        cash: Finance実行時点で見込まれる現金
+        cash: Finance実行時点で見込まれる現金（Entry Fee控除前）
         forecast_round: Financeが実行される（実行された）ラウンド番号
         config: ゲーム設定
+        entry_fee_deduction: このRの必須Entry Fee（v0.8サイクル8.2で予測式へ
+            織り込む。市場結果・型A受取金は未確定のため含めない）
 
     Returns:
         {"interest": 利息額（円）,
          "debt_after_interest": 利息計上後の借金残高（円）,
          "divisor": 強制最低返済の除数（このラウンドを含む残りラウンド数+k）,
          "mandatory_repay": 強制最低返済額（円。mandatory_repay_enabled=Falseなら0）,
+         "entry_fee_deduction": 織り込んだEntry Fee（円）,
+         "cash_before_repay": Entry Fee控除後・強制返済前の現金見込み（円）,
          "cash_after_repay": 強制最低返済差引後の現金見込み（円。マイナスもあり得る
              ＝現金不足でMANDATORY_REPAY_FAILEDになることを示す）}
     """
@@ -247,12 +253,16 @@ def _compute_finance_forecast(
             after_interest.debt_balance, divisor, config.mandatory_repay_k,
         )
 
+    cash_before_repay = cash - entry_fee_deduction
+
     return {
         "interest": interest,
         "debt_after_interest": after_interest.debt_balance,
         "divisor": divisor,
         "mandatory_repay": mandatory_repay,
-        "cash_after_repay": cash - mandatory_repay,
+        "entry_fee_deduction": entry_fee_deduction,
+        "cash_before_repay": cash_before_repay,
+        "cash_after_repay": cash_before_repay - mandatory_repay,
     }
 
 
@@ -263,24 +273,30 @@ def _render_finance_block(
     config: GameConfig,
     *,
     timing_note: str = "",
+    entry_fee_deduction: int = 0,
     entry_fee_note: str = "",
 ) -> list[str]:
     """
-    Finance（利息計上→強制最低返済）の確定計算を提示する（P0-1）
+    Finance（利息計上→強制最低返済）の確定計算を提示する（P0-1、v0.8サイクル8.2でEntry Fee折り込み）
 
     negotiation / commit / reflection / double_up の4プロンプトへ注入する。
-    表示は事実の数値のみ（推奨・危険等の評価語は書かない）。
+    表示は事実の数値のみ（推奨・危険等の評価語は書かない）。破産・生還未達の
+    見込みは事実として明示する（警告文言だが特定の行動を勧めない）。
 
     Args:
-        cash: Finance実行時点で見込まれる現金（呼び出し側の文脈に依存。
-            例: commit/negotiationでは「現時点（今R決着前）」の現金）
+        cash: Finance実行時点で見込まれる現金（Entry Fee控除前。呼び出し側の
+            文脈に依存。例: commit/negotiationでは「現時点（今R決着前）」の現金）
         debt_balance: 利息計上前の借金残高
         forecast_round: Financeが実行される（実行された）ラウンド番号
         config: ゲーム設定
         timing_note: 見出しに付す注記（いつ・何の後に実行されるかの事実）
-        entry_fee_note: Entry Feeに関する注記（P1-1。空文字なら非表示）
+        entry_fee_deduction: このRの必須Entry Fee（>0なら予測式に織り込んで表示）
+        entry_fee_note: Entry Feeに関する追加注記（空文字なら非表示）
     """
-    f = _compute_finance_forecast(debt_balance, cash, forecast_round, config)
+    f = _compute_finance_forecast(
+        debt_balance, cash, forecast_round, config,
+        entry_fee_deduction=entry_fee_deduction,
+    )
     lines: list[str] = [f"\n## Finance（R{forecast_round}）の確定計算{timing_note}"]
     lines.append(f"  借金残高（利息計上前）: {debt_balance}円（{debt_balance // 10_000}万円）")
     lines.append(
@@ -290,6 +306,13 @@ def _render_finance_block(
         f"  利息計上後の借金残高: {f['debt_after_interest']}円"
         f"（{f['debt_after_interest'] // 10_000}万円）"
     )
+    if entry_fee_deduction:
+        # v0.8サイクル8.2 D5: Entry Fee単体の充足/不足を境界値でも読み取れるようにする
+        sufficiency = "充足" if cash >= entry_fee_deduction else "不足"
+        lines.append(
+            f"  Entry Fee {entry_fee_deduction}円: {sufficiency}"
+            f"（現在の現金 {cash}円との比較）"
+        )
     if config.mandatory_repay_enabled:
         lines.append(
             f"  除数（このラウンドを含む残りラウンド数{config.num_rounds - forecast_round + 1}"
@@ -299,13 +322,32 @@ def _render_finance_block(
             f"  強制最低返済額 = ceil({f['debt_after_interest']}円 ÷ {f['divisor']}) "
             f"= {f['mandatory_repay']}円（{f['mandatory_repay'] // 10_000}万円）"
         )
-        lines.append(
-            f"  差引後の現金見込み: {cash}円 − {f['mandatory_repay']}円 "
-            f"= {f['cash_after_repay']}円（{f['cash_after_repay'] // 10_000}万円）"
-        )
+        # v0.8サイクル8.2 2-1: Entry Feeを織り込んだ1行式の現金見込みへ統合
+        if entry_fee_deduction:
+            lines.append(
+                f"  今R賞金0の場合の現金見込み: {cash}円 − Entry Fee {entry_fee_deduction}円 "
+                f"− 強制返済 {f['mandatory_repay']}円 = {f['cash_after_repay']}円"
+                f"（{f['cash_after_repay'] // 10_000}万円）"
+            )
+        else:
+            lines.append(
+                f"  今R賞金0の場合の現金見込み: {cash}円 − 強制返済 {f['mandatory_repay']}円 "
+                f"= {f['cash_after_repay']}円（{f['cash_after_repay'] // 10_000}万円）"
+            )
         if f["cash_after_repay"] < 0:
             lines.append(
-                f"    強制最低返済額との差額: {f['cash_after_repay']}円"
+                f"  ⚠ 今Rで市場賞金 {-f['cash_after_repay']}円以上を得られなければ、"
+                f"強制返済不能で破産脱落します"
+            )
+        elif (
+            forecast_round == config.num_rounds
+            and f["cash_after_repay"] < config.survival_cash
+        ):
+            lines.append(
+                f"  ⚠ この見込みでは強制返済後の現金が生還条件"
+                f"（{config.survival_cash // 10_000}万円以上）に"
+                f"{config.survival_cash - f['cash_after_repay']}円不足し、"
+                f"条件未達の可能性があります（市場結果・型A受取金は未確定のため概算です）"
             )
     if entry_fee_note:
         lines.append(f"  {entry_fee_note}")
@@ -450,6 +492,38 @@ def _render_market_line(
     if carryover:
         line += f"（基本{base_prize // 10_000}万 + 前R繰越{carryover // 10_000}万）"
     return line
+
+
+def _render_market_meta_lines(
+    visible_state: dict[str, Any], config: GameConfig,
+) -> list[str]:
+    """
+    市場高騰のしきい値・総賞金予算を描画する（v0.8サイクル8.2 2-2/4-2）
+
+    高騰しきい値はengine/settlement.py::_should_surgeと同一の判定式
+    （生存者数<=surge_full_participation_max_alive→全員参加のみ発動 /
+     それ以外→参加者数が生存者数の半分超で発動）を文章化したもの。
+    negotiation/commitで共有し、判定は事実の数値のみ（推奨語なし）。
+    """
+    lines: list[str] = []
+    alive_count = len(visible_state.get("alive_players", []))
+    if alive_count > 0:
+        max_alive = config.surge_full_participation_max_alive
+        if max_alive > 0 and alive_count <= max_alive:
+            lines.append(
+                f"  市場高騰のしきい値: 生存者数{alive_count}人（{max_alive}人以下）のため、"
+                f"その市場に生存者全員（{alive_count}人）が参加した場合のみ高騰（賞金プール全体が2倍）"
+            )
+        else:
+            k = alive_count // 2 + 1
+            lines.append(
+                f"  市場高騰のしきい値: その市場の参加者数が{k}人以上"
+                f"（生存者数{alive_count}人の半分超）で高騰（賞金プール全体が2倍）"
+            )
+    total_budget = visible_state.get("total_prize_budget")
+    if total_budget is not None:
+        lines.append(f"  総賞金予算（このゲーム全体・システム基本賞金の合計）: {total_budget // 10_000}万円")
+    return lines
 
 
 def _render_last_round_results(
@@ -604,22 +678,65 @@ def _render_contract_notice_block(visible_state: dict[str, Any]) -> list[str]:
                 f' あなたも {cancel_example} を出せば解除が進みます。'
                 '出さなければ契約は有効なままで、義務違反は従来どおり判定されます。'
             )
+        elif kind == "contract_expired":
+            unsigned = n.get("unsigned_by") or []
+            lines.append(
+                f'  [巡{turn}] {cid} は署名が揃わないまま今Rの交渉が終了し、失効しました'
+                f'（未署名: {", ".join(unsigned) if unsigned else "―"}）。'
+            )
+        elif kind == "trade_rejected":
+            lines.append(
+                f'  [巡{turn}] トレード {n.get("trade_id", "?")}'
+                f'（相手: {n.get("with_player", "?")}）は拒否されました。'
+            )
+        elif kind == "trade_expired":
+            lines.append(
+                f'  [巡{turn}] トレード {n.get("trade_id", "?")}'
+                f'（相手: {n.get("with_player", "?")}）は未受諾のまま'
+                f'今Rの交渉が終了し、失効しました。'
+            )
+        elif kind == "trade_superseded":
+            lines.append(
+                f'  [巡{turn}] トレード {n.get("trade_id", "?")}'
+                f'（相手: {n.get("with_player", "?")}）は、別のトレード'
+                f' {n.get("accepted_trade_id", "?")} が先に受諾されたため失効しました。'
+            )
+        elif kind == "trade_failed_funds":
+            short_side = n.get("short_side")
+            side_label = "提案者" if short_side == "proposer" else "受諾側"
+            lines.append(
+                f'  [巡{turn}] トレード {n.get("trade_id", "?")}'
+                f'（相手: {n.get("with_player", "?")}）は、{side_label}のFree Cash不足'
+                f'（必要額 {n.get("cash_amount", 0) // 10_000}万円）のため不成立になりました。'
+            )
+        elif kind == "double_up_blocked":
+            lines.append(
+                f'  [倍掛け] このRの倍掛け選択は自動的にTAKEになりました'
+                f'（獲得賞金{n.get("eligible_prize", 0) // 10_000}万円受領後の現金'
+                f'{n.get("cash", 0) // 10_000}万円が強制最低返済額'
+                f'{n.get("min_repay", 0) // 10_000}万円未満のため、DOUBLEは選択できません）。'
+            )
         else:
-            # v0.8で追加されたnotice kind（contract_expired/trade_*等）は
-            # 誤った文言（解除通知向けの固定文）で描画しないよう、ここではskipする。
-            # 描画対応は次タスクで行う（Plan Cycle 8.1「やらないこと」参照）。
+            # 未知のnotice kindは誤った固定文で描画しないよう安全にskipする
             continue
     if not lines:
         return []
     return ["\n## 📩 あなたが当事者の契約に関する通知"] + lines
 
 
-def _render_action_feedback_block(visible_state: dict[str, Any]) -> list[str]:
+def _render_action_feedback_block(
+    visible_state: dict[str, Any], *, include_remaining_slots: bool = True,
+) -> list[str]:
     """今ラウンドで不成立になった自分のアクションと残り枠を描画する（本人のみ）
 
     §2.5により不成立アクションもアクション枠を消費する。engineは枠を減らすだけで
     理由を一切返さないため、LLMは同じ不成立を繰り返して枠を使い切る。ここで返すのは
     engineの判定結果そのものであり、ゲームルールは変えない。
+
+    Args:
+        include_remaining_slots: Trueなら「残りアクション枠」行を含める。
+            reflectionプロンプト（今Rはすでに終了済み・枠は無意味）ではFalseにする
+            （v0.8サイクル8.2 5-1）。
     """
     failures = visible_state.get("my_failed_actions") or []
     budget = visible_state.get("my_action_budget") or {}
@@ -643,7 +760,7 @@ def _render_action_feedback_block(visible_state: dict[str, Any]) -> list[str]:
                     f"  ⚠ 同じ不成立を{n}回繰り返しています: {act}{tgt_s} / {reason}。"
                     f"この行動は今ラウンド何度試しても成功しません。")
     used, max_actions = budget.get("used"), budget.get("max")
-    if used is not None and max_actions:
+    if include_remaining_slots and used is not None and max_actions:
         remaining = max(0, max_actions - used)
         line = f"\n## 残りアクション枠: {remaining}/{max_actions}"
         if remaining <= 2:
@@ -672,6 +789,260 @@ def _render_double_up_deposit_lines(
     ]
 
 
+_DOUBLE_UP_RESULT_LABELS = {
+    "success": "成功（預託額の2倍を受領）",
+    "forfeit": "不成功（預託額は全額没収）",
+    "forfeit_eliminated": "不成功（預託額は全額没収・本人はこのRの脱落公示で確認できます）",
+}
+
+_CONTRACT_STATUS_LABELS = {
+    "active": "有効",
+    "completed": "完了（残義務なし）",
+    "cancelled": "解除（全当事者合意）",
+    "expired": "失効（未署名のまま今Rの交渉終了）",
+    "closed": "終了（残義務なし）",
+}
+
+
+def _render_initial_loans_block(visible_state: dict[str, Any]) -> list[str]:
+    """初期借入額（公開情報）を全員分描画する（v0.8サイクル8.2 2-3）。空なら非表示。"""
+    initial_loans = visible_state.get("initial_loans") or {}
+    if not initial_loans:
+        return []
+    lines = ["\n## 初期借入額（公開情報。現金・借金残高・Free Cashは秘匿）"]
+    for pid, amount in initial_loans.items():
+        lines.append(f"  {pid}: {amount // 10_000}万円")
+    return lines
+
+
+def _render_used_cards_block(visible_state: dict[str, Any]) -> list[str]:
+    """使用済みカード（全員・公開、カウンティング材料）を描画する（v0.8サイクル8.2 2-3）
+
+    engineがフォグラウンドとして"FOG"を返す場合はその旨のみ表示する。
+    """
+    used_cards = visible_state.get("used_cards") or {}
+    if not used_cards:
+        return []
+    lines = ["\n## 各プレイヤーの使用済みカード"]
+    for pid, cards in used_cards.items():
+        if cards == "FOG":
+            lines.append(f"  {pid}: （このラウンドは非公開）")
+        elif not cards:
+            lines.append(f"  {pid}: （まだなし）")
+        else:
+            lines.append(f"  {pid}: {', '.join(cards)}")
+    return lines
+
+
+def _render_others_double_ups_block(
+    visible_state: dict[str, Any], self_player_id: str,
+) -> list[str]:
+    """自分以外の倍掛け預託中（未決着）を描画する（v0.8サイクル8.2 2-3）。空なら非表示。
+
+    自分の分は既存の_render_double_up_deposit_linesで別途表示されるため、
+    ここでは他人の分のみを対象とする（選択者・預託額・成否は公開情報）。
+    """
+    others = [
+        du for du in visible_state.get("double_ups", []) or []
+        if du.get("player_id") != self_player_id
+    ]
+    if not others:
+        return []
+    lines = ["\n## 倍掛け中のプレイヤー"]
+    for du in others:
+        deposit_man = du['deposit'] // 10_000
+        double_man = du['deposit'] * 2 // 10_000
+        lines.append(
+            f"  {du['player_id']}: 預託{deposit_man}万円"
+            f"（今Rの市場で賞金を得れば{double_man}万円受領、得られなければ没収）"
+        )
+    return lines
+
+
+def _render_double_ups_resolved_block(
+    visible_state: dict[str, Any], *, heading: str = "前ラウンドの倍掛け結果",
+) -> list[str]:
+    """直近で決着した倍掛けの結果を描画する（v0.8サイクル8.2 2-3/5-2）。空なら非表示。
+
+    Args:
+        heading: 見出し文言。negotiation/commitでは「前ラウンドの倍掛け結果」
+            （前Rの市場決着で判明した結果）、reflection/double_upでは
+            「今ラウンドの倍掛け結果」（このRのSettlementで判明した結果）を渡す。
+    """
+    resolved = visible_state.get("double_ups_resolved") or []
+    if not resolved:
+        return []
+    lines = [f"\n## {heading}"]
+    for du in resolved:
+        result = du.get("result")
+        deposit_man = du['deposit'] // 10_000
+        if result == "success":
+            payout_man = du.get("payout", 0) // 10_000
+            outcome = f"成功（{payout_man}万円受領）"
+        elif result == "forfeit_eliminated":
+            outcome = "脱落により没収"
+        else:
+            outcome = "没収"
+        lines.append(f"  {du['player_id']}: 預託{deposit_man}万円 → {outcome}")
+    return lines
+
+
+def _render_bounties_public_block(
+    visible_state: dict[str, Any], *, include_cancel_hint: bool = True,
+) -> list[str]:
+    """有効な公開報奨一覧を描画する（negotiation/commit共通。v0.8サイクル8.2 4-2）
+
+    Args:
+        include_cancel_hint: Trueならbounty_cancelの記入例を併記する
+            （交渉プロンプト向け。コミットプロンプトではbounty_cancelを
+            選べないため通常False）
+    """
+    bounties_public = [
+        b for b in visible_state.get("bounties_public", []) if b.get("is_active")
+    ]
+    if not bounties_public:
+        return []
+    lines = ["\n## 有効な公開報奨"]
+    if include_cancel_hint:
+        lines.append(
+            '取り下げ（自分が掲載した報奨のみ）: '
+            '{"type": "bounty_cancel", "bounty_id": "報奨ID"}'
+        )
+    for b in bounties_public:
+        poster = b.get("poster") or "匿名"
+        cond = b.get("condition", {})
+        target = cond.get("target_player", "?")
+        lines.append(
+            f"  {b['bounty_id']}: {b['amount'] // 10_000}万円"
+            f" / {b['condition_type']}(target={target})"
+            f" / 掲載者: {poster}"
+        )
+    return lines
+
+
+def _render_contracts_public_block(
+    visible_state: dict[str, Any], *, active_only: bool = True,
+    self_player_id: str | None = None,
+) -> list[str]:
+    """契約の存在・当事者名（公開情報。内容は当事者のみ）を描画する（v0.8サイクル8.2 2-3/5-2）
+
+    Args:
+        active_only: Trueならstatus=activeのみ（negotiation/commit向け）。
+            Falseなら5種別すべてを状態ラベル付きで描画する（reflection向け）。
+        self_player_id: 指定すると自分が当事者の契約に「（あなたが当事者）」を付す。
+    """
+    contracts = visible_state.get("contracts_public") or []
+    if active_only:
+        contracts = [c for c in contracts if c.get("status") == "active"]
+    if not contracts:
+        return []
+    lines = ["\n## 正式契約の状況（公示）"]
+    for c in contracts:
+        parties = c.get("parties", [])
+        line = f"  [{c['contract_id']}] 当事者: {', '.join(parties)}"
+        if not active_only:
+            status = c.get("status")
+            label = _CONTRACT_STATUS_LABELS.get(status, str(status))
+            line += f" - {label}"
+        if self_player_id and self_player_id in parties:
+            line += "（あなたが当事者）"
+        eliminated = c.get("eliminated_parties") or []
+        if eliminated:
+            line += f"（脱落済み当事者: {', '.join(eliminated)}）"
+        if c.get("cancelled_round") is not None and not active_only:
+            line += f"（R{c['cancelled_round']}に解除）"
+        lines.append(line)
+    return lines
+
+
+def _render_trades_completed_block(visible_state: dict[str, Any]) -> list[str]:
+    """成立済みカードトレード（当事者名のみ公開）を描画する（v0.8サイクル8.2 2-3/5-2）。空なら非表示。"""
+    trades = visible_state.get("trades_completed") or []
+    if not trades:
+        return []
+    lines = ["\n## 成立済みカードトレード（当事者名のみ公開。交換内容は秘匿）"]
+    for t in trades:
+        players = t.get("players", [])
+        lines.append(f"  R{t['round']}: {' ⇄ '.join(players)}")
+    return lines
+
+
+_TRADE_STATUS_LABELS = {
+    "proposed": "提案中（受諾待ち）",
+    "accepted": "成立（交換完了）",
+    "rejected": "拒否された",
+    "expired": "失効（未受諾のまま今Rの交渉終了）",
+}
+
+
+def _render_my_trades_this_round_block(visible_state: dict[str, Any]) -> list[str]:
+    """自分が今ラウンドに提案したカードトレードの一覧（v0.8サイクル8.2 2-5）
+
+    trades_pending（現時点で受諾待ちのもの）とは異なり、今Rに自分が出した
+    提案の顛末（成立/拒否/失効含む）を提案者本人向けに描画する。空なら非表示。
+    """
+    trades = visible_state.get("my_trades_this_round") or []
+    if not trades:
+        return []
+    lines = ["\n## あなたが今ラウンドに提案したカードトレード"]
+    for t in trades:
+        status = t.get("status")
+        label = _TRADE_STATUS_LABELS.get(status, str(status))
+        cash = t.get("cash_amount", 0)
+        if cash > 0:
+            cash_str = f"、あなたが{cash // 10_000}万円を払う"
+        elif cash < 0:
+            cash_str = f"、あなたが{abs(cash) // 10_000}万円を受け取る"
+        else:
+            cash_str = ""
+        lines.append(
+            f"  {t['trade_id']}: あなたの{t['give_card_rank']} ⇄ "
+            f"{t['with_player']}の{t['receive_card_rank']}{cash_str} - {label}"
+        )
+    return lines
+
+
+def _render_contract_propose_template(
+    player_state: PlayerState, round_num: int, config: GameConfig, other: str,
+) -> list[str]:
+    """contract_proposeの記入例を、今Rと実在の相手IDで埋めて描画する（v0.8サイクル8.2 2-8）。
+
+    システムプロンプトの{me}/{other}の一般例とは別に、交渉プロンプトでは
+    contract_proposeが実際に選べるときだけ、その場で使える具体例を出す。
+    最終R（R{num_rounds}）はSettlementが同R内で完結するため、型A（将来払い）の
+    支払先を翌Rに置けないので型Aの例は省く。
+    """
+    me = player_state.player_id
+    lines = [
+        "\n## contract_propose の雛形（値は今の生存者・ラウンドから機械的に埋めた"
+        f"一例にすぎません。round_num は今R（{round_num}）以降）:"
+    ]
+    type_b_round = min(round_num + 1, config.num_rounds)
+    if round_num >= config.num_rounds:
+        lines.append(
+            f'  {{"type": "contract_propose", "with": ["{other}"], "terms": ['
+            f'{{"obligor": "{other}", "counterparty": "{me}", '
+            f'"ob_type": "type_b_no_market", "round_num": {type_b_round}, '
+            f'"details": {{"market_id": "M03"}}}}]}}'
+        )
+        lines.append(
+            f"  ※最終R（R{config.num_rounds}）はSettlementが同R内で完結するため、"
+            f"翌Rへの支払いとなる型A（将来払い）の例は省略します"
+        )
+    else:
+        type_a_round = min(round_num + 2, config.num_rounds)
+        lines.append(
+            f'  {{"type": "contract_propose", "with": ["{other}"], "terms": ['
+            f'{{"obligor": "{other}", "counterparty": "{me}", '
+            f'"ob_type": "type_b_no_market", "round_num": {type_b_round}, '
+            f'"details": {{"market_id": "M03"}}}}, '
+            f'{{"obligor": "{me}", "counterparty": "{other}", '
+            f'"ob_type": "type_a_payment", "round_num": {type_a_round}, '
+            f'"details": {{"amount": 300000}}}}]}}'
+        )
+    return lines
+
+
 def _available_negotiation_actions(
     player_state: PlayerState,
     round_num: int,
@@ -691,6 +1062,15 @@ def _available_negotiation_actions(
     """
     fee_anon = config.anon_broadcast_fee // 10_000
     fee_contract = config.contract_fee // 10_000
+    # v0.8 サイクル8.2: contract_fee==0のとき「発行料」文言を一切出さない
+    contract_propose_desc = (
+        "相手の行動・支払いを保証させる正式契約を提案。相手が署名すれば成立。無料"
+        if config.contract_fee == 0
+        else (
+            "相手の行動・支払いを保証させる正式契約を提案。相手が署名すれば成立。"
+            f"発行料{fee_contract}万円"
+        )
+    )
     desc = {
         "dm": "特定の相手に非公開で送る",
         "broadcast": "全員に公開で送る",
@@ -700,10 +1080,10 @@ def _available_negotiation_actions(
         "bounty_post": "条件付きの報奨を掲示する",
         "bounty_cancel": "自分の報奨を取り下げる",
         "repay": "借金を任意返済",
-        "contract_propose": f"口頭合意を拘束力のある正式契約にする。発行料{fee_contract}万円",
+        "contract_propose": contract_propose_desc,
         "contract_sign": "提案された契約に署名して成立させる",
         "contract_cancel": "成立済み契約の解除を申し出る",
-        "card_trade_propose": "未使用カードを1枚ずつ交換する提案",
+        "card_trade_propose": "未使用カードを1枚⇄1枚で交換する提案。最大5人へ同時提案可",
         "card_trade_accept": "提案されたトレードを受諾",
         "card_trade_reject": "提案されたトレードを拒否",
     }
@@ -760,8 +1140,18 @@ def _available_negotiation_actions(
     else:
         unavailable.append("contract_cancel（あなたが当事者の有効な契約なし）")
 
+    # v0.8サイクル8.2 2-7: 今Rにすでにcard_trade_max_per_round回、成立済みトレードの
+    # 当事者になっている場合は不可（engine/actions.py::_trade_counts判定と同一の
+    # 事実をtrades_completed（当事者名のみ公開）から再構成する）
+    trades_this_round_count = sum(
+        1 for t in (visible_state.get("trades_completed") or [])
+        if t.get("round") == round_num and player_state.player_id in (t.get("players") or [])
+    )
     if config.card_trade_enabled and round_num <= config.card_trade_last_round:
-        _add("card_trade_propose")
+        if trades_this_round_count >= config.card_trade_max_per_round:
+            unavailable.append("card_trade_propose（今Rのトレード成立済み）")
+        else:
+            _add("card_trade_propose")
     else:
         unavailable.append("card_trade_propose（R12は不可）")
 
@@ -820,61 +1210,70 @@ RULES_SUMMARY = """# 談合カード ルール
 - プレイヤー{num_players}体が12ラウンドで競う市場争奪ゲーム
 - 毎ラウンド3つの市場が出現し、各プレイヤーは秘密裏に「参加市場」と「使用カード」をコミットする
 - 同じ市場に参加したプレイヤーのうち、最高ランクのカードを出した者が賞金プール全額を獲得
-- 目的: 12ラウンド終了時に「借金残高=0」かつ「現金{survival_cash_man}万円以上」で生還すること。生還者の中で最終資産が高いほど良い
+- 目的: 12ラウンド終了時に「借金残高=0」かつ「現金{survival_cash_man}万円以上」で生還すること
+- **生存は最低限の条件であり勝利ではない。** 生存者中の最終現金が高いほど上位（総合1位が最高評価）。生存を失わない範囲で上位を狙うのが期待され、条件を失えば明確な敗北
 
 ## 生還条件と脱落
 - 生還: R12のFinance終了時にDebt=0かつCash≧{survival_cash_man}万円
-- 脱落の3種別:
+- 脱落の4種別:
   1. 契約違反: 型B行動契約の違反、または型A金銭契約の履行不能 → 即時脱落
-  2. 破産: Entry Fee(必須支払い)を支払えない → 即時脱落
-  3. 条件未達: R12終了時に生還条件を満たさない
-- 脱落は全体に公示される（理由の種別も公示）。脱落者は以後一切行動せず、脱落者を宛先にしたアクション（DM・送金・契約提案・カードトレード）はすべて不成立になる
-- 脱落時強制清算: 現金→借金へ自動充当 → 残債は貸倒れ → 残金はシステム没収（生存者への再分配なし）→ 未使用カード消滅
+  2. 破産(Entry Fee): Entry Fee（必須支払い）を支払えない → 即時脱落
+  3. 破産(強制返済): 毎ラウンドの最低返済額を支払えない → 即時脱落（R12は残債全額が最低返済額）
+  4. 条件未達: R12で完済したが現金{survival_cash_man}万円未満
+- 脱落は理由種別込みで全体に公示。脱落者は以後行動せず、脱落者宛のアクション（DM・送金・契約提案・カードトレード）は不成立になる
+- 脱落時強制清算: 現金→借金へ自動充当→残債貸倒れ→残金はシステム没収（生存者への再分配なし）→未使用カード消滅。倍掛け預託中の金額も没収
 
 ## カード（12枚、各自同一構成）
 ランク1:HIGH_CARD×2, 2:ONE_PAIR×2, 3:TWO_PAIR×1, 4:THREE_OF_A_KIND×1, 5:STRAIGHT×1, 6:FLUSH×1, 7:FULL_HOUSE×1, 8:FOUR_OF_A_KIND×1, 9:STRAIGHT_FLUSH×1, 10:ROYAL_FLUSH×1
 - 使用したカードは消滅。1ラウンド1枚必ず使用、12ラウンドで使い切る
 - 他人の未使用カードは秘匿、使用済みカードは全公開（カウンティング材料）
-- 同ランク最高位は賞金均等分配。譲渡・売買は不可
+- 同ランク最高位は賞金均等分配。一方的な譲渡・売却は不可（カードトレードによる1枚⇄1枚の交換のみ可）
 
 ## 市場
 - 毎ラウンド3市場を賞金額とともに公開。**1ラウンドに参加できる市場は1つだけで、複数市場への同時参加はできない**
-- 市場参加につきEntry Fee {entry_fee_man}万円（1ラウンド1市場なので毎ラウンド{entry_fee_man}万円。必須支払い。当該市場の賞金プールへ加算）
+- 市場参加につきEntry Fee {entry_fee_man}万円（1R1市場なので毎R{entry_fee_man}万円。必須支払い、当該市場の賞金プールへ加算）
 - 参加者が多いほど賞金プールが膨らむ（ハニーポット戦術が成立）
 - 参加者1人の市場: その1人が獲得（空き巣）
 - 参加者0の市場: 翌ラウンドの同市場へキャリーオーバー（最終Rのみ消滅）
 
-## 借入・利息・返済
+## 借入・利息・強制返済
 - ゲーム開始前に{loan_min_man}万〜{loan_max_man}万円を借入。借入額=初期資金=初期借金残高
 - 借入額は公開情報。現金・借金残高・Free Cashは秘匿
 - 毎ラウンドのFinanceフェイズで借金残高へ{interest_pct}%の複利を計上
-- R1〜R11: Negotiation中にrepayアクションで任意返済可能（早期返済で利息を減らせる）。追加借入は禁止
-- **R12 Finance: 返済可能額を自動的に借金へ全額充当**（返済し忘れによる脱落を防止）
-- 生還判定はR12のFinance終了後
+- **強制最低返済**: 利息計上後、最低返済額（=借金残高÷残りラウンド数[このRを含む]、端数切り上げ）を自動返済。払えなければ破産脱落。実際の金額は毎回「Finance見込み」欄に表示
+- **R12**: 残債全額が最低返済額。払えなければ破産、払えても現金{survival_cash_man}万円未満なら条件未達
+- R1〜R11: Negotiation中にrepayアクションで任意の追加返済も可能。追加借入は禁止
 - 開始時は全員Free Cash=0（Cash=借入額=Debt）。金銭による買収や報奨は誰かが稼ぐまで使えない
 
 ## Free Cash = max(0, 現金 − 借金残高[利息込み])
-- 適用対象（Free Cash以内でのみ可能）: 送金、金銭契約（即時・将来とも）、報奨の預託
-- 非適用（システム向け支払い）: Entry Fee、利息、借金返済、契約発行料、匿名通信費
+- 適用対象（Free Cash以内でのみ可能）: 送金、金銭契約（執行時に判定）、報奨の預託、カードトレードの現金支払い
+- 非適用（システム向け支払い）: Entry Fee、利息、借金返済、匿名通信費{contract_fee_freecash_note}
 
 ## ラウンド進行
 1. Market Open: 3市場と賞金を公開（キャリーオーバー反映）
-2. Negotiation: 最大10巡、毎巡ランダム手番。DM/全体発言/送金(即時決済)/契約提案・署名/契約解除/報奨/匿名通信/カードトレード/返済/pass。全員連続パスで早期終了。1プレイヤーあたり最大{negotiation_max_actions}アクション/ラウンド（passは枠を消費しない。**不成立アクションも枠を消費する**が、宛先が「生存者」欄にいるか・Free Cashが足りるかを出す前に確認すれば避けられる）
+2. Negotiation: 最大10巡、毎巡ランダム手番。DM/全体発言/送金(即時決済)/契約提案・署名/契約解除/報奨/匿名通信/カードトレード/返済/pass。全員連続パスで早期終了。1人{negotiation_max_actions}アクション/R上限（passは枠を消費しないが**不成立アクションは枠を消費する**。宛先が「生存者」欄にあるか・Free Cash十分か確認すれば避けられる）。署名待ち契約提案・未受諾トレードはフェイズ終了時に失効
 3. Commit: 全生存プレイヤーが「市場+カード」を秘密提出。Entry Fee不足→破産脱落。手札に無いカード名を指定した場合や無効な指定の場合はシステムが自動で選ぶ（AUTO COMMIT）
-4. Settlement（8Step処理）:
+4. Settlement:
    - Reveal: 全市場の参加者・使用カードを公開
-   - Market Settlement: Entry Feeプール加算→勝敗判定→賞金支払い→カード消滅
+   - Market Settlement: 高騰判定→Entry Feeプール加算→勝敗判定→賞金支払い→カード消滅
+   - 前R倍掛けの判定: 成功→2倍払出 / 失敗→没収。払出はこの後の型A支払原資になる
    - 型B行動契約の監査: 市場/カード指定の照合。違反者はこの時点で脱落確定
-   - スナップショット: 市場賞金反映後のCash/Free Cashを固定（型A判定の基準）
+   - スナップショット: 市場賞金・倍掛け払出反映後のCash/Free Cashを固定（型A判定の基準）
    - 型A金銭契約のAtomic執行: 義務者ごとに合算判定、1円でも不足なら全件履行不能→脱落
-   - 報奨判定・脱落処理・強制清算
-5. Finance: 利息計上→返済（R12は自動返済→生還判定）
+   - 報奨判定・脱落公示・強制清算
+   - （Settlement後）今Rの賞金獲得者がTAKE/DOUBLEを選択。DOUBLEなら預託額を現金から減算
+5. Finance: 利息計上 → 強制最低返済（不能→破産）→ 任意追加返済 → [R12のみ: 生還判定]
 
-## 正式契約（発行料{contract_fee_man}万円、提案者負担）
-- 2人以上の連名で成立。契約の存在と当事者名は公示、内容は当事者のみ
-- 型A（金銭）: 指定ラウンドに自動支払い。Free Cash不足で脱落
-- 型B（行動）: 市場指定/カード指定/不参加指定。違反で即脱落
-- 義務単位で管理: 脱落者が義務者or相手方の義務のみ失効、生存者間の義務は継続
+{contract_section_head}
+- このゲームで唯一の「破れない約束」。{contract_free_word}署名した当事者の義務はシステムが自動執行/自動監査し、違反・履行不能は義務者の即時脱落
+  - 縛る効果: 相手を縛れば「来ない」「出す」「払う」を前提に自分の市場・カードを選べる。自分を縛れば口約束にない信用を得て相手から市場・カード・現金を引き出せる
+- 成立の流れ: contract_propose→提案者は自動署名済み→相手がcontract_signした時点で成立。片務（自分だけが義務を負う）契約も可。署名されないまま今Rの交渉が終われば提案は失効（提案者に通知）
+- 型A（金銭）: 指定ラウンドのSettlementで自動支払い。支払能力は**執行時**のFree Cashで判定（いまFree Cash0でも将来払いを提案・署名可。執行時に不足すれば脱落）
+- 型B（行動）: 市場指定 / カード指定 / 不参加指定。Reveal後にCommit内容と照合。Free Cash不要（序盤から使える）
+- 提案時の検証: round_numは今R以降、market_idはM01〜M03、amountは正の整数、義務者・相手方は当事者のみ。不正な提案は不成立（枠は消費）
+- 解除: 未到来の義務が残る契約は、生存する全当事者が contract_cancel を出せば解除できる（履行済み・監査済み義務はそのまま）。残義務ゼロの契約は自動で閉じる
+- 契約の存在と当事者名は全員に公示、内容は当事者のみ
+- 義務単位で管理: 脱落者が義務者or相手方の義務のみ失効、生存者間の義務は継続（脱落者への未回収債権は消滅）
 
 ## 匿名通信・公開報奨
 - 匿名通信: {anon_fee_man}万円で発信者を伏せた1メッセージを全体へ（1プレイヤー1ラウンド2通まで）
@@ -885,18 +1284,19 @@ RULES_SUMMARY = """# 談合カード ルール
   - 匿名掲載可（手数料+10%）。取り下げ自由（預託金返還）
 
 ## 公開情報と秘匿情報
-- 公開: 初期借入額、総賞金予算、各ラウンドの市場と賞金、使用済み全カード、各市場の参加者・使用カード（決着後）、勝者と獲得額、契約の存在と当事者名、公開報奨、全体チャット、AUTO COMMIT発生、脱落者と理由種別
-- 秘匿: 未使用カード、現金・借金残高・Free Cash、DM、契約内容、匿名通信・匿名報奨の掲載者、次ラウンドのコミット内容
+- 公開: 初期借入額、総賞金予算、市場と賞金、使用済み全カード、各市場の参加者・使用カード（決着後）、勝者と獲得額、契約の存在と当事者名、カードトレード成立の事実（当事者名）、市場高騰の発生、倍掛け状況（選択者・預託額・成否）、公開報奨、全体チャット、AUTO COMMIT発生、脱落者と理由種別
+- 秘匿: 未使用カード、現金・借金残高・Free Cash、DM、契約内容、カードトレードで交換されたカード・現金、匿名通信・匿名報奨の掲載者、個別財務通知、次ラウンドのコミット内容
 
 ## 口約束と正式契約の違い
-- 口約束: コスト無料、拘束力なし、破っても信用を失うのみ
-- 正式契約: 発行料{contract_fee_man}万円、自動執行/自動監査、破れば即時脱落、存在は公示
+- 口約束: 拘束力なし。破っても信用を失うのみ
+- 正式契約: 相手の署名で成立。自動執行/自動監査。破れば義務者が即時脱落。存在は公示
 
 ## 経済の注意点
 - 全員生還は算術的に不可能（全員の生還に必要な金額 > 総賞金）。協調の温い均衡は成立しない
-- 場への純注入は市場賞金のみ。利息・手数料・没収金は場からの純流出
+- 場への純注入は市場賞金のみ。利息・匿名通信費・報奨手数料・没収金・倍掛け没収は場からの純流出
 - 送金はNegotiation中に即時決済（双方のCash/Free Cashへ即反映）
 - 型A契約のAtomic執行: 同一Settlement内で受け取る予定の型A受取金は支払原資にできない
+- 市場賞金と前R倍掛けの払出は同一Rの型A支払原資になる
 
 ## アクション形式（JSON）
 出力は必ず以下の形式:
@@ -914,45 +1314,44 @@ strategyに必ず"emotion"を含めてください。現在のあなたの感情
 - {{"type": "repay", "amount": 1000000}}
 - {{"type": "anonymous_broadcast", "message": "..."}}
 - {{"type": "pass"}}
-- {{"type": "contract_propose", "with": ["P07"], "terms": [
-    {{"obligor": "自分のID", "counterparty": "P07", "ob_type": "type_a_payment", "round_num": 5, "details": {{"amount": 500000}}}},
-    {{"obligor": "P07", "counterparty": "自分のID", "ob_type": "type_b_market", "round_num": 5, "details": {{"market_id": "M02"}}}},
-    {{"obligor": "P07", "counterparty": "自分のID", "ob_type": "type_b_card", "round_num": 5, "details": {{"card_rank": "FLUSH"}}}}
+- {{"type": "contract_propose", "with": ["{other}"], "terms": [
+    {{"obligor": "{other}", "counterparty": "{me}", "ob_type": "type_b_no_market", "round_num": 8, "details": {{"market_id": "M03"}}}},
+    {{"obligor": "{me}", "counterparty": "{other}", "ob_type": "type_a_payment", "round_num": 9, "details": {{"amount": 300000}}}}
   ]}}
-  ※ob_type: type_a_payment(金銭支払) / type_b_market(市場指定) / type_b_card(カード指定) / type_b_no_market(不参加指定)
+  ※例: {other}がR8にM03へ不参加の代わりに{me}がR9に30万円払う。round_numは提案時点以降を指定（番号は架空）
+  ※ob_type: type_a_payment(金銭支払:amount) / type_b_market(市場指定:market_id) / type_b_card(カード指定:card_rankへ大文字カード名) / type_b_no_market(不参加指定:market_id)
+  ※withは複数可（3者以上の契約）。片務契約（termsが自分の義務だけ）も可
 - {{"type": "contract_sign", "contract_id": "..."}}
 - {{"type": "contract_cancel", "contract_id": "..."}}
-  ※成立済み契約の解除。**生存する全当事者が同じ contract_cancel を出した時点で解除成立**。
-    1人でも出していなければ元の契約は有効なまま。
-    **義務が1件でも履行/違反/監査済みになった契約は解除できません**（今Rが期限の義務までは解除可）。
-    契約内容を変えたいときは「旧契約を全員で解除 → 新条件で contract_propose」の順で行う。
-    同じ相手と両立しない契約（例: 同じラウンドについて別々の市場を指定する型B）を二重に結ぶと、どちらかが必ず型B違反になる。
-    条件を変えたいときは「旧契約を全員で解除 → 新条件で contract_propose」の順にすれば回避できる。
+  ※成立済み契約の解除申し出。生存する全当事者が出した時点で未到来の義務のみ解除。条件変更は「旧契約を全員で解除→新条件でcontract_propose」
 - {{"type": "bounty_post", "amount": 500000, "bounty_type": "achievement", "condition_type": "market_win_against", "condition": {{"target_player": "P07"}}, "round_num": 5}}
+  ※bounty_type: achievement(達成者型) / event(イベント型)。condition_type: market_win_against / same_market / player_eliminated。achievement×player_eliminatedは不可
+  ※イベント型の例: {{"type": "bounty_post", "amount": 500000, "bounty_type": "event", "condition_type": "player_eliminated", "condition": {{"target_player": "P07"}}, "round_num": 5}}
 - {{"type": "bounty_cancel", "bounty_id": "B_xxxxxxxx"}}
-- {{"type": "card_trade_propose", "with_players": ["P07"], "give_card": "ONE_PAIR", "receive_card": "FLUSH", "cash_amount": 0}}
-  ※with_playersは最大5人のリスト（ブロードキャスト提案）。cash_amount: 正=自分が払う、負=相手が払う、0=カード交換のみ
-  ※1ラウンド1回まで。R12は不可。受諾した相手と即時交換成立、他の宛先は自動失効。拒否に理由は添えられない
-※宛先を取るアクション（dm / transfer / contract_propose の with / card_trade_propose の with_players）の宛先は、毎ターン提示される「生存者」欄から選べばよい。脱落者を指定すると必ず不成立になり、アクション枠だけを失うが、生存者欄から選ぶ限りこれは起きない。
+- {{"type": "card_trade_propose", "with_players": ["{other}"], "give_card": "ONE_PAIR", "receive_card": "FLUSH", "cash_amount": 0}}
+  ※with_playersは最大5人（同時提案、最初の受諾相手と成立、他は失効）。自分は指定不可。cash_amount: 正=自分が払う/負=相手が払う/0=交換のみ（Free Cash以内）
+  ※成立は1R1回まで（流れた提案は消費しない）。R12不可。契約使用予定（型Bカード指定・未到来）のカードは出せない。未受諾は今Rの交渉終了時に失効し、拒否・失効は提案者に通知
+- {{"type": "card_trade_accept", "trade_id": "..."}} / {{"type": "card_trade_reject", "trade_id": "..."}}
+※宛先（dm/transfer/contract_proposeのwith/card_trade_proposeのwith_players）は毎ターン提示される「生存者」欄から選べばよい。脱落者指定は不成立でアクション枠を失うが、生存者欄から選ぶ限り起きない
 
 ## 各アクションの使いどころ（便益 / コスト・失敗条件）
 - dm / broadcast: 便益=コスト無料で情報と口約束を配れる。コスト=拘束力はゼロで、破られても相手に罰はない
-- transfer: 便益=即時決済なので、その場で信用や協力を買える。コスト=Free Cash以内でのみ可能。返金は相手の任意
-- repay: 便益=借金残高が減り、以後の複利と毎ラウンドの強制最低返済額が下がる（Free Cashも増えやすくなる）。コスト=手元の現金が減る。Entry Fee分を残しているか確認すること
-- anonymous_broadcast: 便益=発信者を伏せたまま全体へ情報を出せる。コスト=1通{anon_fee_man}万円の現金払い、1ラウンド2通まで
-- contract_propose / contract_sign: 便益=口約束と違い、システムが自動で監査・執行する。相手が破れば相手は即時脱落するので、裏切りに機械的なコストを付けられる。「絶対に来ない」「必ずこのカードを出す」を検証可能な形にできる。コスト=発行料{contract_fee_man}万円は提案者負担。自分が義務者の側は、自分の違反・履行不能でも即時脱落する
-- contract_cancel: 便益=不要になった契約・条件を変えたい契約を、全当事者の合意で無効化できる（違反脱落を回避する正規の手段）。コスト=生存する全当事者が同じ contract_cancel を出すまで成立しない。義務が1件でも履行/違反/監査済みの契約は解除できない
-- bounty_post: 便益=自分では実行できない結果を、第三者の行動として金で買える。匿名でも掲載できる。コスト=預託はFree Cash制限対象。匿名掲載は手数料+10%。取り下げれば預託金は返還される
-- card_trade_propose / card_trade_accept / card_trade_reject: 便益=システムが原子的に執行するので相手の信用が要らない。手札の穴を埋めて勝てる市場を作れる。最大5人へ同時提案でき、最初に受諾した相手と即時成立する。コスト=1ラウンド1回まで、R12は不可。現金支払いはFree Cash以内で、支払不能なら不成立（脱落はしない）
+- transfer: 便益=即時決済でその場の信用や協力を買える。コスト=Free Cash以内のみ可能。返金は相手の任意
+- repay: 便益=借金残高が減り、以後の利息（{interest_pct}%/R）と強制最低返済額が下がる。コスト=現金が減る（Entry Fee・契約・トレードの原資と共通）
+- anonymous_broadcast: 便益=発信者を伏せて情報や噂を全体に流せる。信用を賭けずに市場誘導・他人の同盟を揺さぶれる。コスト=1通{anon_fee_man}万円の現金払い、1R2通まで
+- contract_propose / contract_sign: 便益=相手の行動・支払いを確定できる（不参加市場を作る、使用カードを固定する、将来支払いを保証させる）。自分が義務を負えば約束の信用が増し、片務契約は署名されやすい。コスト=義務者は違反・履行不能で即時脱落し、行動の自由を失う
+- contract_cancel: 便益=不要な契約を全当事者合意で無効化できる（違反脱落を避ける正規の手段）。コスト=生存する全当事者が出すまで成立しない
+- bounty_post: 便益=自分で実行できない結果を第三者の行動として金で買える。匿名掲載も可。コスト=預託はFree Cash制限対象、匿名掲載は手数料+10%。取り下げれば預託金返還
+- card_trade_propose / card_trade_accept / card_trade_reject: 便益=信用不要で原子的に執行され、手札の穴を埋めて勝てる市場を作れる。弱いカードを現金付きで手放し返済原資にもできる。最大5人へ同時提案し先着受諾で成立。コスト=成立は1R1回、R12不可。現金はFree Cash以内、不能なら不成立（脱落なし）
 
 コミットフェイズのアクション:
 - {{"type": "market_commit", "market_id": "M01", "card": "ONE_PAIR"}}
 
 ## Season 2 追加ルール（有効時のみ適用）
-- **市場高騰**: 同一市場への参加者数が生存者数の半分を超えると、その市場の賞金プールが2倍になる（3人以下の場合は全員参加のみ発動）
-- **強制最低返済**: 毎ラウンドのFinanceで、利息計上後の借金残高 ÷（このラウンドを含む残りラウンド数）を切り上げた額が自動返済される。実際の金額と内訳はNegotiation/Commit/倍掛け選択/振り返りの各状態欄（Finance見込み）に毎回表示される。返済を先送りできないため、計画的な資金管理が必要
-- **カードトレード**: Negotiation中に他プレイヤーとカード交換を提案できる（1ラウンド1回まで、R12は不可）。複数宛先へのブロードキャスト提案が可能で、最初に受諾した相手と即時交換される
-- **倍掛け**: 市場賞金を獲得した直後にTAKE（即時受領）かDOUBLE（預託）を選択。DOUBLEを選ぶと賞金を預託し、次ラウンドで市場賞金を獲得すれば預託額の2倍を受領。獲得できなければ全額没収。参加者が自分1人だけの市場（空き巣）での賞金は成功判定に含めない。R11が最後の選択機会（R12は自動TAKE）。選択と預託額は全員に公開される
+- **市場高騰**: 同一市場の参加者数が生存者数の半分超で、その市場の賞金プール全体（基本賞金+繰越+Entry Fee合計）が2倍（生存者3人以下は全員参加のみ発動）。判定はReveal後の実参加人数（行くと言って行かなければ潰せる）
+- **強制最低返済**: 「借入・利息・強制返済」参照。返済を先送りできないため、計画的な資金管理が必要
+- **カードトレード**: 「アクション形式」参照
+- **倍掛け**: 市場賞金獲得直後にTAKE（即時受領）かDOUBLE（預託）を選択。DOUBLEは次R市場賞金1円以上獲得で預託額の2倍、獲得なしなら全額没収（空き巣勝利は成功に含めない）。預託金は現金扱いされず（Entry Fee・契約・強制返済・トレード不可）、預託後現金が強制最低返済額未満ならDOUBLE不可（自動TAKE、通知あり）。成功時の2倍払出は次Rの型A支払原資になり再DOUBLE不可。R11が最終選択機会（R12は自動TAKE）。選択・預託額・結果は全員公開
 {final_market_rule}"""
 
 
@@ -975,6 +1374,27 @@ def build_system_prompt(player_id: str, config: GameConfig) -> str:
     else:
         final_market_rule = ""
 
+    # v0.8 サイクル8.2: 発行料の条件分岐（contract_fee==0のとき「発行料」文言を一切出さない）
+    contract_fee_man = config.contract_fee // 10_000
+    if config.contract_fee == 0:
+        contract_section_head = "## 正式契約（公正証書）"
+        contract_free_word = "無料。"
+        contract_fee_freecash_note = ""
+    else:
+        contract_section_head = (
+            f"## 正式契約（公正証書。発行料{contract_fee_man}万円、提案者負担）"
+        )
+        contract_free_word = ""
+        contract_fee_freecash_note = "、契約発行料"
+
+    # {me}/{other}: system prompt を席ごとに埋め込む（{other}は席順で自分の次のID）
+    me = player_id
+    try:
+        seat_num = int(player_id[1:])
+        other = f"P{(seat_num % config.num_players) + 1:02d}"
+    except (ValueError, IndexError):
+        other = "P02" if player_id != "P02" else "P03"
+
     rules = RULES_SUMMARY.format(
         num_players=config.num_players,
         survival_cash_man=config.survival_cash // 10_000,
@@ -983,16 +1403,22 @@ def build_system_prompt(player_id: str, config: GameConfig) -> str:
         interest_pct=config.interest_rate * 100,
         entry_fee_man=config.entry_fee // 10_000,
         anon_fee_man=config.anon_broadcast_fee // 10_000,
-        contract_fee_man=config.contract_fee // 10_000,
+        contract_fee_man=contract_fee_man,
+        contract_section_head=contract_section_head,
+        contract_free_word=contract_free_word,
+        contract_fee_freecash_note=contract_fee_freecash_note,
         final_market_rule=final_market_rule,
         negotiation_max_actions=config.negotiation_max_actions,
+        me=me,
+        other=other,
     )
 
     identity = (
         f"\nあなたは{player_id}です。"
-        f"目的: {config.num_rounds}ラウンド生き残り（現金{config.survival_cash // 10_000}万円以上 + 借金0）"
-        f"かつ最終資産を最大化すること。\n"
-        f"嘘をついてもよい。交渉・談合・裏切りは自由。ただし正式契約の違反は即脱落。"
+        f"目的: 生存条件（現金{config.survival_cash // 10_000}万円以上 + 借金0）を確保したうえで、"
+        f"最終現金で総合1位を狙うこと。\n"
+        f"嘘をついてもよい。交渉・談合・裏切りは自由。口約束は無料だが拘束力がなく、"
+        f"正式契約は相手の署名一つで相手の行動・支払いを確定させられる（違反は義務者が即脱落）。"
     )
 
     cot_block = ""
@@ -1041,16 +1467,20 @@ def build_negotiation_prompt(
     lines: list[str] = []
     lines.append(f"=== ラウンド{round_num} / 交渉フェイズ（巡{turn}） ===\n")
 
-    # 市場情報
+    # 市場情報（+ 高騰しきい値・総賞金予算。v0.8サイクル8.2 2-2）
     lines.append("## 市場")
     for m in visible_state.get("markets", []):
         lines.append(_render_market_line(
             m["market_id"], m["prize_pool"],
             m.get("base_prize", m["prize_pool"]), m.get("carryover", 0),
         ))
+    lines.extend(_render_market_meta_lines(visible_state, config))
 
     # 前ラウンドの結果（参加者・勝者・獲得額・高騰・流札→繰越。§8.1公開情報）
     lines.extend(_render_last_round_results(visible_state))
+
+    # 前ラウンドの倍掛け結果（v0.8サイクル8.2 2-3c。結果ブロック直後に表示）
+    lines.extend(_render_double_ups_resolved_block(visible_state))
 
     # 引き継ぎメモリ（前ラウンドから持ち越した自分だけの記憶）
     lines.extend(_render_memory_block(memory, stale_warning=True))
@@ -1074,13 +1504,10 @@ def build_negotiation_prompt(
     # このR内で見ればCommit/Settlementより前なので、現金は今R決着前の値。
     lines.extend(_render_finance_block(
         player_state.cash, player_state.debt_balance, round_num, config,
-        timing_note="（このRのCommit・Settlementの後、今RのFinanceで実行されます。"
-                    "現金は今Rの市場結果反映前の値です）",
-        entry_fee_note=(
-            f"次のCommitフェイズ冒頭で、参加する1市場分のEntry Fee "
-            f"{config.entry_fee}円が自動徴収されます"
-            f"（1ラウンドに参加できる市場は1つだけです。不足の場合は破産脱落）。"
-        ),
+        timing_note="（次のCommitフェイズ冒頭のEntry Fee控除、Settlementを経て、"
+                    "今RのFinanceで実行されます。市場結果反映前の値です）",
+        entry_fee_deduction=config.entry_fee,
+        entry_fee_note="（1R1市場のため、参加できる市場は1つだけです。Entry Feeはコミット時に自動徴収され、不足の場合は破産脱落）",
     ))
 
     # A-5: 自分の過去AUTO COMMIT記録（事実のみ・本人限定）
@@ -1102,6 +1529,15 @@ def build_negotiation_prompt(
     # 脱落者（公示。§8.1公開情報）
     lines.extend(_render_eliminations_block(visible_state, round_num))
 
+    # 公開情報6ブロック（v0.8サイクル8.2 2-3。空なら各自非表示）
+    lines.extend(_render_initial_loans_block(visible_state))
+    lines.extend(_render_used_cards_block(visible_state))
+    lines.extend(_render_others_double_ups_block(visible_state, player_state.player_id))
+    lines.extend(_render_contracts_public_block(
+        visible_state, active_only=True, self_player_id=player_state.player_id,
+    ))
+    lines.extend(_render_trades_completed_block(visible_state))
+
     # メッセージ
     lines.extend(_render_message_list(
         visible_state.get("messages", []), "今ラウンドのメッセージ", limit=10,
@@ -1112,8 +1548,9 @@ def build_negotiation_prompt(
     if pending:
         lines.append("\n## 提案中の正式契約（署名待ち）")
         lines.append(
-            "契約は提案者が自動で署名済みです。すでにあなたが署名済みの契約に再度 contract_sign "
-            "を送っても成立せず、その巡の発言を1回失います。"
+            "契約は提案者が自動で署名済みです。全当事者の署名が揃うと即座に成立します。"
+            "未署名のまま今Rの交渉が終了すると失効します。すでにあなたが署名済みの契約に"
+            "再度 contract_sign を送っても成立せず、その巡の発言を1回失います。"
         )
         lines.append(
             'あなたが未署名の契約に署名するには '
@@ -1134,6 +1571,11 @@ def build_negotiation_prompt(
                 "  あなたの署名: 未（あなたが署名すれば契約は成立する）"
             )
             lines.append(f"  未署名: {', '.join(unsigned)}")
+            if proposer == player_state.player_id and unsigned:
+                lines.append(
+                    f"  あなたの提案（署名待ち: {', '.join(unsigned)}）"
+                    "— 今Rの交渉終了時に失効"
+                )
             lines.append("  義務:")
             for ob in c["obligations"]:
                 ob_type_label, details_str = _format_obligation_detail(ob)
@@ -1141,6 +1583,27 @@ def build_negotiation_prompt(
                     f'    - {ob["obligor"]} → {ob["counterparty"]}: '
                     f'{ob_type_label} R{ob["round_num"]} {details_str}'
                 )
+
+            # v0.8サイクル8.2 2-4: 署名した場合に自分が「受け取る」側の義務
+            # （相手が義務者・自分が相手方）を、自分の義務プレビューより前に
+            # 提示する（便益を先に見せ、コストと対称に読めるようにする）。
+            received_obs = [
+                ob for ob in c["obligations"]
+                if ob["counterparty"] == player_state.player_id
+                and ob["obligor"] != player_state.player_id
+            ]
+            if received_obs:
+                lines.append(
+                    "  → この契約が成立した場合、あなたが受け取るもの:"
+                    if i_signed else
+                    "  → 署名した場合、あなたが受け取るもの:"
+                )
+                for ob in received_obs:
+                    ob_type_label, details_str = _format_obligation_detail(ob)
+                    lines.append(
+                        f'    - [{cid}] {ob["obligor"]} → あなた: '
+                        f'{ob_type_label} R{ob["round_num"]} {details_str}'
+                    )
 
             # P0-5: 署名した場合、既存の署名済み義務と合流した結果どうなるかを
             # 事実として提示する（署名を止めさせる意図ではなく、矛盾の有無を
@@ -1171,26 +1634,9 @@ def build_negotiation_prompt(
                     ))
 
     # 有効な公開報奨一覧（§7.2。Engineがすでに構築済みの公開情報を描画する）
-    bounties_public = [
-        b for b in visible_state.get("bounties_public", []) if b.get("is_active")
-    ]
-    if bounties_public:
-        lines.append("\n## 有効な公開報奨")
-        lines.append(
-            '取り下げ（自分が掲載した報奨のみ）: '
-            '{"type": "bounty_cancel", "bounty_id": "報奨ID"}'
-        )
-        for b in bounties_public:
-            poster = b.get("poster") or "匿名"
-            cond = b.get("condition", {})
-            target = cond.get("target_player", "?")
-            lines.append(
-                f"  {b['bounty_id']}: {b['amount'] // 10_000}万円"
-                f" / {b['condition_type']}(target={target})"
-                f" / 掲載者: {poster}"
-            )
+    lines.extend(_render_bounties_public_block(visible_state, include_cancel_hint=True))
 
-    # 提案中のカードトレード（当事者にのみ表示）
+    # 提案中のカードトレード（当事者にのみ表示。v0.8サイクル8.2 2-5で支払方向を明示）
     trades_pending = visible_state.get("trades_pending", [])
     if trades_pending:
         lines.append("\n## 提案中のカードトレード")
@@ -1203,27 +1649,40 @@ def build_negotiation_prompt(
             proposer = t["proposer"]
             rp = t["round_proposed"]
             cash = t["cash_amount"]
+            target = t.get("with_player")
             lines.append(f"\n### トレード {tid}（R{rp}提案、提案者: {proposer}）")
             if cash > 0:
-                lines.append(
-                    f"  {proposer}の {t['give_card_rank']} + {cash // 10_000}万円"
-                    f" ⇄ {t['with_player']}の {t['receive_card_rank']}"
-                )
+                cash_note = f" ＋ 現金{cash // 10_000}万円（{proposer}が払う）"
             elif cash < 0:
-                lines.append(
-                    f"  {proposer}の {t['give_card_rank']}"
-                    f" ⇄ {t['with_player']}の {t['receive_card_rank']} + {abs(cash) // 10_000}万円"
-                )
+                cash_note = f" ＋ 現金{abs(cash) // 10_000}万円（{target}が払う）"
             else:
-                lines.append(
-                    f"  {proposer}の {t['give_card_rank']}"
-                    f" ⇄ {t['with_player']}の {t['receive_card_rank']}"
-                )
+                cash_note = ""
+            lines.append(
+                f"  {proposer}が渡す: {t['give_card_rank']}"
+                f" ／ {target}が渡す: {t['receive_card_rank']}{cash_note}"
+            )
+            if player_state.player_id == proposer:
+                lines.append("  あなたの立場: 提案者（相手の受諾/拒否待ち）")
+            elif player_state.player_id == target:
+                if cash > 0:
+                    stance = "受諾すればあなたは現金を受け取ります"
+                elif cash < 0:
+                    stance = "受諾すればあなたは現金を払います"
+                else:
+                    stance = "現金の授受はありません"
+                lines.append(f"  あなたの立場: 受諾候補（{stance}）")
+            lines.append(
+                "  未受諾のまま今Rの交渉が終了すると失効します"
+                "（拒否・失効はいずれも提案者に通知されます）"
+            )
             # 提案者向け: 全宛先のステータス表示
             if "all_targets" in t:
                 statuses = t.get("target_statuses", {})
                 parts = [f"{p}({statuses.get(p, '?')})" for p in t["all_targets"]]
                 lines.append(f"  宛先: {', '.join(parts)}")
+
+    # あなたが今ラウンドに提案したカードトレードの顛末（v0.8サイクル8.2 2-5）
+    lines.extend(_render_my_trades_this_round_block(visible_state))
 
     # あなたが当事者の契約に関する通知（解除要求/成立。AUTO_PASSの起床トリガでもある）
     lines.extend(_render_contract_notice_block(visible_state))
@@ -1232,26 +1691,35 @@ def build_negotiation_prompt(
     lines.extend(_render_action_feedback_block(visible_state))
 
     # 修正2: 交渉フェイズではmarket_commitは使えないことを明記
-    if config.enable_cot:
-        json_example = '{"reasoning": "...", "strategy": {...}, "action": {"type": "pass"}}'
-    else:
-        json_example = '{"strategy": {...}, "action": {"type": "pass"}}'
     available, unavailable = _available_negotiation_actions(
         player_state, round_num, visible_state, config)
     lines.append("\n## いま選べるアクション")
     lines.append("  " + " / ".join(available))
     if unavailable:
         lines.append("  いま選べないもの: " + " / ".join(unavailable))
+    # contract_proposeが選べるときだけ、今R・実在の相手で埋めた記入例を出す（v0.8サイクル8.2 2-8）
+    if any(a.startswith("contract_propose") for a in available):
+        others = [p for p in alive if p != player_state.player_id]
+        if others:
+            lines.extend(_render_contract_propose_template(
+                player_state, round_num, config, others[0]))
     lines.append(
         "\nstrategyには任意で reason_category を1つ含められます: "
         "情報収集・様子見 / 戦略的沈黙 / 返答待ち / 資金・カード制約 / "
         "行動枠温存 / 関係構築・合意形成 / 情報発信・牽制 / その他"
     )
-    lines.append(
-        f"\n上の一覧から1つ選び、JSON形式で回答してください。"
-        f"（market_commitはコミットフェイズで行います。ここでは選べません）\n"
-        f"例: {json_example}"
-    )
+    if config.enable_cot:
+        lines.append(
+            "\n上の一覧から1つ選び、JSON形式で回答してください"
+            "（market_commitはコミットフェイズで行います。ここでは選べません）。"
+            'JSONの先頭に "reasoning" フィールドを含め、行動決定前の推論を'
+            "日本語で簡潔に書いてください。"
+        )
+    else:
+        lines.append(
+            "\n上の一覧から1つ選び、JSON形式で回答してください。"
+            "（market_commitはコミットフェイズで行います。ここでは選べません）"
+        )
 
     return "\n".join(lines)
 
@@ -1287,6 +1755,8 @@ def build_commit_prompt(
         lines.append(_render_market_line(
             m.market_id, m.prize_pool, m.base_prize, m.carryover,
         ))
+    # 市場高騰のしきい値・総賞金予算（v0.8サイクル8.2 4-2。negotiationと共通）
+    lines.extend(_render_market_meta_lines(visible_state, config))
 
     # 前ラウンドの結果（参加者・勝者・獲得額・高騰・流札→繰越。§8.1公開情報）
     lines.extend(_render_last_round_results(visible_state))
@@ -1327,10 +1797,9 @@ def build_commit_prompt(
         player_state.cash, player_state.debt_balance, round_num, config,
         timing_note="（このコミットの後のSettlementを経て、今RのFinanceで実行されます。"
                     "現金は今Rの市場結果反映前の値です）",
+        entry_fee_deduction=config.entry_fee,
         entry_fee_note=(
-            f"このコミットで選ぶ1市場のEntry Fee {config.entry_fee}円が"
-            f"この後自動徴収されます"
-            f"（1ラウンドに参加できる市場は1つだけです。不足の場合は破産脱落）。"
+            "（1R1市場のため、参加できる市場は1つだけです。Entry Feeはコミット時に自動徴収され、不足の場合は破産脱落）"
         ),
     ))
 
@@ -1346,6 +1815,15 @@ def build_commit_prompt(
 
     # 自分が当事者の正式契約の全容（台帳。Handover Memory依存の解消）
     lines.extend(_render_my_contracts_block(visible_state, round_num))
+
+    # 公開情報ブロック（v0.8サイクル8.2 4-2。negotiationと共通のヘルパーを再利用。空なら非表示）
+    lines.extend(_render_others_double_ups_block(visible_state, player_state.player_id))
+    lines.extend(_render_double_ups_resolved_block(visible_state))
+    lines.extend(_render_contracts_public_block(
+        visible_state, active_only=True, self_player_id=player_state.player_id,
+    ))
+    lines.extend(_render_trades_completed_block(visible_state))
+    lines.extend(_render_bounties_public_block(visible_state, include_cancel_hint=False))
 
     # 使用済みカード情報
     used = visible_state.get("used_cards", {})
@@ -1441,6 +1919,11 @@ def build_reflection_prompt(
         visible_state, title=f"今ラウンド（R{round_num}）の結果",
     ))
 
+    # 今ラウンドの倍掛け結果（v0.8サイクル8.2 C2。結果ブロック直後に表示）
+    lines.extend(_render_double_ups_resolved_block(
+        visible_state, heading="今ラウンドの倍掛け結果",
+    ))
+
     # 今ラウンドの会話（全件。交渉/コミットプロンプトと違い件数制限なし）
     lines.extend(_render_message_list(
         visible_state.get("messages", []), "今ラウンドの会話（全件）",
@@ -1456,22 +1939,23 @@ def build_reflection_prompt(
     # 自分が当事者の正式契約の全容（台帳。Handover Memory依存の解消）
     lines.extend(_render_my_contracts_block(visible_state, round_num))
 
-    # 契約の存在と当事者（§8.1公開情報）
-    contracts = visible_state.get("contracts_public", [])
-    if contracts:
-        lines.append("\n## 正式契約の状況")
-        for c in contracts:
-            dead = c.get("eliminated_parties") or []
-            note = ""
-            if dead and c.get("status") == "active":
-                # Contract.status は engine 上 active のままだが、脱落者が関わる未履行
-                # 義務は§6.3で失効済み。status だけ見せると誤読される（D4）。
-                note = f"（{', '.join(dead)}が脱落済み → 当該義務は失効済み・解除交渉は不要）"
-            lines.append(f"  [{c['contract_id']}] 当事者: {', '.join(c['parties'])}"
-                         f" / 状態: {c['status']}{note}")
+    # 契約の存在と当事者（§8.1公開情報。reflectionは振り返り用途のため
+    # active_only=Falseで全状態＝5ラベルを表示する。v0.8サイクル8.2 5-2）
+    lines.extend(_render_contracts_public_block(
+        visible_state, active_only=False, self_player_id=player_state.player_id,
+    ))
 
-    # 今ラウンドで不成立になった自分のアクション・残り枠
-    lines.extend(_render_action_feedback_block(visible_state))
+    # 公開情報ブロック（v0.8サイクル8.2 5-2。negotiation/commitと共通のヘルパーを再利用）
+    lines.extend(_render_others_double_ups_block(visible_state, player_state.player_id))
+    lines.extend(_render_trades_completed_block(visible_state))
+
+    # あなたが当事者の契約に関する通知（v0.8サイクル8.2 5-2で新規に呼び出し。
+    # 特にdouble_up_blockedはSettlement中に発生し、他プロンプトでは今Rの間に
+    # 表示機会がないため、ここが唯一の確認手段になる）
+    lines.extend(_render_contract_notice_block(visible_state))
+
+    # 今ラウンドで不成立になった自分のアクション（残り枠は今Rが終了済みのため非表示）
+    lines.extend(_render_action_feedback_block(visible_state, include_remaining_slots=False))
 
     # A-5: 自分の過去AUTO COMMIT記録（事実のみ・本人限定）。
     # このプロンプトで書くメモが次ラウンドへの唯一の引き継ぎになるため、
@@ -1501,10 +1985,9 @@ def build_reflection_prompt(
             player_state.cash, player_state.debt_balance, round_num + 1, config,
             timing_note=f"（次ラウンドR{round_num + 1}の予測。現時点の残高がそのまま"
                         f"維持された場合の見込みで、Negotiationでの返済等により実際の額は変わり得ます）",
+            entry_fee_deduction=config.entry_fee,
             entry_fee_note=(
-                f"次ラウンドのCommitフェイズ冒頭でEntry Fee {config.entry_fee}円が"
-                f"自動徴収されます（現在の現金 {player_state.cash}円と比較: "
-                f"{'不足' if player_state.cash < config.entry_fee else '充足'}）。"
+                "（1R1市場のため、参加できる市場は1つだけです。Entry Feeはコミット時に自動徴収され、不足の場合は破産脱落）"
             ),
         ))
 
@@ -1818,6 +2301,20 @@ def build_double_up_prompt(
     lines.append(f"- **失敗時**: 預託額 {prize_won // 10_000}万円が**全額没収**されます")
     lines.append(f"- TAKE を選ぶと {prize_won // 10_000}万円をそのまま受け取ります")
     lines.append(f"- あなたの選択と預託額は全プレイヤーに公開されます")
+    lines.append(
+        "- 成否の判定はあなた自身の次Rの市場参加・勝敗のみで決まります"
+        "（他プレイヤーの倍掛け結果とは独立です）"
+    )
+    lines.append(
+        "- 判定前に何らかの理由で脱落した場合、次Rの市場結果に関わらず預託は全額没収されます"
+    )
+    lines.append(
+        "- 成功時に受領する2倍のpayoutは、次Rの型A（現金）支払義務の原資になります"
+    )
+    lines.append(
+        "- 成功時に受領した賞金をその場でさらにDOUBLEすることはできません"
+        "（次に選べるのはTAKEのみです）"
+    )
 
     lines.append(f"\n## あなたの状態（{player_state.player_id}）")
     lines.append(f"  現金: {player_state.cash // 10_000}万円（賞金反映後）")
@@ -1878,6 +2375,74 @@ def build_double_up_prompt(
                 f"（強制最低返済額{take_forecast['mandatory_repay']}円に対する差額: "
                 f"{double_forecast['cash_after_repay']}円）"
             )
+
+    # DOUBLEを選んだ場合の次ラウンド見通し（v0.8サイクル8.2 A2）: 今RのFinance後の
+    # 現金・借金残高を元手に、次Rの強制最低返済を概算する。DOUBLE成否は次Rの
+    # 市場参加・勝敗で決まるため、ここでは「次R市場賞金0＝DOUBLE失敗」を
+    # 仮定した最低ラインのみを示す（TAKE分岐は上のFinance確定計算で完結済み）。
+    if round_num < config.num_rounds and config.mandatory_repay_enabled:
+        next_round = round_num + 1
+        double_next = _compute_finance_forecast(
+            double_forecast["debt_after_interest"] - double_forecast["mandatory_repay"],
+            double_forecast["cash_after_repay"], next_round, config,
+            entry_fee_deduction=config.entry_fee,
+        )
+        lines.append(f"\n## DOUBLEを選んだ場合の次ラウンド（R{next_round}）見通し")
+        lines.append(
+            "  次Rの市場結果・DOUBLEの成否は未確定のため、次Rの現金は今RのFinance後"
+            "現金がそのまま繰り越された（＝DOUBLE失敗・次R市場賞金0）と仮定した"
+            "最低ラインで概算します"
+        )
+        lines.append(
+            f"  次Rの強制最低返済額（概算）: {double_next['mandatory_repay']}円"
+            f"（{double_next['mandatory_repay'] // 10_000}万円）"
+        )
+        lines.append(
+            f"  次RのEntry Fee {config.entry_fee}円と強制最低返済を差し引いた"
+            f"現金見込み: {double_next['cash_after_repay']}円"
+            f"（{double_next['cash_after_repay'] // 10_000}万円）"
+        )
+        if double_next["cash_after_repay"] < 0:
+            lines.append(
+                f"  ⚠ この見込みでは次Rの強制最低返済額に"
+                f"{-double_next['cash_after_repay']}円不足し、破産の可能性があります"
+            )
+        else:
+            lines.append(
+                "  この見込みでは次Rの強制最低返済に不足しません"
+                "（DOUBLE成功時はさらに現金が増えます）"
+            )
+
+        # A3: 次Rに支払期限が来る型A（現金）義務 — 成功時/失敗時それぞれの原資を明示
+        next_r_obs = [
+            ob for ob in visible_state.get("my_obligations", [])
+            if ob.get("round_num") == next_round and ob.get("ob_type") == "type_a_payment"
+        ]
+        pay_total = sum(
+            (ob.get("details") or {}).get("amount", 0)
+            for ob in next_r_obs if ob.get("obligor") == player_state.player_id
+        )
+        receive_total = sum(
+            (ob.get("details") or {}).get("amount", 0)
+            for ob in next_r_obs if ob.get("counterparty") == player_state.player_id
+            and ob.get("obligor") != player_state.player_id
+        )
+        if pay_total or receive_total:
+            lines.append(
+                f"  次R支払期限の型A義務: 支払い合計{pay_total}円 "
+                f"/ 受取合計{receive_total}円"
+            )
+            if pay_total:
+                lines.append(
+                    f"  成功時はこのRの受領額{prize_won * 2}円から支払えます。"
+                    f"失敗時はEntry Fee控除後の現金{double_next['cash_before_repay']}円"
+                    f"から支払う必要があります"
+                )
+
+    # 今ラウンドで決着した他プレイヤーの倍掛け結果（公開情報）
+    lines.extend(_render_double_ups_resolved_block(
+        visible_state, heading="今ラウンドの倍掛け結果",
+    ))
 
     # 署名済み未履行の契約義務一覧（帳簿ミス起因の自爆防止）
     ob_lines = _render_obligations_block(

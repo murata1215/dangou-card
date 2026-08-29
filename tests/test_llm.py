@@ -553,8 +553,9 @@ class TestStep31Fixes:
         config = GameConfig.baseline_v1()
         prompt = build_system_prompt("P01", config)
         assert "自動" in prompt and "返済" in prompt
-        # R12 Financeの説明が含まれること
-        assert "返済可能額" in prompt or "全額充当" in prompt
+        # R12 Financeの説明が含まれること（v0.8サイクル8.2 Step1で
+        # 「残債全額が最低返済額」に短縮。事実は不変）
+        assert "残債全額が最低返済額" in prompt
 
     def test_rules_summary_contains_final_market_s2(self):
         """S2設定でRULES_SUMMARYに最終市場ルールが含まれること"""
