@@ -1513,7 +1513,11 @@ def test_phase2_core18_reservations_cover_model_overrides_and_flag_h4_cap_gap():
     # アクション枠節の文言を実装事実に合わせて拡充した結果、system prompt長が
     # 7,076→8,177字に増加。H1予約額が$0.03184→$0.03459へ増加したため六度目の期待値更新
     # （max_cost_per_model以内には収まる。判断1・判断2に基づく変更）。
-    assert reservations["H1"] == pytest.approx(0.03459, abs=1e-12)
+    # Cycle 8.3（2026-08-30）: F5（identityの空行追加+1字）/F6（dm・transfer例の宛先を
+    # {other}化。差引0字）/F7（contract節に「弱いカードで勝つ」を追加+9字）で
+    # system prompt長が8,177→8,187字に変化。H1予約額は$0.03459→$0.034615へ変化
+    # （トークン境界の丸めにより文字数増でも減少し得る。七度目の期待値更新）。
+    assert reservations["H1"] == pytest.approx(0.034615, abs=1e-12)
     for key in ("H1", "H2", "H4"):
         assert reservations[key] > 0.02
         if key != "H4":

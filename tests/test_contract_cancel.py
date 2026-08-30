@@ -773,15 +773,15 @@ class TestRenderContractNoticeBlock:
     """_render_contract_notice_block() の描画内容"""
 
     def test_empty_when_no_notices(self):
-        assert _render_contract_notice_block({"my_contract_notices": []}) == []
-        assert _render_contract_notice_block({}) == []
+        assert _render_contract_notice_block({"my_contract_notices": []}, 2) == []
+        assert _render_contract_notice_block({}, 2) == []
 
     def test_renders_cancel_requested(self):
         state = {"my_contract_notices": [{
             "turn": 2, "kind": "cancel_requested", "contract_id": "C_ab12",
             "by": "P02", "cancel_requested_by": ["P02"], "pending": ["P01"],
         }]}
-        text = "\n".join(_render_contract_notice_block(state))
+        text = "\n".join(_render_contract_notice_block(state, 2))
         assert "P02" in text
         assert "C_ab12" in text
         assert "contract_cancel" in text
@@ -792,7 +792,7 @@ class TestRenderContractNoticeBlock:
             "turn": 3, "kind": "cancel_completed", "contract_id": "C_ab12",
             "by": "P02", "cancel_requested_by": ["P02", "P01"], "pending": [],
         }]}
-        text = "\n".join(_render_contract_notice_block(state))
+        text = "\n".join(_render_contract_notice_block(state, 3))
         assert "C_ab12" in text
         assert "解除されました" in text
 
