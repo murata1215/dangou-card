@@ -9,6 +9,7 @@ import math
 
 from engine.models import Card, CardRank, PlayerState
 from engine.cards import create_deck
+from engine.config import GameConfig
 
 
 def create_player(player_id: str, loan_amount: int) -> PlayerState:
@@ -56,11 +57,78 @@ def can_pay_free_cash(player: PlayerState, amount: int) -> bool:
 
     送金・金銭契約・報奨預託等のプレイヤー間価値移転に適用。
 
+    Deprecated:
+        v0.9以降、プレイヤー間送金の支払可否判定には
+        spendable_cash(player, config, at_settlement=False) を使う。
+        本関数は §2.4 のFree Cash定義そのものを表す参照実装として残す
+        （現在エンジン内に呼び出し元はない）。
+
     Args:
         player: プレイヤー状態
         amount: 必要額
     """
     return player.free_cash >= amount
+
+
+def spendable_cash(player: PlayerState, config: GameConfig, *, at_settlement: bool) -> int:
+    """
+    プレイヤー間の価値移転（送金・型A契約・報奨預託・カードトレード現金）に
+    使える金額（支払可能額）を返す（v0.9）。
+
+    config.free_cash_mode で判定基準を切り替える:
+      - "debt"      : max(0, cash - debt_balance) … §2.4 Free Cash（既定）
+      - "cash"      : cash（借金の横流し防止を撤廃）
+      - "entry_fee" : Negotiation時 max(0, cash - config.entry_fee) /
+                      Settlement時 cash
+
+    Args:
+        player: プレイヤー状態
+        config: ゲーム設定
+        at_settlement: Settlement Step4スナップショット等、当ラウンドの
+            Entry Feeが既にCommitで実引き落とし済みの時点での評価なら True。
+            Negotiationフェーズ（送金・報奨・トレード提案・トレード成立
+            再検証）では False。
+
+    Note:
+        at_settlement の区別は "entry_fee" モードでのみ意味を持つ
+        （二重控除の回避。GameConfig.free_cash_mode のdocstring参照）。
+        "debt" / "cash" モードでは at_settlement の値に関わらず結果は同じ。
+    """
+    mode = config.free_cash_mode
+    if mode == "cash":
+        return player.cash
+    if mode == "entry_fee":
+        if at_settlement:
+            return player.cash
+        return max(0, player.cash - config.entry_fee)
+    # "debt"（既定・旧挙動）
+    return max(0, player.cash - player.debt_balance)
+
+
+def insufficient_funds_reason(config: GameConfig, purpose: str) -> str:
+    """
+    支払可能額不足時の理由文字列を free_cash_mode に応じて生成する（v0.9）。
+
+    Args:
+        config: ゲーム設定
+        purpose: "transfer" / "bounty" / "trade" / "type_a" のいずれか
+            （"debt"モードでの英語文言の出し分けにのみ使用）
+    """
+    mode = config.free_cash_mode
+    if mode == "entry_fee":
+        return (
+            f"支払可能額（現金 − 今RのEntry Fee {config.entry_fee}円）"
+            "を超えています"
+        )
+    if mode == "cash":
+        return "現金が不足しています"
+    # "debt"（既定）: 既存の英語文言を完全維持
+    return {
+        "transfer": "Insufficient free cash for transfer",
+        "bounty": "Insufficient free cash for bounty deposit",
+        "trade": "Insufficient free cash for trade payment",
+        "type_a": "Atomic execution failed - insufficient free cash",
+    }[purpose]
 
 
 def pay(player: PlayerState, amount: int) -> PlayerState:

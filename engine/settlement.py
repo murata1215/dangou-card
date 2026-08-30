@@ -361,6 +361,12 @@ def execute_settlement(
             snapshots[pid] = {
                 "cash": p.cash,
                 "free_cash": p.free_cash,
+                # v0.9: 型A判定の実基準（config.free_cash_mode に依存）。
+                # Entry FeeはCommitで既に実引き落とし済みのため at_settlement=True
+                # （二重控除を避ける。GameConfig.free_cash_mode のdocstring参照）。
+                "spendable": player_ops.spendable_cash(p, config, at_settlement=True),
+                # v0.9: viewerがdebtをcash-free_cashで逆算せずに済むよう明示する。
+                "debt_balance": p.debt_balance,
             }
 
     logger.log("SNAPSHOT", round_num, "settlement", step=4, data={
@@ -407,7 +413,7 @@ def execute_settlement(
             contracts = elim_ops.expire_obligations_for_player(obligor_id, contracts)
             logger.log("TYPE_A_FAILURE", round_num, "settlement", step=5, data={
                 "player_id": obligor_id,
-                "reason": "Atomic execution failed - insufficient free cash",
+                "reason": player_ops.insufficient_funds_reason(config, "type_a"),
             })
 
     # =========================================================================

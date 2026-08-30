@@ -357,6 +357,13 @@ def main() -> None:
     parser.add_argument("--ruleset", type=str, default="S1",
                         choices=["S1", "S2"],
                         help="ルールセット: S1(Season 1, 既定) / S2(Season 2)")
+    parser.add_argument("--free-cash-mode", type=str, default=None,
+                        choices=["debt", "cash", "entry_fee"],
+                        help="v0.9: 支払可能額の基準を明示的に上書きする"
+                             "（未指定ならrulesetプリセットの既定値のまま。"
+                             "例: --ruleset S2 は無指定でentry_fee、"
+                             "--ruleset S1 は無指定でdebt）。"
+                             "指定した場合はdebtも含めて必ず上書きする。")
     args = parser.parse_args()
 
     # nice 10で実行（本番サーバー同居対策）
@@ -389,6 +396,11 @@ def main() -> None:
     if args.survival_cash is not None:
         config = config.model_copy(update={"survival_cash": args.survival_cash})
 
+    # v0.9: 支払可能額モードの上書き（未指定ならrulesetプリセットの既定値のまま。
+    # 明示指定時はdebtも含めて必ず上書きする）
+    if args.free_cash_mode is not None:
+        config = config.model_copy(update={"free_cash_mode": args.free_cash_mode})
+
     # 賞金スケジュールの変換（flat: 総賞金を全ラウンド均等配分）
     if args.prize_schedule == "flat":
         total = config.total_prize
@@ -408,6 +420,7 @@ def main() -> None:
     print(f"ベースseed: {args.seed}")
     print(f"プレイヤー数: {config.num_players}")
     print(f"ロスター: {', '.join(roster)}")
+    print(f"free_cash_mode: {config.free_cash_mode}")
     print(f"総賞金: {config.total_prize:,}円")
     print(f"ワーカー数: {args.workers}")
     print(f"出力: {output_dir}")

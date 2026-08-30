@@ -663,3 +663,48 @@ Cycle 2.2で導入した「不足行は結果断定・警告記号を含まな�
 Finance系ブロックを追加する際も、この「行単位での事実/評価分離」を踏襲する。
 担保テスト: `tests/test_prompt_finance.py`（3件を行単位アサーションへ更新）・
 `tests/test_prompt_v08.py::TestFinanceForecastEntryFeeAndWarning`。
+
+## プレイヤー間支払可否の判定基準は`GameConfig.free_cash_mode`で切替可能（v0.9・サイクル9.1）
+
+サイクル9.0の棚卸しで、送金・型A契約・報奨預託・カードトレード現金支払の支払可否ゲートが
+全て`PlayerState.free_cash`（§2.4: `max(0, 現金 − 借金残高)`）に固定されており、R1開始時は
+全員 現金=借金 のためFree Cash=0となり借入金を交渉に一切使えないことを確定した
+（v0.8本戦`trial_C_l12_r12_v08_20260830`のtransfer 0件・トレード0件・型A不能脱落1件の
+構造要因）。
+
+v0.9でこれを`GameConfig.free_cash_mode: Literal["debt","cash","entry_fee"]`（既定`"debt"`＝
+旧挙動）として設定可能にし、判定ロジックを`engine.player.spendable_cash(player, config, *,
+at_settlement)`に切り出した。
+
+- `"debt"`（既定・`baseline_v1`）: 旧来のFree Cash定義そのまま。
+- `"cash"`: 借金の横流し防止を撤廃し、現金全額を交渉資金として使える。
+- `"entry_fee"`（`baseline_v1_s2`）: Negotiation中は`max(0, 現金 − 今RのEntry Fee)`を
+  留保し、Settlement（Commit後）の型A執行では現金全額を基準にする。Entry Feeは
+  Commitで既に現金から実引き落とし済み（`engine/game.py`のCommitフェイズ）のため、
+  Settlement側でさらに差し引くと同じEntry Feeを二重控除してしまい、本来払えるはずの
+  型A義務が不履行・脱落扱いになる。このため`at_settlement`引数でフェイズ依存に
+  判定式を切り替える（Negotiation時は`False`、Settlementスナップショット撮影時は
+  `True`）。
+
+`PlayerState.free_cash`（§2.4の定義そのもの）は`free_cash_mode`の値に関わらず無変更。
+表示・ログ・ビューア・ブログ・実況の後方互換のため。Settlementスナップショットには
+新たに`spendable`（`spendable_cash()`の値）と`debt_balance`を追加したが、型A Atomic執行
+（`engine/contracts.py`）は`snap.get("spendable", snap.get("free_cash", 0))`で旧形状
+スナップショット・既存テストとの互換を保つ。
+
+既定ロスール8種は送金・報奨・トレード・契約を一切行わないため、`free_cash_mode`間の
+比較シミュレーションで指標が完全一致してしまう。この検証ギャップを埋めるため、送金のみを
+行う`bots/kingmaker_bot.py`（`KingmakerBot`）を追加した。次Rの強制最低返済（利息込み）＋
+次RのEntry Feeが現金を超える見込みになった時点で、`spendable_cash()`の全額を公開情報のみ
+から推定した最富裕生存者へ送金する。`BOT_REGISTRY`にのみ登録し`DEFAULT_ROSTER`には
+含めない（`--roster`等での明示指定時のみ使用、既定8種ロスターの挙動には影響しない）。
+
+**既知の未解決点**: `baseline_v1_s2`が`entry_fee`モードになっても`llm/prompt_builder.py`は
+旧Free Cash定義の文言（計25箇所＋分岐3箇所）を出力し続けており、AIに伝えるルールと
+実際の判定基準が食い違う。`entry_fee`モードでのLLM本戦を行う前に、プロンプト文面を
+`free_cash_mode`に対応させる修正が必須。
+
+担保テスト: `tests/test_spendable_cash.py`（29件）。詳細:
+`doc/devlog/2026-08-30_155134.md`（サイクル9.0の棚卸し）・
+`doc/devlog/2026-08-30_180634.md`（サイクル9.1の実装）・
+`doc/analysis/free_cash_mode_sim_20260830.md`（シミュレーション比較結果）。

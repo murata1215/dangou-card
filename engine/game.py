@@ -854,7 +854,9 @@ class Game:
                 return
 
             # 現金再検証（v0.8 E10: 資金不足によるEXPIREDは双方へ通知）
-            if proposal.cash_amount > 0 and proposal.cash_amount > proposer_state.free_cash:
+            if proposal.cash_amount > 0 and proposal.cash_amount > player_ops.spendable_cash(
+                proposer_state, self.config, at_settlement=False
+            ):
                 proposal.status = CardTradeStatus.EXPIRED
                 self._push_contract_notice(proposal.proposer, {
                     "turn": turn, "kind": "trade_failed_funds",
@@ -867,7 +869,9 @@ class Game:
                     "cash_amount": proposal.cash_amount, "short_side": "proposer",
                 })
                 return
-            if proposal.cash_amount < 0 and abs(proposal.cash_amount) > accepter_state.free_cash:
+            if proposal.cash_amount < 0 and abs(proposal.cash_amount) > player_ops.spendable_cash(
+                accepter_state, self.config, at_settlement=False
+            ):
                 proposal.status = CardTradeStatus.EXPIRED
                 self._push_contract_notice(proposal.proposer, {
                     "turn": turn, "kind": "trade_failed_funds",
@@ -2061,6 +2065,14 @@ class Game:
 
         # 当事者向け: 提案中の契約（当事者のみ閲覧可能）
         if for_player_id is not None:
+            # v0.9: 交渉での支払可能額（config.free_cash_mode に依存）。
+            # 送金・報奨預託・トレード提案の上限を本人にも明示する。
+            me = self.players.get(for_player_id)
+            if me is not None:
+                state["spendable_cash"] = player_ops.spendable_cash(
+                    me, self.config, at_settlement=False,
+                )
+
             state["contracts_pending"] = [
                 {
                     "contract_id": c.contract_id,

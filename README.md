@@ -78,6 +78,32 @@ config = GameConfig.default_12()  # 12人版（テスト大会用）
 config = GameConfig(survival_cash=2_000_000)  # カスタム
 ```
 
+### 支払可能額の判定基準（`free_cash_mode`, v0.9）
+
+送金・型A契約・報奨預託・カードトレード現金支払など、プレイヤー間の価値移転で
+「いくらまで支払えるか」の基準は`GameConfig.free_cash_mode`で切り替えられる
+（`engine.player.spendable_cash()`が実際の判定を行う）。
+
+| モード | 判定基準 | 用途 |
+|---|---|---|
+| `"debt"`（既定） | `max(0, 現金 − 借金残高)` = 従来のFree Cash（§2.4） | `baseline_v1`（S1）据え置き |
+| `"cash"` | 現金全額 | 借金の横流し防止を撤廃 |
+| `"entry_fee"` | Negotiation中: `max(0, 現金 − 今RのEntry Fee)` / Settlement時: 現金全額 | `baseline_v1_s2`（S2）既定。借入金を交渉資金として使える |
+
+`"debt"`モードのままだとR1開始時は全員 現金=借金 のためFree Cash=0となり、賞金を
+稼ぐまで一切のプレイヤー間送金ができない（v0.8本戦で確認された構造的問題）。
+`PlayerState.free_cash`自体（表示・ログ・ビューア用）は`free_cash_mode`に関わらず不変。
+
+```bash
+uv run python scripts/simulate.py --ruleset S2 --games 1000 --free-cash-mode cash
+```
+
+既定ロスール8種は送金・報奨・トレード・契約を一切行わないため、`free_cash_mode`間の
+比較シミュレーションでは指標が完全一致してしまう。送金のみを行う`KingmakerBot`
+（`bots/kingmaker_bot.py`）を`BOT_REGISTRY`に追加済み（`DEFAULT_ROSTER`には非含有）。
+`--roster`で明示指定した場合のみ使われる。詳細: `rules/project.md`・
+`doc/analysis/free_cash_mode_sim_20260830.md`。
+
 ### 引き継ぎメモリ（Handover Memory）
 
 LLMコールは1-shotで会話履歴を持たず、チャット・戦略メモは毎ラウンド消えるため、標準構成のAIは

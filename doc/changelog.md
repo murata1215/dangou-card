@@ -1733,3 +1733,51 @@ C6（L6: `comment`内未エスケープ改行によるstrict JSON失敗）が`ok
   **1435 passed**（旧1410+新規25、回帰0件）、`uv run python scripts/dry_run.py`は
   **578イベント**（不変）。`git diff engine/game.py`は賞金計算・判定ゲート行を含まないことを
   確認済み。詳細: `doc/devlog/2026-08-28_213206.md`。
+
+## 2026-08-30: サイクル9.0/9.1 Free Cash廃止（支払いは現金基準へ切替可能に）＋KingmakerBot追加
+
+v0.8本戦（`trial_C_l12_r12_v08_20260830`）分析でtransfer 0件・トレード0件・型A不能脱落1件が
+判明し、原因はプレイヤー間支払い（送金・型A・報奨預託・トレード現金）の上限が
+Free Cash（`max(0, 現金 − 借金残高)`）であること、R1開始時は全員 現金=借金 のため
+Free Cash=0となり借入金を交渉に一切使えないことと特定した（サイクル9.0、読み取り専用の
+棚卸し、コード変更0行）。
+
+サイクル9.1で対応を実装:
+
+- `engine/config.py`に`GameConfig.free_cash_mode: Literal["debt","cash","entry_fee"]="debt"`
+  を新設。`baseline_v1_s2`（S2）は`"entry_fee"`、`baseline_v1`（S1）は`"debt"`のまま据え置き。
+- `engine/player.py`に`spendable_cash(player, config, *, at_settlement)`と
+  `insufficient_funds_reason(config, purpose)`を新設。既存の`can_pay_free_cash`は
+  非推奨注記のみ追加し無変更（呼び出し元は元々0件）。`PlayerState.free_cash`
+  （§2.4定義そのもの）も不変更で、表示・ログ・ビューアの後方互換を維持。
+- エンジン内の支払可否ゲート6箇所（送金`actions.py`、報奨預託`actions.py`、
+  トレード提案`actions.py`、トレード成立時再検証×2`game.py`、型A Atomic執行
+  `contracts.py`）を`spendable_cash()`経由に切り替え。
+- `engine/settlement.py`のSettlementスナップショットに`spendable`/`debt_balance`を追加
+  （`snap.get("spendable", snap.get("free_cash", 0))`のフォールバックを型A側に実装し、
+  旧形状スナップショット・既存テストとの後方互換を確保）。
+- `viewer/log_parser.py`は`debt_balance`が明示されていれば優先し、無い旧ログは
+  従来どおり`cash - free_cash`で逆算するフォールバックへ変更。
+- 送金専用の`bots/kingmaker_bot.py`（`KingmakerBot`）を新規追加。既定ロスール8種は
+  送金・報奨・トレード・契約を一切行わないため`free_cash_mode`間の比較指標が
+  完全一致してしまう問題への対処として、`BOT_REGISTRY`にのみ追加し
+  `DEFAULT_ROSTER`には含めない（`--roster`等で明示指定時のみ使用）。
+- `scripts/simulate.py`に`--free-cash-mode {debt,cash,entry_fee}`を追加
+  （CLIセンチネルの設計不備を自己発見・修正、`default=None`で明示指定時のみ上書き）。
+- 新規`tests/test_spendable_cash.py`（29件）。既存1547件は無改修のまま
+  `uv run pytest -q`は**1576 passed**（回帰0件）。
+
+`--ruleset S2 --games 1000 --seed 42`で3系列（既定8種／Kingmaker2席／Kingmaker4席）×
+{debt, entry_fee}の計6回シミュレーションを実施。既定8種は`summary.csv`がモード間で
+バイト単位で完全一致し、本改修が既存挙動に副作用ゼロという回帰証明になった。
+Kingmaker混入系列では送金件数がdebtモードの15〜42件からentry_feeモードで
+899〜1492件へ36〜60倍に増加し、借入金を交渉資金として使えるようにする本サイクルの
+目的がエンジンレベルで機能していることを実証した。詳細:
+`doc/analysis/free_cash_mode_sim_20260830.md`。
+
+**既知の未解決点**: `baseline_v1_s2`が`entry_fee`モードになっても、
+`llm/prompt_builder.py`は旧Free Cash定義（計25箇所＋分岐3箇所）を出力し続けており、
+AIに伝えるルールと実際の判定が食い違う状態。`entry_fee`モードでのLLM本戦の前に、
+次タスクで必ず解消すること。LLM API呼び出しなし・`logs/llm/`不変。
+詳細: `doc/devlog/2026-08-30_155134.md`（サイクル9.0）・
+`doc/devlog/2026-08-30_180634.md`（サイクル9.1）。

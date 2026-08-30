@@ -6,6 +6,8 @@
 仕様書§11の確定パラメータ一覧に対応。
 """
 
+from typing import Literal
+
 from pydantic import BaseModel, field_validator
 
 HANDOVER_MEMORY_MAX_CHARS = 3000
@@ -78,6 +80,31 @@ class GameConfig(BaseModel):
 
     anon_bounty_surcharge: float = 0.10
     """匿名報奨の手数料率（§7.2: +10%）"""
+
+    # --- v0.9: 支払可能額（プレイヤー間送金の基準） ---
+    free_cash_mode: Literal["debt", "cash", "entry_fee"] = "debt"
+    """
+    プレイヤー間の価値移転（送金・型A契約・報奨預託・カードトレード現金）の
+    支払可能額判定基準（v0.9）。
+
+    - "debt"      : max(0, 現金 − 借金残高) … §2.4 Free Cash（既定・旧挙動）。
+                    R1開始時は全員 現金=借金 のため Free Cash=0 となり、
+                    賞金を稼ぐまで一切のプレイヤー間送金ができない。
+    - "cash"      : 現金全額。借金の横流し防止を撤廃し、借入金をそのまま
+                    交渉資金として使える（v0.9本命）。
+    - "entry_fee" : Negotiation中は max(0, 現金 − 今RのEntry Fee) を予約し、
+                    Settlement（Commit後）の型A執行では現金全額を基準にする。
+                    Entry FeeはCommitで既に現金から実引き落とし済み
+                    （engine/game.py の Commitフェイズ）のため、Settlement側で
+                    さらに差し引くと同じEntry Feeを二重控除してしまい、
+                    本来払えるはずの型A義務が不履行・脱落扱いになる
+                    （doc/analysis/free_cash_inventory_20260830.md §6）。
+                    このためフェイズ依存（engine.player.spendable_cash の
+                    at_settlement 引数）で判定式を切り替える。
+
+    PlayerState.free_cash（§2.4の定義そのもの）は本フィールドの値に関わらず
+    無変更。表示・ログ・ビューア・ブログ・実況の後方互換のため。
+    """
 
     # --- Season 2 拡張 ---
     fog_rounds: list[int] = []
@@ -306,4 +333,7 @@ class GameConfig(BaseModel):
             # v0.8 D1: 契約発行料を無料化。デフォルト(100,000)は温存し、
             # S2プリセットでのみ0円に上書きする。
             "contract_fee": 0,
+            # v0.9: 借りた金を交渉に使えるようにする。Free Cash（借金控除）
+            # をやめ、今RのEntry Fee分だけ留保する方式へ切り替える。
+            "free_cash_mode": "entry_fee",
         })

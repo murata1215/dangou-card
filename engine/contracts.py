@@ -275,15 +275,19 @@ def execute_type_a_atomic(
     型A契約のAtomic執行を行う（§6.6, §5.2 Step 5）
 
     義務者ごとに当該Settlement期限の支払義務を合算し、
-    スナップショットのFreeCash以内なら全件一括執行、
-    1円でも不足なら全件履行不能=脱落。
+    スナップショットの支払可能額（v0.9: "spendable"キー。config.free_cash_mode
+    に依存。旧ログ/旧形状スナップショットでは "free_cash" にフォールバック）
+    以内なら全件一括執行、1円でも不足なら全件履行不能=脱落。
 
     重要: 同一Settlement内で受け取る予定の型A受取金は支払原資にできない（§6.6）
 
     Args:
         obligations: 当該ラウンドの型A義務
-        snapshots: プレイヤーID → {"cash": int, "free_cash": int} のスナップショット
-                   （§5.2 Step 4で市場賞金反映後に撮影）
+        snapshots: プレイヤーID → {"cash": int, "free_cash": int, "spendable": int}
+                   のスナップショット（§5.2 Step 4で市場賞金反映後に撮影）。
+                   "spendable" キーが無い場合は "free_cash"（無ければ0）に
+                   フォールバックする（v0.9より前に作られたスナップショット・
+                   テストの手組みスナップショットとの後方互換のため）。
 
     Returns:
         (更新された義務リスト, 脱落者IDリスト, 実行された支払い {player_id: 差分})
@@ -302,7 +306,10 @@ def execute_type_a_atomic(
     # 各義務者について判定
     for obligor, total in obligor_totals.items():
         snap = snapshots.get(obligor, {"cash": 0, "free_cash": 0})
-        if total <= snap["free_cash"]:
+        # v0.9: "spendable" 優先。無ければ "free_cash"（旧形状スナップショット
+        # との後方互換）にフォールバックする。
+        basis = snap.get("spendable", snap.get("free_cash", 0))
+        if total <= basis:
             # 全件執行可能 → 一括支払い
             payments[obligor] = payments.get(obligor, 0) - total
             # 各受取人に加算

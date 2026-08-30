@@ -21,6 +21,7 @@ from engine.contracts import (
     can_cancel_contract, normalize_type_b_card_details, validate_type_b_card_details,
     is_card_tradable,
 )
+from engine import player as player_ops
 
 
 class ActionResult:
@@ -107,8 +108,8 @@ def validate_action(
         target = players.get(action.to)
         if target is None or not target.is_alive:
             return ActionResult(False, f"Target {action.to} is not alive")
-        if action.amount > player.free_cash:
-            return ActionResult(False, "Insufficient free cash for transfer")
+        if action.amount > player_ops.spendable_cash(player, config, at_settlement=False):
+            return ActionResult(False, player_ops.insufficient_funds_reason(config, "transfer"))
         return ActionResult(True)
 
     if isinstance(action, RepayAction):
@@ -245,8 +246,8 @@ def validate_action(
         deposited = action.amount
         if action.anonymous:
             deposited += math.ceil(action.amount * config.anon_bounty_surcharge)
-        if deposited > player.free_cash:
-            return ActionResult(False, "Insufficient free cash for bounty deposit")
+        if deposited > player_ops.spendable_cash(player, config, at_settlement=False):
+            return ActionResult(False, player_ops.insufficient_funds_reason(config, "bounty"))
         if action.amount <= 0:
             return ActionResult(False, "Bounty amount must be positive")
         return ActionResult(True)
@@ -290,8 +291,10 @@ def validate_action(
             CardRank[action.receive_card]
         except KeyError:
             return ActionResult(False, f"Invalid card rank: {action.receive_card}")
-        if action.cash_amount > 0 and action.cash_amount > player.free_cash:
-            return ActionResult(False, "Insufficient free cash for trade payment")
+        if action.cash_amount > 0 and action.cash_amount > player_ops.spendable_cash(
+            player, config, at_settlement=False
+        ):
+            return ActionResult(False, player_ops.insufficient_funds_reason(config, "trade"))
         # v0.8 E7: 「1R1回」は成立ベース。提案時点で今R成立済み回数のみ検査する
         # （提案は枠を消費しない。受諾で初めて双方の枠を消費する）
         if trade_counts is not None and trade_counts.get(player.player_id, 0) >= config.card_trade_max_per_round:

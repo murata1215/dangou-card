@@ -393,13 +393,19 @@ def get_game_state(logs_dir: Path, trial_dir_name: str, game_id: str) -> dict[st
                     mark_eliminated(data.get("player_id", ""), e)
             elif et == "SNAPSHOT":
                 # SNAPSHOTから各プレイヤーの所持金・借金を取得
-                # debt = cash - free_cash（free_cash > 0 のとき正確）
+                # v0.9: debt_balance が明示されていればそれを優先する
+                # （free_cash_mode に依存せず常に正確）。
+                # 旧ログ（debt_balance 無し）は debt = cash - free_cash に
+                # フォールバックする（free_cash > 0 のとき正確）。
                 for pid, sd in e.get("data", {}).get("snapshots", {}).items():
                     cash = sd.get("cash")
                     free_cash = sd.get("free_cash")
+                    debt_balance = sd.get("debt_balance")
                     if cash is not None:
                         cash_by_pid[pid] = cash
-                        if free_cash is not None:
+                        if debt_balance is not None:
+                            debt_by_pid[pid] = debt_balance
+                        elif free_cash is not None:
                             debt_by_pid[pid] = cash - free_cash
             elif et == "INTEREST":
                 # old_debt = SNAPSHOT時点の正確な借金残高
@@ -1363,8 +1369,17 @@ def get_round_states(
             for pid, sd in data.get("snapshots", {}).items():
                 cash = sd.get("cash")
                 free = sd.get("free_cash")
-                # debt = cash - free_cash（free_cash > 0 のとき正確）
-                debt = (cash - free) if (cash is not None and free is not None) else None
+                # v0.9: debt_balance が明示されていればそれを優先
+                # （free_cash_mode に依存せず常に正確）。
+                # 旧ログはフォールバックで debt = cash - free_cash を使う
+                # （free_cash > 0 のとき正確）。
+                debt_balance = sd.get("debt_balance")
+                if debt_balance is not None:
+                    debt = debt_balance
+                elif cash is not None and free is not None:
+                    debt = cash - free
+                else:
+                    debt = None
                 rd["cash"][pid] = {"cash": cash, "free_cash": free, "debt": debt}
 
         elif et == "INTEREST":
