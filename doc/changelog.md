@@ -1,5 +1,34 @@
 # Changelog
 
+## 2026-08-30: サイクル9.0/8.5: Free Cash参照箇所の棚卸し + v0.8本戦（trial_C_l12_r12_v08_20260830）結果分析（いずれも読み取り専用）
+
+コード変更0行・API呼び出し0件・`logs/`無改変の読み取り専用調査2件をまとめて記録する。
+
+- **サイクル9.0（Free Cash参照箇所の棚卸し、v0.9設計準備）**: v0.9でのFree Cash廃止・現金
+  ベース化に向け`engine/`/`llm/prompt_builder.py`/`tests/`/`bots/`/`scripts/`/`viewer/`を
+  横断調査。支払可否ゲートは`engine/`内6箇所（送金・報奨預託・トレード提案/成立時再検証×2・
+  型A Atomic）に限定され、bots8体と`simulate.py`/`dry_run.py`には0件と確定。事前調査の誤り
+  （「Entry Feeはcashから直接減算されない」）を`engine/game.py:1008`の実引き落とし確認で訂正し、
+  `free_cash=max(0,cash−entry_fee)`への単純置換はSettlement側で二重控除になり型A義務の理不尽な
+  脱落を招くと判定。`viewer/log_parser.py`が`debt=cash−free_cash`で借金を逆算しているため
+  computed field定義自体は変更せず、`GameConfig.free_cash_mode`+`spendable_cash()`で支払可否
+  判定を切り出す方式を推奨案として提示した。詳細: `doc/analysis/free_cash_inventory_20260830.md`、
+  `doc/devlog/2026-08-30_155134.md`。
+- **サイクル8.5（v0.8本戦の結果分析）**: v0.8初のLLM本戦`trial_C_l12_r12_v08_20260830`
+  （seed 1202、seat_mapはv0.7`trial_C_l12_r12_20260828`とバイト同一）を、v0.7と比較して
+  `doc/uso8000000_dangou_card_spec_v0_8_regulation_season2.md`§12計測項目1〜10に沿って分析。
+  `llm_logs`は本番の`llm.response_parser.parse_response()`/`extract_json()`で再パースした
+  （独自JSON抽出は不使用）。契約は無料化どおり活性化（`contract_propose` 6→23、
+  `contract_sign` 4→19、`CONTRACT_EXPIRED`新設5件）した一方、`card_trade_propose`は1→0で
+  むしろ消滅。生還率は5/12→6/12に改善したが、唯一の契約違反脱落（P06 R2）は
+  cash_before=2,546,250円という余裕のある現金でも`TYPE_A_FAILURE`
+  「Atomic execution failed - insufficient free cash」で発生しており、サイクル9.0で特定した
+  Free Cash構造制約と直結することを確認。target_market/COMMITミスマッチ率は2定義とも改善
+  （JSONフィールド方式50.8→34.9%、v0.7と同一正規表現のメッセージ本文方式51.4→41.1%）。
+  memory失敗8件中7件はplayer/round完全特定、salvage1件は再パースで確証を得られず未特定と
+  正直に記載した。集計スクリプト2本（`/tmp/cycle85_work/`）はリポジトリに含まれない。詳細:
+  `doc/analysis/trial_v08_l12_r12_20260830_analysis.md`、`doc/devlog/2026-08-30_164246.md`。
+
 ## 2026-08-30: サイクル8.2: v0.8プロンプト文面の一括修正 — Finance見込み1行式化・公開情報4ブロック・署名待ち受取プレビュー・DOUBLEの次R見通し
 
 サイクル8.1のエンジン差分（契約無料化・署名待ち失効・トレード枠の成立ベース化・公開情報4キー・
