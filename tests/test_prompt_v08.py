@@ -129,7 +129,8 @@ class TestNegotiationPublicInfoBlocks:
 
     def test_initial_loans_block(self):
         prompt = self._prompt()
-        assert "## 初期借入額（公開情報。現金・借金残高・Free Cashは秘匿）" in prompt
+        # Cycle 9.2: entry_feeモードではFree Cash概念が廃止された
+        assert "## 初期借入額（公開情報。現金・借金残高は秘匿）" in prompt
         # v0.8サイクル8.3 F8: 12行の縦列挙から1行の横並びへ圧縮
         assert "P01: 50万 / P02: 50万 / P03: 50万" in prompt
 
@@ -248,9 +249,10 @@ class TestTradePaymentDirection:
             "P02が渡す: ONE_PAIR ／ あなたが渡す: FLUSH ＋ 現金5万円（あなたが払う）"
             in prompt
         )
+        # entry_feeモードのためspendable_cash = cash - entry_fee = 700000
         assert (
             "あなたの立場: 受諾候補（受諾すればあなたは現金を支払います"
-            f"（Free Cash {player.free_cash}円以内で可））" in prompt
+            "（支払可能額 700000円以内で可））" in prompt
         )
 
 
@@ -278,8 +280,9 @@ class TestNotificationKinds:
         # v0.8サイクル8.3 F4: [R{n}末]形式・相手IDは残す（承認時ノート指定）
         assert "[R6末] C_B は R6 の交渉終了時に署名が揃わず失効しました（未署名: P02）" in prompt
         assert "[R6末] トレード T_1（相手: P02）は R6 の交渉終了時に失効しました" in prompt
+        # Cycle 9.2: entry_feeモードでは「支払可能額不足」に変更
         assert (
-            "トレード T_2（相手: P03）は、提案者のFree Cash不足（必要額 5万円）"
+            "トレード T_2（相手: P03）は、提案者の支払可能額不足（必要額 5万円）"
             "のため不成立になりました" in prompt
         )
         # v0.8サイクル8.3 F16: engineの実判定（預託後の現金）に合わせた文言。

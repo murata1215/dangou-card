@@ -57,6 +57,8 @@ class TestPromptBuilder:
         assert "カード" in prompt
         assert "市場" in prompt
         assert "借金" in prompt or "借入" in prompt
+        # baseline_v1()はfree_cash_mode="debt"（既定）のため旧文言（Free Cash）を
+        # 維持するガード（Cycle 9.2でentry_fee/cashモードのみFree Cash文言を廃止した）
         assert "Free Cash" in prompt
 
     def test_loan_prompt_generated(self):

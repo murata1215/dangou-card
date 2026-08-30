@@ -3,13 +3,13 @@
 
 ダミー入力（実在の対戦ログとは無関係の架空データ）で `llm/prompt_builder.py` の
 各プロンプトビルダー（build_system_prompt / build_negotiation_prompt /
-build_commit_prompt / build_reflection_prompt / build_double_up_prompt）を呼び出し、
-実際の出力全文を Markdown として `doc/prompt_dump/actual_prompts_20260830_v2.md`
-へ書き出す。
+build_commit_prompt / build_reflection_prompt / build_double_up_prompt /
+build_loan_prompt）を呼び出し、実際の出力全文を Markdown として
+`doc/prompt_dump/actual_prompts_20260830_v3.md` へ書き出す。
 
 - LLM API は一切呼び出さない。`llm/adapters.py` は import しない
 - import するのは `engine.config` / `engine.models` / `engine.cards` /
-  `llm.prompt_builder.build_{system,negotiation,commit,reflection,double_up}_prompt`
+  `llm.prompt_builder.build_{system,negotiation,commit,reflection,double_up,loan}_prompt`
   のみ
 - `engine/` のロジックには一切影響しない（呼び出すだけで変更・実行はしない）
 - 実行すると出力ファイルを上書きする
@@ -19,7 +19,14 @@ build_commit_prompt / build_reflection_prompt / build_double_up_prompt）を呼�
 
 v0.8サイクル8.2で作成されたダミーシナリオ（P07視点・GameConfig.baseline_v1_s2(12)・
 パターンA=R1契約ゼロ席・パターンB=R7契約リッチ席）を土台に、サイクル8.3のダンプv2
-レビュー修正（F1〜F17）を反映するための最小限のダミー値変更のみを加えている
+レビュー修正（F1〜F17）を反映するための最小限のダミー値変更を加えたうえで、
+サイクル9.2（v0.9 プロンプト文面: Free Cash廃止の反映＋本戦分析5点 G1〜G5）向けに
+以下のダミー値をさらに追加している:
+  - パターンA/B双方の visible_state に `spendable_cash` キーを追加
+  - パターンBに次R（R8）期限・現金不足の型A義務を追加（G1警告の実演）
+  - パターンBに自分（P07）が提案者の署名待ち契約を追加（G3回帰ガードの実演。
+    contract_sign が「署名できる契約がない」にならないことを確認する）
+  - 6本目のプロンプトとして build_loan_prompt を追加
 （詳細は本ファイル末尾の main() 直前のコメントを参照）。
 """
 
@@ -41,9 +48,10 @@ from llm.prompt_builder import (
     build_commit_prompt,
     build_reflection_prompt,
     build_double_up_prompt,
+    build_loan_prompt,
 )
 
-OUTPUT_PATH = Path(__file__).resolve().parent.parent / "doc" / "prompt_dump" / "actual_prompts_20260830_v2.md"
+OUTPUT_PATH = Path(__file__).resolve().parent.parent / "doc" / "prompt_dump" / "actual_prompts_20260830_v3.md"
 
 # v1（doc/prompt_dump/actual_prompts_20260829.md）の実測文字数。v1自体は本スクリプトで
 # 再生成しないため、「v1比」列の計算用に定数として保持する。
@@ -54,6 +62,17 @@ V1_CHARS = {
     "commit": 2_662,
     "double_up": 1_588,
     "reflection": 3_114,
+}
+
+# v2（doc/prompt_dump/actual_prompts_20260830_v2.md）の実測文字数。v2自体は本スクリプトで
+# 再生成しないため、「v2比」列の計算用に定数として保持する（サイクル9.2で追加）。
+V2_CHARS = {
+    "system": 8_187,
+    "neg_a": 2_073,
+    "neg_b": 5_794,
+    "commit": 2_954,
+    "double_up": 2_361,
+    "reflection": 3_862,
 }
 
 
@@ -88,6 +107,9 @@ def _pattern_a_inputs():
         "initial_loans": {pid: 4_000_000 for pid in _alive_all_12()},
         "total_prize_budget": 45_000_000,
         "my_action_budget": {"used": 0, "max": 10},
+        # v0.9サイクル9.2: engine/game.pyが実際に払い出すキーをダミーにも投入する
+        # （free_cash_mode="entry_fee"のため cash - entry_fee = 400万 - 10万 = 390万）
+        "spendable_cash": 3_900_000,
     }
     return player, visible_state, config
 
@@ -143,6 +165,11 @@ def _pattern_b_base_state() -> dict:
          "ob_type": "type_b_market", "round_num": 7, "details": {"market_id": "M02"}},
         {"contract_id": "C_4A7F21", "obligor": "P07", "counterparty": "P03",
          "ob_type": "type_a_payment", "round_num": 8, "details": {"amount": 1_200_000}},
+        # v0.9サイクル9.2 G1実演: 次R（R8）期限・現金不足の型A義務。
+        # 現金520万 − Entry Fee20万 = 500万 < 600万 のため⚠警告が発火する
+        # （実際の判定は強制最低返済見込みも差し引くため、より厳しく不足する）
+        {"contract_id": "C_F00D01", "obligor": "P07", "counterparty": "P12",
+         "ob_type": "type_a_payment", "round_num": 8, "details": {"amount": 6_000_000}},
     ]
     my_contracts = [
         {
@@ -179,6 +206,18 @@ def _pattern_b_base_state() -> dict:
                  "round_num": 7, "details": {"card_rank": "FLUSH"}},
                 {"obligor": "P12", "counterparty": "P07", "ob_type": "type_a_payment",
                  "round_num": 8, "details": {"amount": 1_200_000}},
+            ],
+        },
+        # v0.9サイクル9.2 G3回帰ガード実演: 自分（P07）が提案者の署名待ち契約。
+        # engineが提案者を自動署名するため signed_by=["P07"]。この契約1件だけを
+        # 見ればcontract_signは選べないはずだが、上のC_D30E88（P12提案・自分未署名）
+        # があるため、いま選べるアクションではcontract_signは選択可能のまま。
+        {
+            "contract_id": "C_5F1A02", "proposer": "P07", "parties": ["P07", "P04"],
+            "signed_by": ["P07"], "round_created": 7,
+            "obligations": [
+                {"obligor": "P04", "counterparty": "P07", "ob_type": "type_a_payment",
+                 "round_num": 9, "details": {"amount": 300_000}},
             ],
         },
     ]
@@ -269,6 +308,9 @@ def _pattern_b_base_state() -> dict:
              "actual_market_id": "M02", "actual_card": "HIGH_CARD"},
         ],
         "total_prize_budget": 45_000_000,
+        # v0.9サイクル9.2: engine/game.pyが実際に払い出すキーをダミーにも投入する
+        # （free_cash_mode="entry_fee"のため cash - entry_fee = 520万 - 10万 = 510万）
+        "spendable_cash": 5_100_000,
     }
 
 
@@ -348,54 +390,69 @@ def generate() -> str:
     ]
     reflection = build_reflection_prompt(player_b, 7, vs_reflection, config, memory=PATTERN_B_MEMORY)
 
+    # 7. loan prompt（v0.9サイクル9.2で新規追加。ゲーム開始前の借入額選択）
+    loan = build_loan_prompt(config)
+
     outputs = {
         "system": system_prompt, "neg_a": neg_a, "neg_b": neg_b,
         "commit": commit, "double_up": double_up, "reflection": reflection,
+        "loan": loan,
     }
 
     def row(key: str, label: str, fn_ref: str) -> str:
         text = outputs[key]
         chars = len(text)
         rows_n = text.count("\n") + 1
-        v1 = V1_CHARS[key]
-        diff = chars - v1
-        sign = "+" if diff >= 0 else ""
-        return f"| {label} | `{fn_ref}` | {chars:,} | {rows_n} | {sign}{diff:,}字 |"
+        if key in V1_CHARS:
+            diff1 = chars - V1_CHARS[key]
+            sign1 = "+" if diff1 >= 0 else ""
+            v1_cell = f"{sign1}{diff1:,}字"
+        else:
+            v1_cell = "N/A（v3新規）"
+        if key in V2_CHARS:
+            diff2 = chars - V2_CHARS[key]
+            sign2 = "+" if diff2 >= 0 else ""
+            v2_cell = f"{sign2}{diff2:,}字"
+        else:
+            v2_cell = "N/A（v3新規）"
+        return f"| {label} | `{fn_ref}` | {chars:,} | {rows_n} | {v1_cell} | {v2_cell} |"
 
     summary_table = "\n".join([
-        "| # | プロンプト | 生成関数 | 文字数 | 行数 | v1比 |",
-        "|---|---|---|---:|---:|---|",
+        "| # | プロンプト | 生成関数 | 文字数 | 行数 | v1比 | v2比 |",
+        "|---|---|---|---:|---:|---|---|",
         "| 1 " + row("system", "system_prompt", "build_system_prompt").split("|", 1)[1],
         "| 2 " + row("neg_a", "negotiation prompt（パターンA: 契約ゼロ）", "build_negotiation_prompt").split("|", 1)[1],
         "| 3 " + row("neg_b", "negotiation prompt（パターンB: 契約あり）", "build_negotiation_prompt").split("|", 1)[1],
         "| 4 " + row("commit", "commit prompt", "build_commit_prompt").split("|", 1)[1],
         "| 5 " + row("double_up", "double_up prompt", "build_double_up_prompt").split("|", 1)[1],
         "| 6 " + row("reflection", "reflection prompt", "build_reflection_prompt").split("|", 1)[1],
+        "| 7 " + row("loan", "loan prompt（借入額選択）", "build_loan_prompt").split("|", 1)[1],
     ])
 
-    doc = f"""# 嘘八百万—談合カード— 実プロンプトダンプ v2（2026-08-30）
+    doc = f"""# 嘘八百万—談合カード— 実プロンプトダンプ v3（2026-08-30）
 
 ## この文書について
 
-本ファイルは `doc/prompt_dump/actual_prompts_20260829.md`（以下「v1」）の後継版です。v1作成後、サイクル8.1（エンジン差分）とサイクル8.2（v0.8プロンプト文面の一括修正）により `llm/prompt_builder.py` の出力文面が変化したため、**同一のダミーシナリオ・同一の手法**で全プロンプトを再生成し、最新の実出力をそのまま転記しています。
+本ファイルは `doc/prompt_dump/actual_prompts_20260830_v2.md`（以下「v2」）の後継版です。v2作成後、サイクル9.1（エンジン側の支払可能額ゲート刷新: `GameConfig.free_cash_mode`、`engine/player.py::spendable_cash()`）とサイクル9.2（v0.9プロンプト文面: Free Cash廃止の反映＋v0.8本戦分析5点 G1〜G5への対応）により `llm/prompt_builder.py` の出力文面が変化したため、**同一のダミーシナリオ・同一の手法**で全プロンプトを再生成し、最新の実出力をそのまま転記しています。
 
-- 生成に使用した `GameConfig`: `GameConfig.baseline_v1_s2(12)`（S2ルール有効・12席・12ラウンド。v1と同一設定。`contract_fee=0` のため、本ダンプでは契約提案が「無料」と表示されます — v1の「発行料10万円」はサイクル8.1で契約無料化された結果、現行コードでは再現されません）
-- ダミーの主人公プレイヤーID: **P07**（v1と同一。実在の対戦ログとは無関係の架空ID）
-- 金額・カード名・契約ID・メッセージ本文・他プレイヤーの行動はv1と同一のダミー値を土台に用いており、実際のプレイ記録ではありません
+- 生成に使用した `GameConfig`: `GameConfig.baseline_v1_s2(12)`（S2ルール有効・12席・12ラウンド。v1/v2と同一設定。サイクル9.1で `free_cash_mode="entry_fee"` に切り替わっており、借入金も最初から交渉資金として使える。`contract_fee=0` のため、本ダンプでは契約提案が「無料」と表示されます）
+- ダミーの主人公プレイヤーID: **P07**（v1/v2と同一。実在の対戦ログとは無関係の架空ID）
+- 金額・カード名・契約ID・メッセージ本文・他プレイヤーの行動はv2と同一のダミー値を土台に用いており、実際のプレイ記録ではありません
 - コード変更は一切行っていません。LLM APIも一切呼び出していません（`llm/adapters.py` は import すらしていません）
 - 生成スクリプトは `scripts/dump_prompts.py`（リポジトリに含まれる読み取り専用ツール）です
 - 全文コードブロックの外枠には4連続バッククォート（````）を使用しています。system_prompt本文にJSON例の```コードフェンスが含まれるため、3連続バッククォートでは本文が途中で切れて見えてしまうことの回避措置です
 - 「発火している条件付きブロック」欄は、実際の出力テキストに含まれる `##`/`###` 見出しを機械的に抽出したものです（grepによる抽出）
 - **【2026-08-30 補遺】** 初回生成時のパターンB（負債・契約リッチ席）は、v0.8サイクル8.2で追加された `visible_state` キーの一部（`double_ups_resolved` / `my_trades_this_round` / `contract_expired`/`trade_rejected`/`trade_superseded`/`double_up_blocked` 種別の通知）が空のままで、対応するプロンプトブロックが1度も出力に現れていなかった。本補遺で上記キーへダミー値を投入し、`negotiation`（パターンB）・`commit`・`double_up`・`reflection` の4プロンプトでこれらのブロックを実際に発火させたうえで再計測している。
 - **【2026-08-30 補遺2（サイクル8.3）】** ダンプv2レビュー（17点、F1〜F17）の指摘を受けて `llm/prompt_builder.py` を修正し、同一シナリオで再生成した。ダミー値の変更は以下の3点のみ（それ以外の数値・シナリオは補遺1から不変）: ①F14実演のためP05の倍掛け預託に `success_round=8` を設定 ②F1の受諾者払い分岐を実演するためトレード `T_5C1A` の `cash_amount` を正から負へ反転（P02払い→P07=あなた払い） ③契約無料化後の文脈に合わせてダミーメッセージ「契約にするなら発行料はそちら持ちで。」を「契約にするなら型Aの支払いはそちら側で。」に変更。生成スクリプトは本補遺よりリポジトリ内 `scripts/dump_prompts.py` として恒久化した（サイクル8.2時点は `/tmp/` の一時スクリプトだった）。
+- **【2026-08-30 補遺3（サイクル9.2、本v3）】** v0.9でエンジンが `free_cash_mode="entry_fee"` に切り替わったのに `llm/prompt_builder.py` が追随しておらず、v0.8のFree Cash経済（開始時Free Cash=0）を前提にした文面のまま借入金を交渉資金として使えることを禁止と告げていた事故を修正した。あわせてv0.8本戦分析5点（G1〜G5）に対応。本v3でのダミー値変更は以下の4点: ①パターンA/Bの `visible_state` に `spendable_cash` キーを追加（engineが実際に払い出す値をそのまま投入） ②パターンBに次R（R8）期限・現金不足の型A義務 `C_F00D01`（600万円）を追加し、G1警告を実演 ③パターンBに自分（P07）が提案者の署名待ち契約 `C_5F1A02` を追加し、G3（提案者本人へのcontract_sign非表示）が他者提案の契約と共存しても壊れないことを実演 ④6本目のプロンプトとして `build_loan_prompt` を新規追加。system_prompt本文の「## Free Cash」節は「## お金の使い方」節に置き換わり、negotiationの「あなたの状態」欄は「Free Cash」表示から「支払可能額（現金 − 今RのEntry Fee）」表示に変わっている。
 
 ## 文字数サマリ
 
 {summary_table}
 
-（1・2行目は補遺1から変更なし。3〜6行目は本補遺2でのF1〜F17反映後の値）
+（1〜6行目はv2からの本補遺3での変化。7行目`loan prompt`は新規追加のためv1比・v2比とも対象外）
 
-いずれの増減も上記のダミー値変更3点と、`llm/prompt_builder.py` のサイクル8.3修正（F1: トレード現金表示、F2: 署名待ち手札なし警告、F3: 「アクション枠を1つ消費します」、F4: 契約・トレード失効通知の[R{{n}}末]形式化、F8: 初期借入額の1行化、F9: 総賞金予算ラベル、F10: 「2倍の払出」、F11〜F13: double_up次R見通しの冒頭サマリ・結論・型A義務原資、F15: 他者倍掛けのsuccess_round明示、F16: double_up_blocked通知の預託後現金表記、F17: Finance見込み行のforecast_labelパラメータ化）に由来するものです。system_promptの増減はF5（identityの空行）・F6（宛先例のID）・F7（弱いカードで勝つ）の3点のみです。
+3〜6行目（negotiation パターンB・commit・double_up・reflection）の増減は、上記ダミー値変更②③（G1警告・G3実演の契約1件追加）に由来する部分と、Free Cash文言の除去・支払可能額表示への置換に由来する部分の合算です。system_promptの増減は「## Free Cash」節→「## お金の使い方」節への置換や、借入・型A・報奨・トレード等の文言をentry_feeモード向けに書き換えたことに由来します（詳細は本文参照）。
 
 ## 1. system_prompt
 
@@ -420,7 +477,7 @@ def generate() -> str:
 
 - **生成関数**: `build_negotiation_prompt`
 - **文字数/行数**: 上表参照
-- **送信条件**: R1・巡1・手札12枚フル・現金=借入額=400万円・Free Cash 0の席。契約義務なし・署名待ち契約なし・カードトレード提案なし・引き継ぎメモなし・脱落者なし・前ラウンド結果なし（R1のため）を想定したダミー。
+- **送信条件**: R1・巡1・手札12枚フル・現金=借入額=400万円（支払可能額=現金−Entry Fee=390万円）の席。契約義務なし・署名待ち契約なし・カードトレード提案なし・引き継ぎメモなし・脱落者なし・前ラウンド結果なし（R1のため）を想定したダミー。
 - **送信フェイズ**: Negotiationフェイズ
 - **発火している条件付きブロック**（機械抽出。grep `^##`）: {_fired_headings(neg_a)}
 
@@ -439,6 +496,7 @@ def generate() -> str:
 - **送信条件**: R7・巡4。以下の条件付きブロックをすべて発火させたダミー席: 6枚に減った手札、進行中の型B義務（今R期限）を含む契約C_4A7F21（解除同意1/2、R8期限の型A支払義務120万円あり）、脱落者P09を含む消化済み契約C_91B0C4、P12提案の署名待ち契約C_D30E88（自分がまだ未署名・署名すれば型A受取が発生。要求カードFLUSHは現在の手札に無いためF2警告が発火）、P02提案のカードトレードT_5C1A（サイクル8.3でP07払いに変更）、脱落者P08/P09、AUTO COMMIT実績、倍掛け結果3件（P11成功・P06没収・P08脱落没収）、契約解除通知に加え`contract_expired`/`trade_rejected`/`trade_superseded`通知3件、不成立アクション（P09宛て2回）、公開報奨B_7788AA、他プレイヤーP05の倍掛け中預託（サイクル8.3でsuccess_round=8を明示）、公示された正式契約2件（自分1件+他者間1件）、成立済みカードトレード2件（P02⇄P04・P01⇄P06）、各プレイヤーの使用済みカード、初期借入額12人分、DM/broadcast/匿名/DM各1件、自分が今ラウンドに提案したカードトレード3件（受諾待ち/拒否/失効）
 - **送信フェイズ**: Negotiationフェイズ
 - **発火している条件付きブロック**（機械抽出。grep `^##`/`^###`）: {_fired_headings(neg_b)}
+- **v0.9サイクル9.2で追加したダミー**: 次R（R8）期限・現金不足の型A義務 `C_F00D01`（600万円。G1警告を実演）／自分（P07）が提案者の署名待ち契約 `C_5F1A02`（G3実演。P12提案のC_D30E88が未署名のまま残るため、いま選べるアクションではcontract_signは選択可能のまま）
 
 > 以下は上記ダミー入力に対する実際の出力全文です。プレイヤーID・金額・カード名・契約ID・メッセージ本文はすべてダミー値です。省略・要約は行っていません。
 
@@ -496,6 +554,23 @@ def generate() -> str:
 ### 全文
 
 {_fence(reflection)}
+
+## 7. loan prompt（借入額選択）
+
+### メタ情報
+
+- **生成関数**: `build_loan_prompt`（v0.9サイクル9.2で新規追加）
+- **文字数/行数**: 上表参照
+- **送信条件**: ゲーム開始前。プレイヤー状態に依存しない固定文（`GameConfig` のみで決まる）。
+- **送信フェイズ**: LOAN_SELECTION（全フェイズの最初、1ゲームに1回）
+- **発火している条件付きブロック**（機械抽出。grep `^##`）: {_fired_headings(loan)}
+  - `baseline_v1_s2(12)` は `mandatory_repay_enabled=True` のため「賞金を1度も取れなかった場合の目安」参考表（G5）が発火している。表の数値は `llm/prompt_builder.py::_simulate_zero_prize_path()` が `_compute_finance_forecast()` を再利用して算出したもので、毎R表示のFinance見込みブロックと計算式が一致する。
+
+> 以下は上記ダミー入力に対する実際の出力全文です。プレイヤーID・金額・カード名・契約ID・メッセージ本文はすべてダミー値です。省略・要約は行っていません。
+
+### 全文
+
+{_fence(loan)}
 """
     return doc
 

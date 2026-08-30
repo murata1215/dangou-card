@@ -217,8 +217,11 @@ def test_gemini_phase2_overrides_and_reserves_are_model_specific():
     # 7,076→8,177字に増加したため、六度目の期待値更新。M3/H3とも引き続き0.03未満。
     # Cycle 8.3（2026-08-30）: F5/F6/F7でsystem prompt長が8,177→8,187字に変化したため、
     # 七度目の期待値更新。M3/H3とも引き続き0.03未満。
-    assert mm._phase2_worst_case_cost(MODEL_REGISTRY["M3"], system, 512) == pytest.approx(0.0167085)
-    assert mm._phase2_worst_case_cost(MODEL_REGISTRY["H3"], system, 912) == pytest.approx(0.027078)
+    # Cycle 9.2（2026-08-30）: v0.9 free_cash_mode="entry_fee"向けにFree Cash文言を
+    # 「お金の使い方」節へ置換した結果、system prompt長が8,187→8,181字に変化したため、
+    # 八度目の期待値更新。M3/H3とも引き続き0.03未満。
+    assert mm._phase2_worst_case_cost(MODEL_REGISTRY["M3"], system, 512) == pytest.approx(0.016704)
+    assert mm._phase2_worst_case_cost(MODEL_REGISTRY["H3"], system, 912) == pytest.approx(0.027072)
     assert mm._phase2_worst_case_cost(MODEL_REGISTRY["M3"], system, 512) < 0.03
     assert mm._phase2_worst_case_cost(MODEL_REGISTRY["H3"], system, 912) < 0.03
 

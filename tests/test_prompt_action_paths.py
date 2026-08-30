@@ -139,7 +139,9 @@ class TestE3BountyCancelFormat:
 
 
 # =============================================================================
-# E4-a: 匿名通信費の事実（cash支払・Free Cash制限外）が機能説明直下に再掲される
+# E4-a: 匿名通信費の事実（cash支払）が機能説明直下に再掲される
+# Cycle 9.2: entry_feeモードではFree Cash概念が廃止されたため
+# 「※現金払い。」の近傍assertへ変更（"Free Cash制限外"の再掲は無くなった）
 # =============================================================================
 
 class TestE4aAnonFeeFreeCashExempt:
@@ -147,14 +149,13 @@ class TestE4aAnonFeeFreeCashExempt:
         config = GameConfig.baseline_v1_s2(8)
         prompt = build_system_prompt("P01", config)
         assert "匿名通信" in prompt
-        # 機能説明の近傍に「現金払い」「Free Cash制限外」の事実が明示されている
+        # 機能説明の近傍に「現金払い」の事実が明示されている
         # （"匿名通信:" は機能説明行。"匿名通信費"はL719の非適用列挙にも出るため
-        #  コロン付きで機能説明行のみを狙う。budget制約により文言は最小限に圧縮
-        #  済みだが、事実2点（現金払い／Free Cash制限外）は保持している）
+        #  コロン付きで機能説明行のみを狙う）
         idx = prompt.index("匿名通信:")
         nearby = prompt[idx:idx + 200]
-        assert "現金" in nearby and "cash" in nearby.lower()
-        assert "Free Cash制限外" in nearby
+        assert "現金" in nearby
+        assert "※現金払い。" in nearby
 
 
 # =============================================================================

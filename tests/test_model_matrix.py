@@ -1517,7 +1517,10 @@ def test_phase2_core18_reservations_cover_model_overrides_and_flag_h4_cap_gap():
     # {other}化。差引0字）/F7（contract節に「弱いカードで勝つ」を追加+9字）で
     # system prompt長が8,177→8,187字に変化。H1予約額は$0.03459→$0.034615へ変化
     # （トークン境界の丸めにより文字数増でも減少し得る。七度目の期待値更新）。
-    assert reservations["H1"] == pytest.approx(0.034615, abs=1e-12)
+    # Cycle 9.2（2026-08-30）: v0.9 free_cash_mode="entry_fee"向けにRULES_SUMMARYの
+    # Free Cash文言を「お金の使い方」節へ置換した結果、system prompt長が8,187→8,181字に
+    # 変化。H1予約額は$0.034615→$0.0346へ変化（八度目の期待値更新）。
+    assert reservations["H1"] == pytest.approx(0.0346, abs=1e-12)
     for key in ("H1", "H2", "H4"):
         assert reservations[key] > 0.02
         if key != "H4":

@@ -120,7 +120,8 @@ class TestNeutralizedWarnings:
         prompt = build_system_prompt("P01", config)
         # v0.8サイクル8.2 Step1の圧縮で強調表現(**...**)付きに言い換えられた
         assert "**不成立アクションは枠を消費する**" in prompt
-        assert "宛先が「生存者」欄にあるか・Free Cash十分か確認すれば避けられる" in prompt
+        # Cycle 9.2: entry_feeモードではFree Cashが廃止され「支払可能額が十分か」に変更
+        assert "宛先が「生存者」欄にあるか・支払可能額が十分か確認すれば避けられる" in prompt
 
     def test_dead_target_has_avoidance(self):
         config = GameConfig.baseline_v1_s2(12)
@@ -206,11 +207,12 @@ class TestClosingEnumeration:
 
     def test_zero_free_cash_marks_transfer_unavailable(self):
         config = GameConfig.baseline_v1_s2(12)
-        player = _make_player(cash=100_000, debt=100_000)  # free_cash = 0
+        # entry_feeモードのためspendable_cash = cash - entry_fee = 0
+        player = _make_player(cash=100_000, debt=100_000)
         vs = _base_visible_state()
         prompt = build_negotiation_prompt(player, 5, 1, vs, config)
         _, unavailable = _extract_available_unavailable(prompt)
-        assert "transfer・bounty_post（Free Cash 0）" in unavailable
+        assert "transfer・bounty_post（支払可能額 0）" in unavailable
 
     def test_closing_no_longer_says_only_five(self):
         config = GameConfig.baseline_v1_s2(12)
@@ -539,7 +541,7 @@ class TestActionDescriptionMapping:
         zero_free_cash_player = _make_player(cash=100_000, debt=100_000)
         zero_free_cash_prompt = build_negotiation_prompt(zero_free_cash_player, 5, 1, vs, config)
         _, zero_free_cash_unavailable = _extract_available_unavailable(zero_free_cash_prompt)
-        assert "transfer・bounty_post（Free Cash 0）" in zero_free_cash_unavailable
+        assert "transfer・bounty_post（支払可能額 0）" in zero_free_cash_unavailable
 
         r12_prompt = build_negotiation_prompt(player, 12, 1, vs, config)
         _, r12_unavailable = _extract_available_unavailable(r12_prompt)
