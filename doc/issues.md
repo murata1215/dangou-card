@@ -51,3 +51,7 @@
 - [x] CoT(A)実装: `enable_cot`フラグでLLM応答JSONに`reasoning`フィールドを追加。情報リーク防止（他プレイヤー・イベントログへの非公開）をテスト3件で担保（2026-08-16）
 - [x] CoTスモークテスト: 6ベンダー混合・S2・R1打ち切り（seed=601, コスト$0.36）で全6ベンダーがreasoningを正常出力、リーク0件を確認（2026-08-16）
 - [ ] CoT ON/OFF比較実験: 同一モデルでのCoT有無による生還率・意思決定品質の因果効果を測定するフル試合実験が未実施。次タスク候補
+
+## 観戦・解説まわり
+
+- [ ] `engine/commentary/trace.py` の DM 宛先が常に空: L431 が `action.get("target","")` を読むが実ログのキーは `to`（`engine/models.py` L470-543 の DMAction 定義）。このため `trace.secret.dms[].recipient` は全件空文字列になる。`anonymous_broadcast` も未対応。DM宛先が必要な解析では `action.to` を自前で読むこと（2026-09-08 「金になった嘘」抽出時に発見、本タスクでは未修正）
