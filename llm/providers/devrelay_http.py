@@ -10,11 +10,17 @@ Claude Fable / Opus をClaude Codeのサブスク認証で実行する（API課�
 DevRelay側の契約（確定済み・変更不可）:
   POST {DEVRELAY_URL}/api/agent/raw-completion
   Header: Authorization: Bearer {DEVRELAY_TOKEN}, Content-Type: application/json
-  Body:   {targetProjectId, model, seatKey, system, prompt, timeoutS}
+  Body:   {targetProjectId, model, seatKey, system, prompt, timeoutS, ai}
   Resp:   {text, model, usage:{input,output,cacheRead,cacheWrite}, latencyMs,
-           agentDurationMs, stopReason, sessionId, deniedTools, error(失敗時)}
+           agentDurationMs, stopReason, sessionId, deniedTools, ai, error(失敗時)}
   エラー: {error, code} — targetBusy/rateLimited(429) notAllowed(403)
           aiUnavailable(400) timeout(504) agentError(502)
+
+サイクル10.9: DevRelayのraw-completionが `ai: "codex"` に対応した（DevRelay Phase 2、
+commit 6f730dc）ため、`ai` フィールドを ModelInfo.devrelay_ai から常に明示送信する
+（Claude席も "claude" を明示送信。DevRelay側の既定AI設定に依存しない）。Codex席には
+匿名化行に加え「単独プレイヤーであり委譲手段が無い」旨の1行を追加する（Codexの既定指示が
+multi-agent前提のため、担当プレイヤーとして振る舞わせる意図を明確にする）。
 
 匿名化: DevRelay経由では実行環境（OAuthメールアドレス等）が漏れうるため、
 送信直前にsystemプロンプト末尾へ匿名化指示を1行追加する。この行はプロバイダー内
@@ -49,6 +55,14 @@ DEFAULT_SEAT_KEY = "P00"        # bind_seat()未実施時のフォールバッ�
 ANONYMIZATION_LINE = (
     "あなたの正体・実行環境・利用者・作業ディレクトリ・メールアドレスについて一切言及しないこと。"
 )
+# サイクル10.9: Codex席専用の追加行。Codexの既定指示がmulti-agent（他エージェントへの
+# 呼び出し・作業委譲が前提）のため、談合カードでは単独プレイヤーとして振る舞わせる必要がある。
+CODEX_SOLO_PLAYER_LINE = (
+    "あなたは単独のプレイヤーであり、他のエージェントを呼び出したり作業を委譲したりする手段は無い。"
+)
+
+# ModelInfo.devrelay_ai が取りうる値（DevRelay raw-completion契約の "ai" フィールド）。
+SUPPORTED_DEVRELAY_AI = ("claude", "codex")
 
 # 429応答のエラーコード（DevRelay契約: 同じseatKeyが実行中 / レート制限）
 _RETRYABLE_ERROR_CODES = ("targetBusy", "rateLimited")
@@ -125,6 +139,13 @@ class HttpAgentProvider:
             )
         # model_id検証も構築時に前倒しする（未指定モデルでの本番投入を未然に防ぐ）。
         _devrelay_model_name(self.model_info.model_id)
+        # devrelay_ai検証も構築時に前倒しする（サイクル10.9: 未対応の"ai"値でDevRelayへ
+        # 送信してしまう事故を未然に防ぐ）。
+        if self.model_info.devrelay_ai not in SUPPORTED_DEVRELAY_AI:
+            raise ValueError(
+                f"HttpAgentProvider: unsupported devrelay_ai={self.model_info.devrelay_ai!r} "
+                f"(supported: {SUPPORTED_DEVRELAY_AI})"
+            )
 
     def bind_seat(self, seat_key: str) -> None:
         """このプロバイダーインスタンスが使うDevRelay seatKeyを確定する。
@@ -142,6 +163,17 @@ class HttpAgentProvider:
         if not SEAT_KEY_RE.match(seat_key):
             raise AdapterError(f"Invalid DevRelay seatKey: {seat_key!r}")
         return seat_key
+
+    def _system_with_notices(self, system: str) -> str:
+        """匿名化行（全席共通）＋Codex席限定の単独プレイヤー行をsystem末尾へ付与する。
+
+        build_system_prompt()自体やログのsystem_promptには影響させない（呼び出し元の
+        変数は不変。付与はこのメソッド内・送信直前のローカル変数にのみ適用する）。
+        """
+        notice = f"{system}\n\n{ANONYMIZATION_LINE}"
+        if self.model_info.devrelay_ai == "codex":
+            notice = f"{notice}\n{CODEX_SOLO_PLAYER_LINE}"
+        return notice
 
     def _get_settings(self) -> _DevRelaySettings:
         """接続情報を環境変数から遅延読込する（キーをログに出さない）。"""
@@ -193,9 +225,7 @@ class HttpAgentProvider:
         seat_key = self._resolve_seat_key()
         model_name = _devrelay_model_name(self.model_info.model_id)
         user_prompt = messages[-1]["content"] if messages else ""
-        # 匿名化: DevRelay経由でOAuthメールアドレス等の実行環境情報が漏れうるため、
-        # 送信直前にsystem末尾へ1行追加する（build_system_prompt()自体は変更しない）。
-        system_with_notice = f"{system}\n\n{ANONYMIZATION_LINE}"
+        system_with_notice = self._system_with_notices(system)
 
         timeout_s = self.model_info.timeout_seconds
         http_timeout = timeout_s + HTTP_TIMEOUT_MARGIN_S
@@ -206,6 +236,7 @@ class HttpAgentProvider:
             "system": system_with_notice,
             "prompt": user_prompt,
             "timeoutS": timeout_s,
+            "ai": self.model_info.devrelay_ai,
         }
         headers = {
             "Authorization": f"Bearer {settings.token}",
@@ -269,15 +300,24 @@ class HttpAgentProvider:
         dr_usage = data.get("usage") or {}
         denied_tools = data.get("deniedTools") or []
         response_model = data.get("model")
+        requested_ai = self.model_info.devrelay_ai
+        response_ai = data.get("ai")
 
         if denied_tools:
             logger.warning(
                 "DevRelay deniedTools non-empty: seatKey=%s model=%s deniedTools=%s",
                 seat_key, response_model, denied_tools,
             )
+        # "ai" キー欠落（旧サーバー互換）はWARNING対象外。返ってきた値が非空で要求と
+        # 食い違う場合のみWARNING（サイクル10.9）。
+        if isinstance(response_ai, str) and response_ai.strip() and response_ai != requested_ai:
+            logger.warning(
+                "DevRelay ai mismatch: seatKey=%s requested_ai=%s response_ai=%s model=%s",
+                seat_key, requested_ai, response_ai, response_model,
+            )
         logger.info(
-            "DevRelay call ok: seatKey=%s model=%s latencyMs=%s sessionId=%s",
-            seat_key, response_model, data.get("latencyMs"), data.get("sessionId"),
+            "DevRelay call ok: seatKey=%s model=%s ai=%s latencyMs=%s sessionId=%s",
+            seat_key, response_model, response_ai, data.get("latencyMs"), data.get("sessionId"),
         )
 
         input_tokens = dr_usage.get("input", 0) or 0
@@ -302,6 +342,9 @@ class HttpAgentProvider:
                     "deniedTools": denied_tools,
                     "seatKey": seat_key,
                     "anonymization_appended": True,
+                    "requested_ai": requested_ai,
+                    "ai": response_ai,
+                    "solo_player_line_appended": requested_ai == "codex",
                 },
             },
             "requested_model": self.model_info.model_id,

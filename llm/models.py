@@ -57,6 +57,8 @@ class ModelInfo:
     tier: str = ""           # "H"(強)/"M"(中)/"L"(軽)。"" = 未分類（テスト用アドホック生成のデフォルト）
     hidden_thinking_reserve_tokens: int = 0
     billing: str = "api"     # "api"(通常API課金) / "subscription"(DevRelay経由・0円計上・席キャップ対象外)
+    devrelay_ai: str = "claude"  # DevRelay raw-completionへ送る"ai"フィールド（"claude"/"codex"）。
+    # adapter_type="devrelay_http" 以外では未使用（サイクル10.9）。
     # max_tokens の外側で課金される hidden thinking/reasoning の事前予約トークン数（worst_case_cost用）。
     # 0 = thinking が output/completion に内包される（Anthropic/OpenAI）か、
     #     thinking 無効化済み（Kimi/DeepSeek）→ 予約不要（計算は現行と完全同値）。
@@ -470,6 +472,36 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         supports_temperature=False,
         billing="subscription",
         tier="",
+    ),
+    # サイクル10.9 (2026-09-21) 追加。DevRelay raw-completionの ai="codex" 対応
+    # （DevRelay Phase 2、commit 6f730dc）を受けたCodex実験席。
+    # 実機確認済み(2026-09-21): ai="codex" + model="gpt-5.6-terra"/"gpt-5.6-sol" でHTTP 200、
+    # レスポンスの "ai" が "codex" で返る。Codex側の既定指示（multi-agent前提、約11Kトークン）が
+    # 毎回乗るが、DR_FABLE等と同じくsubscription課金のためこのプロジェクトの費用には影響しない。
+    # provider="OpenAI"（中身がCodex=OpenAIのため。_PROVIDER_TO_VENDOR/VENDOR_ORDERに既存でvendor="openai"）。
+    "DR_TERRA": ModelInfo(
+        model_id="devrelay/gpt-5.6-terra",
+        provider="OpenAI", name="GPT-5.6 Terra (DevRelay experimental seat)",
+        adapter_type="devrelay_http",
+        input_price=0.0, output_price=0.0,
+        env_key="DEVRELAY_TOKEN", base_url=None,
+        timeout_seconds=120,
+        supports_temperature=False,
+        billing="subscription",
+        tier="",
+        devrelay_ai="codex",
+    ),
+    "DR_SOL": ModelInfo(
+        model_id="devrelay/gpt-5.6-sol",
+        provider="OpenAI", name="GPT-5.6 Sol (DevRelay experimental seat)",
+        adapter_type="devrelay_http",
+        input_price=0.0, output_price=0.0,
+        env_key="DEVRELAY_TOKEN", base_url=None,
+        timeout_seconds=120,
+        supports_temperature=False,
+        billing="subscription",
+        tier="",
+        devrelay_ai="codex",
     ),
 }
 

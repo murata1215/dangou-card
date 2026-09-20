@@ -19,6 +19,7 @@ from llm.llm_logger import LLMLogger
 from llm.models import MODEL_REGISTRY, ModelInfo, get_model
 from llm.providers.devrelay_http import (
     ANONYMIZATION_LINE,
+    CODEX_SOLO_PLAYER_LINE,
     DEFAULT_TARGET_PROJECT_ID,
     HttpAgentProvider,
 )
@@ -297,7 +298,7 @@ def test_denied_tools_logs_warning(caplog):
 # --- 12. レジストリ登録 ---
 
 def test_registry_entries_are_subscription_and_unregistered_from_default_roster():
-    for key in ("DR_FABLE", "DR_OPUS", "DR_OPUS48", "DR_SONNET5"):
+    for key in ("DR_FABLE", "DR_OPUS", "DR_OPUS48", "DR_SONNET5", "DR_TERRA", "DR_SOL"):
         info = MODEL_REGISTRY[key]
         assert info.adapter_type == "devrelay_http"
         assert info.billing == "subscription"
@@ -305,10 +306,18 @@ def test_registry_entries_are_subscription_and_unregistered_from_default_roster(
         assert info.output_price == 0.0
         assert info.tier == ""  # get_models_by_tier() では拾われない＝既定ロスター外
 
+    for key in ("DR_FABLE", "DR_OPUS", "DR_OPUS48", "DR_SONNET5"):
+        assert MODEL_REGISTRY[key].devrelay_ai == "claude"
+    for key in ("DR_TERRA", "DR_SOL"):
+        assert MODEL_REGISTRY[key].devrelay_ai == "codex"
+        assert MODEL_REGISTRY[key].provider == "OpenAI"
+
     assert get_model("devrelay/claude-fable-5-1") is MODEL_REGISTRY["DR_FABLE"]
     assert get_model("devrelay/claude-opus-5") is MODEL_REGISTRY["DR_OPUS"]
     assert get_model("devrelay/claude-opus-4-8") is MODEL_REGISTRY["DR_OPUS48"]
     assert get_model("devrelay/claude-sonnet-5") is MODEL_REGISTRY["DR_SONNET5"]
+    assert get_model("devrelay/gpt-5.6-terra") is MODEL_REGISTRY["DR_TERRA"]
+    assert get_model("devrelay/gpt-5.6-sol") is MODEL_REGISTRY["DR_SOL"]
 
     adapter = create_adapter(MODEL_REGISTRY["DR_FABLE"])
     assert isinstance(adapter, HttpAgentProvider)
@@ -330,6 +339,98 @@ def test_anonymization_line_appended_only_in_transport_payload():
     assert captured["system"] == f"{original_system}\n\n{ANONYMIZATION_LINE}"
     # build_system_prompt()相当の元文字列自体は変更されない（呼び出し側の変数は不変）
     assert original_system == "あなたはプレイヤーP05である。"
+
+
+# --- 13.5. サイクル10.9: "ai" フィールドの送信・Codex席専用行・食い違いWARNING ---
+
+def test_request_includes_ai_claude_by_default():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json=success_payload())
+
+    provider = HttpAgentProvider(make_model(), transport=httpx.MockTransport(handler))
+    provider.complete(system="SYSTEM_TEXT", messages=[{"role": "user", "content": "u"}])
+
+    assert captured["body"]["ai"] == "claude"
+    assert CODEX_SOLO_PLAYER_LINE not in captured["body"]["system"]
+    assert captured["body"]["system"] == f"SYSTEM_TEXT\n\n{ANONYMIZATION_LINE}"
+
+
+def test_request_includes_ai_codex_and_solo_line():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json=success_payload())
+
+    codex_model = make_model(
+        model_id="devrelay/gpt-5.6-terra", provider="OpenAI", devrelay_ai="codex"
+    )
+    provider = HttpAgentProvider(codex_model, transport=httpx.MockTransport(handler))
+    provider.complete(system="SYSTEM_TEXT", messages=[{"role": "user", "content": "u"}])
+
+    assert captured["body"]["ai"] == "codex"
+    assert captured["body"]["system"] == (
+        f"SYSTEM_TEXT\n\n{ANONYMIZATION_LINE}\n{CODEX_SOLO_PLAYER_LINE}"
+    )
+
+
+def test_response_ai_recorded_in_usage(caplog):
+    codex_model = make_model(
+        model_id="devrelay/gpt-5.6-terra", provider="OpenAI", devrelay_ai="codex"
+    )
+    provider = HttpAgentProvider(
+        codex_model,
+        transport=httpx.MockTransport(
+            lambda r: httpx.Response(200, json=success_payload(ai="codex"))
+        ),
+    )
+    with caplog.at_level(logging.WARNING):
+        _, usage = provider.complete(system="s", messages=[{"role": "user", "content": "u"}])
+
+    dr = usage["usage_raw"]["devrelay"]
+    assert dr["requested_ai"] == "codex"
+    assert dr["ai"] == "codex"
+    assert dr["solo_player_line_appended"] is True
+    assert not any("ai mismatch" in rec.message for rec in caplog.records)
+
+
+def test_response_ai_mismatch_logs_warning(caplog):
+    codex_model = make_model(
+        model_id="devrelay/gpt-5.6-terra", provider="OpenAI", devrelay_ai="codex"
+    )
+    provider = HttpAgentProvider(
+        codex_model,
+        transport=httpx.MockTransport(
+            lambda r: httpx.Response(200, json=success_payload(ai="claude"))
+        ),
+    )
+    with caplog.at_level(logging.WARNING):
+        provider.complete(system="s", messages=[{"role": "user", "content": "u"}])
+
+    assert any("ai mismatch" in rec.message for rec in caplog.records)
+
+
+def test_response_ai_absent_no_warning(caplog):
+    """旧サーバー互換: レスポンスに "ai" キーが無い場合はWARNINGを出さない。"""
+    provider = HttpAgentProvider(
+        make_model(),
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, json=success_payload())),
+    )
+    with caplog.at_level(logging.WARNING):
+        _, usage = provider.complete(system="s", messages=[{"role": "user", "content": "u"}])
+
+    assert usage["usage_raw"]["devrelay"]["ai"] is None
+    assert usage["usage_raw"]["devrelay"]["requested_ai"] == "claude"
+    assert usage["usage_raw"]["devrelay"]["solo_player_line_appended"] is False
+    assert not any("ai mismatch" in rec.message for rec in caplog.records)
+
+
+def test_unsupported_devrelay_ai_rejected_at_construction():
+    with pytest.raises(ValueError):
+        HttpAgentProvider(make_model(devrelay_ai="gemini"))
 
 
 # --- 14. LLMAgent 統合: bind_seat と 0円ログ ---
@@ -388,3 +489,18 @@ def test_fake_server_agent_error(fake_server, monkeypatch):
     provider.bind_seat("P11")
     with pytest.raises(AdapterError):
         provider.complete(system="s", messages=[{"role": "user", "content": "__AGENT_ERROR__"}])
+
+
+def test_fake_server_echoes_ai(fake_server, monkeypatch):
+    """サイクル10.9: fake serverが受け取った "ai" をそのままエコーする（Codex席想定）。"""
+    monkeypatch.setenv("DEVRELAY_URL", fake_server)
+    monkeypatch.setenv("DEVRELAY_TOKEN", "fake-token")
+    codex_model = make_model(
+        model_id="devrelay/gpt-5.6-terra", provider="OpenAI", devrelay_ai="codex"
+    )
+    provider = HttpAgentProvider(codex_model)
+    provider.bind_seat("P12")
+    _, usage = provider.complete(system="s", messages=[{"role": "user", "content": "u"}])
+    dr = usage["usage_raw"]["devrelay"]
+    assert dr["ai"] == "codex"
+    assert dr["requested_ai"] == "codex"

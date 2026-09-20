@@ -7,8 +7,8 @@ DevRelay側の契約どおりの固定JSONを返す（本物のDevRelayサーバ
 契約: doc/devlog（サイクル10.7）参照。
   POST {base_url}/api/agent/raw-completion
   Header: Authorization: Bearer {token}
-  Body:   {targetProjectId, model, seatKey, system, prompt, timeoutS}
-  Resp:   {text, model, usage, latencyMs, agentDurationMs, stopReason, sessionId, deniedTools}
+  Body:   {targetProjectId, model, seatKey, system, prompt, timeoutS, ai}
+  Resp:   {text, model, ai, usage, latencyMs, agentDurationMs, stopReason, sessionId, deniedTools}
 
 異常系トリガ（`prompt` 文字列に以下が含まれると挙動を変える。テスト専用の合図であり、
 本物のDevRelay契約には存在しない）:
@@ -68,6 +68,7 @@ def _make_handler(token: str, busy_seen: dict[str, int], lock: threading.Lock) -
             prompt = req.get("prompt", "") or ""
             seat_key = req.get("seatKey", "") or ""
             model = req.get("model", "unknown-model")
+            ai = req.get("ai", "claude")
 
             if "__RATE_LIMITED__" in prompt:
                 self._send_json(429, {"error": "rate limited", "code": "rateLimited"})
@@ -95,6 +96,7 @@ def _make_handler(token: str, busy_seen: dict[str, int], lock: threading.Lock) -
             self._send_json(200, {
                 "text": '{"ok": true}',
                 "model": model,
+                "ai": ai,
                 "usage": {"input": 42, "output": 8, "cacheRead": 0, "cacheWrite": 0},
                 "latencyMs": 3500, "agentDurationMs": 3200,
                 "stopReason": "success", "sessionId": "raw_fake_session",
