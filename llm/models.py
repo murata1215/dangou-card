@@ -449,6 +449,28 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         billing="subscription",
         tier="",
     ),
+    "DR_OPUS48": ModelInfo(
+        model_id="devrelay/claude-opus-4-8",
+        provider="Anthropic", name="Claude Opus 4.8 (DevRelay experimental seat)",
+        adapter_type="devrelay_http",
+        input_price=0.0, output_price=0.0,
+        env_key="DEVRELAY_TOKEN", base_url=None,
+        timeout_seconds=120,
+        supports_temperature=False,
+        billing="subscription",
+        tier="",
+    ),
+    "DR_SONNET5": ModelInfo(
+        model_id="devrelay/claude-sonnet-5",
+        provider="Anthropic", name="Claude Sonnet 5 (DevRelay experimental seat)",
+        adapter_type="devrelay_http",
+        input_price=0.0, output_price=0.0,
+        env_key="DEVRELAY_TOKEN", base_url=None,
+        timeout_seconds=120,
+        supports_temperature=False,
+        billing="subscription",
+        tier="",
+    ),
 }
 
 

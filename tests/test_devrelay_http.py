@@ -297,7 +297,7 @@ def test_denied_tools_logs_warning(caplog):
 # --- 12. レジストリ登録 ---
 
 def test_registry_entries_are_subscription_and_unregistered_from_default_roster():
-    for key in ("DR_FABLE", "DR_OPUS"):
+    for key in ("DR_FABLE", "DR_OPUS", "DR_OPUS48", "DR_SONNET5"):
         info = MODEL_REGISTRY[key]
         assert info.adapter_type == "devrelay_http"
         assert info.billing == "subscription"
@@ -307,6 +307,8 @@ def test_registry_entries_are_subscription_and_unregistered_from_default_roster(
 
     assert get_model("devrelay/claude-fable-5-1") is MODEL_REGISTRY["DR_FABLE"]
     assert get_model("devrelay/claude-opus-5") is MODEL_REGISTRY["DR_OPUS"]
+    assert get_model("devrelay/claude-opus-4-8") is MODEL_REGISTRY["DR_OPUS48"]
+    assert get_model("devrelay/claude-sonnet-5") is MODEL_REGISTRY["DR_SONNET5"]
 
     adapter = create_adapter(MODEL_REGISTRY["DR_FABLE"])
     assert isinstance(adapter, HttpAgentProvider)
