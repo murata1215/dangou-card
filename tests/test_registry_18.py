@@ -152,7 +152,11 @@ def test_no_placeholder_model_ids():
 
 
 def test_all_prices_positive():
+    """billing="subscription"（サイクル10.7: DevRelay経由のサブスク実験席）は
+    API課金が発生しない設計上の意図的な0円のため、この不変条件の対象外とする。"""
     for key, info in MODEL_REGISTRY.items():
+        if info.billing == "subscription":
+            continue
         assert info.input_price > 0, key
         assert info.output_price > 0, key
 
@@ -211,14 +215,16 @@ def test_model_info_fields_include_phase2_and_temperature_overrides():
     """ModelInfoのフィールド数が既知の値であること（想定外フィールド追加の検知）
 
     2026-08-18: hidden_thinking_reserve_tokens を追加（worst_case_costのhidden thinking
-    予約対応。既定0で全モデルの計算を変えない。scripts/model_smoke.py:worst_case_cost参照）。"""
+    予約対応。既定0で全モデルの計算を変えない。scripts/model_smoke.py:worst_case_cost参照）。
+    サイクル10.7 (2026-09-20): billing を追加（DevRelay経由のサブスク実験席を
+    0円計上するためのフラグ。既定"api"で全モデルの計算を変えない）。"""
     names = [f.name for f in fields(ModelInfo)]
     assert names == [
         "model_id", "provider", "name", "adapter_type", "input_price", "output_price",
         "env_key", "base_url", "timeout_seconds", "max_tokens",
         "phase2_max_tokens", "phase2_timeout_seconds", "max_tokens_param", "supports_temperature", "temperature_override", "extra_params",
         "cached_input_price", "reasoning_price", "tier",
-        "hidden_thinking_reserve_tokens",
+        "hidden_thinking_reserve_tokens", "billing",
     ]
 
 

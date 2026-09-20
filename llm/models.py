@@ -56,6 +56,7 @@ class ModelInfo:
     reasoning_price: float | None = None     # thinkingトークン単価（$/1Mトークン）。None → output_price と同値
     tier: str = ""           # "H"(強)/"M"(中)/"L"(軽)。"" = 未分類（テスト用アドホック生成のデフォルト）
     hidden_thinking_reserve_tokens: int = 0
+    billing: str = "api"     # "api"(通常API課金) / "subscription"(DevRelay経由・0円計上・席キャップ対象外)
     # max_tokens の外側で課金される hidden thinking/reasoning の事前予約トークン数（worst_case_cost用）。
     # 0 = thinking が output/completion に内包される（Anthropic/OpenAI）か、
     #     thinking 無効化済み（Kimi/DeepSeek）→ 予約不要（計算は現行と完全同値）。
@@ -417,6 +418,37 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         temperature_override=0.6,
         tier="",
     ),
+    # サイクル10.7 (2026-09-20) 追加。DevRelayサーバー経由のサブスク実験席。
+    # DevRelay(自宅マシンuso8m)がClaude Codeのサブスク認証で実行するため、
+    # このプロジェクトのAPI課金は発生しない（billing="subscription"→estimate_cost()が
+    # 常に0を返し、席キャップ/試合キャップの対象からも外れる）。
+    # 正式ロスター(H/M/L 18モデル)には含めない。tier=""で get_models_by_tier() から除外される。
+    # model_idは "devrelay/<DevRelay側のmodel名>" 形式。HttpAgentProviderがプレフィックスを
+    # 剥がしてDevRelayへ送る。claude-opus-5等、既存レジストリのmodel_idと衝突させないための
+    # 意図的な接頭辞（H1のmodel_id="claude-opus-5"と別物である必要がある）。
+    # provider="Anthropic"は中身がClaudeのため（vendor画像・VENDOR_ORDER集合を変えない）。
+    "DR_FABLE": ModelInfo(
+        model_id="devrelay/claude-fable-5-1",
+        provider="Anthropic", name="Claude Fable 5.1 (DevRelay experimental seat)",
+        adapter_type="devrelay_http",
+        input_price=0.0, output_price=0.0,
+        env_key="DEVRELAY_TOKEN", base_url=None,
+        timeout_seconds=120,
+        supports_temperature=False,  # DevRelay契約にtemperatureパラメータなし
+        billing="subscription",
+        tier="",
+    ),
+    "DR_OPUS": ModelInfo(
+        model_id="devrelay/claude-opus-5",
+        provider="Anthropic", name="Claude Opus 5 (DevRelay experimental seat)",
+        adapter_type="devrelay_http",
+        input_price=0.0, output_price=0.0,
+        env_key="DEVRELAY_TOKEN", base_url=None,
+        timeout_seconds=120,
+        supports_temperature=False,
+        billing="subscription",
+        tier="",
+    ),
 }
 
 
@@ -480,7 +512,13 @@ def estimate_cost(
       OpenAI系: reasoning は completion_tokens に含まれる → separate_thinking ≈ 0（自動的に二重計上なし）
       Gemini系: completion に thinking が含まれない → 差分 = thinking が加算される
       Anthropic: thinking は output_tokens に含まれる → total = input + output → separate_thinking = 0
+
+    サイクル10.7: billing="subscription"（DevRelay経由のサブスク席）は常に0円。
+    トークン数に関わらずAPI課金が発生しないため、席キャップ/試合キャップの対象からも外れる。
     """
+    if model.billing == "subscription":
+        return 0.0
+
     effective_cached_price = model.cached_input_price if model.cached_input_price is not None else model.input_price
     effective_reasoning_price = model.reasoning_price if model.reasoning_price is not None else model.output_price
 

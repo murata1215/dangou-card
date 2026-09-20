@@ -413,7 +413,7 @@ def create_adapter(
     model_info: ModelInfo,
     max_retries: int | None = None,
     allow_temperature_fallback: bool = True,
-) -> AnthropicAdapter | OpenAICompatAdapter | GeminiStub:
+) -> "AnthropicAdapter | OpenAICompatAdapter | GeminiStub | Any":
     """
     ModelInfoからアダプタを自動選択して生成する
 
@@ -437,6 +437,16 @@ def create_adapter(
     elif model_info.adapter_type == "gemini":
         # GeminiはOpenAI互換エンドポイントを使用（google-genai SDK不要）
         return OpenAICompatAdapter(
+            model_info,
+            max_retries=max_retries,
+            allow_temperature_fallback=allow_temperature_fallback,
+        )
+    elif model_info.adapter_type == "devrelay_http":
+        # サイクル10.7: DevRelayサーバー経由のサブスク実験席（正式ロスター外）。
+        # 循環import回避のため分岐内で遅延import（llm.providers.devrelay_httpは
+        # llm.adapters.AdapterErrorに依存するため、モジュール先頭でのimportは避ける）。
+        from llm.providers.devrelay_http import HttpAgentProvider
+        return HttpAgentProvider(
             model_info,
             max_retries=max_retries,
             allow_temperature_fallback=allow_temperature_fallback,

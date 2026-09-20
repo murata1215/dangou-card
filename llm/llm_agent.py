@@ -52,13 +52,18 @@ class LLMAgent(PlayerAgent):
         self,
         player_id: str,
         model_info: ModelInfo,
-        adapter: AnthropicAdapter | OpenAICompatAdapter | GeminiStub,
+        adapter: "AnthropicAdapter | OpenAICompatAdapter | GeminiStub | Any",
         llm_logger: LLMLogger,
         config: GameConfig | None = None,
     ) -> None:
         self.player_id = player_id
         self.model_info = model_info
         self.adapter = adapter
+        # サイクル10.7: HttpAgentProvider(DevRelay経由)はDevRelay契約上のseatKeyに
+        # プレイヤーIDを使う。他アダプタはbind_seatを持たないため無害（ダックタイピング）。
+        bind_seat = getattr(adapter, "bind_seat", None)
+        if callable(bind_seat):
+            bind_seat(player_id)
         self.llm_logger = llm_logger
         self._config: GameConfig | None = config
         self._system_prompt: str = ""
