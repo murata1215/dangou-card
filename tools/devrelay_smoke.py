@@ -10,13 +10,18 @@ tools/devrelay_smoke.py — 実DevRelayサーバーへのスモークテスト�
 `ai`（ModelInfo.devrelay_ai）とレスポンスの `ai` を表示する。また `--models`/
 `--seat-keys` で複数席を別seatKeyで同時に1コールずつ叩く結合確認を追加した。
 
+サイクル10.11: 軽量席 DR_HAIKU（devrelay/claude-haiku-4-5）・DR_LUNA
+（devrelay/gpt-5.6-luna）を追加。本ツールはレジストリキーを受け取るだけなので
+コード変更は不要（`--model DR_HAIKU` 等がそのまま動く）。
+
 使い方:
     uv run python tools/devrelay_smoke.py
     uv run python tools/devrelay_smoke.py --model DR_OPUS48 --seat-key P02
     uv run python tools/devrelay_smoke.py --model DR_TERRA --seat-key P04
+    uv run python tools/devrelay_smoke.py --model DR_HAIKU --seat-key P07
     uv run python tools/devrelay_smoke.py \
-        --models DR_FABLE,DR_OPUS48,DR_SONNET5,DR_TERRA,DR_SOL \
-        --seat-keys P01,P02,P03,P04,P05
+        --models DR_FABLE,DR_OPUS,DR_OPUS48,DR_SONNET5,DR_TERRA,DR_SOL,DR_HAIKU,DR_LUNA \
+        --seat-keys P01,P02,P03,P04,P05,P06,P07,P08
 """
 
 from __future__ import annotations

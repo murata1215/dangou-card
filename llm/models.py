@@ -503,6 +503,34 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         tier="",
         devrelay_ai="codex",
     ),
+    # サイクル10.11 (2026-09-21) 追加。軽量DevRelay席。実機疎通確認済み（各200・約8秒）。
+    # DR_HAIKUはdevrelay_ai既定"claude"のためClaude経路（provider="Anthropic"）。
+    # model_id="devrelay/claude-haiku-4-5"はL1(model_id="claude-haiku-4-5-20251001")と
+    # サフィックス違いのため衝突しない。
+    "DR_HAIKU": ModelInfo(
+        model_id="devrelay/claude-haiku-4-5",
+        provider="Anthropic", name="Claude Haiku 4.5 (DevRelay experimental seat)",
+        adapter_type="devrelay_http",
+        input_price=0.0, output_price=0.0,
+        env_key="DEVRELAY_TOKEN", base_url=None,
+        timeout_seconds=120,
+        supports_temperature=False,
+        billing="subscription",
+        tier="",
+    ),
+    # DR_LUNAはDR_TERRA/DR_SOLと同じCodex経路（devrelay_ai="codex", provider="OpenAI"）。
+    "DR_LUNA": ModelInfo(
+        model_id="devrelay/gpt-5.6-luna",
+        provider="OpenAI", name="GPT-5.6 Luna (DevRelay experimental seat)",
+        adapter_type="devrelay_http",
+        input_price=0.0, output_price=0.0,
+        env_key="DEVRELAY_TOKEN", base_url=None,
+        timeout_seconds=120,
+        supports_temperature=False,
+        billing="subscription",
+        tier="",
+        devrelay_ai="codex",
+    ),
 }
 
 

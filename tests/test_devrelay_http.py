@@ -298,7 +298,10 @@ def test_denied_tools_logs_warning(caplog):
 # --- 12. レジストリ登録 ---
 
 def test_registry_entries_are_subscription_and_unregistered_from_default_roster():
-    for key in ("DR_FABLE", "DR_OPUS", "DR_OPUS48", "DR_SONNET5", "DR_TERRA", "DR_SOL"):
+    for key in (
+        "DR_FABLE", "DR_OPUS", "DR_OPUS48", "DR_SONNET5", "DR_TERRA", "DR_SOL",
+        "DR_HAIKU", "DR_LUNA",
+    ):
         info = MODEL_REGISTRY[key]
         assert info.adapter_type == "devrelay_http"
         assert info.billing == "subscription"
@@ -306,9 +309,9 @@ def test_registry_entries_are_subscription_and_unregistered_from_default_roster(
         assert info.output_price == 0.0
         assert info.tier == ""  # get_models_by_tier() では拾われない＝既定ロスター外
 
-    for key in ("DR_FABLE", "DR_OPUS", "DR_OPUS48", "DR_SONNET5"):
+    for key in ("DR_FABLE", "DR_OPUS", "DR_OPUS48", "DR_SONNET5", "DR_HAIKU"):
         assert MODEL_REGISTRY[key].devrelay_ai == "claude"
-    for key in ("DR_TERRA", "DR_SOL"):
+    for key in ("DR_TERRA", "DR_SOL", "DR_LUNA"):
         assert MODEL_REGISTRY[key].devrelay_ai == "codex"
         assert MODEL_REGISTRY[key].provider == "OpenAI"
 
@@ -318,9 +321,28 @@ def test_registry_entries_are_subscription_and_unregistered_from_default_roster(
     assert get_model("devrelay/claude-sonnet-5") is MODEL_REGISTRY["DR_SONNET5"]
     assert get_model("devrelay/gpt-5.6-terra") is MODEL_REGISTRY["DR_TERRA"]
     assert get_model("devrelay/gpt-5.6-sol") is MODEL_REGISTRY["DR_SOL"]
+    assert get_model("devrelay/claude-haiku-4-5") is MODEL_REGISTRY["DR_HAIKU"]
+    assert get_model("devrelay/gpt-5.6-luna") is MODEL_REGISTRY["DR_LUNA"]
 
     adapter = create_adapter(MODEL_REGISTRY["DR_FABLE"])
     assert isinstance(adapter, HttpAgentProvider)
+
+
+def test_dr_seats_model_ids_are_unique_and_namespaced():
+    """サイクル10.11: DR席8本のmodel_idが相互に一意かつ`devrelay/`接頭辞付きで、
+    非DR席（例: L1=claude-haiku-4-5-20251001）のmodel_idと衝突しないことを確認する。"""
+    dr_keys = (
+        "DR_FABLE", "DR_OPUS", "DR_OPUS48", "DR_SONNET5",
+        "DR_TERRA", "DR_SOL", "DR_HAIKU", "DR_LUNA",
+    )
+    dr_model_ids = [MODEL_REGISTRY[k].model_id for k in dr_keys]
+    assert len(dr_model_ids) == len(set(dr_model_ids))
+    assert all(mid.startswith("devrelay/") for mid in dr_model_ids)
+
+    non_dr_model_ids = {
+        info.model_id for key, info in MODEL_REGISTRY.items() if key not in dr_keys
+    }
+    assert non_dr_model_ids.isdisjoint(dr_model_ids)
 
 
 # --- 13. 匿名化行 ---
