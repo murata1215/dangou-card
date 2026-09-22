@@ -585,6 +585,16 @@ def run_publish(order_override: str | None, dry_run: bool, force: bool = False) 
         url = try_upload_image(client, img_path)
         if url:
             url_map[rel] = url
+
+    # サイクル10.17: 画像アップロードが1枚でも失敗した場合はPOST前に中断する
+    # （従来は警告のみで続行し、画像リンク切れのまま記事がpublishされる欠陥があった。
+    # ここで止めればplan.md/INDEX.mdは未更新のままなので、同じ --order で安全に再実行できる）
+    if len(url_map) < len(images):
+        failed = [rel for _, rel in images if rel not in url_map]
+        print(f"[中断] 画像アップロードに失敗した画像があります（429等）。POSTは行いません: {failed}")
+        print("  しばらく待ってから同じ --order で再実行してください。")
+        sys.exit(1)
+
     featured_url = next(iter(url_map.values()), None)
 
     body_with_urls = build_body_with_public_urls(body, url_map)
