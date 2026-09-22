@@ -429,13 +429,17 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
     # 剥がしてDevRelayへ送る。claude-opus-5等、既存レジストリのmodel_idと衝突させないための
     # 意図的な接頭辞（H1のmodel_id="claude-opus-5"と別物である必要がある）。
     # provider="Anthropic"は中身がClaudeのため（vendor画像・VENDOR_ORDER集合を変えない）。
+    # サイクル10.13 (2026-09-22): timeout_seconds 120→180（DevRelay契約上限）。
+    # l12r12_dr_1201本戦の504タイムアウト72件は全件elapsed≈108秒（120秒の9割）打ち切りで、
+    # 原因はOpus 4.8/Sonnet 5のthinking出力量（doc/analysis/l12r12_dr_1201_timeout.md）。
+    # httpx側のマージン(HTTP_TIMEOUT_MARGIN_S=30)は据え置きのため210秒に自動追従する。
     "DR_FABLE": ModelInfo(
         model_id="devrelay/claude-fable-5-1",
         provider="Anthropic", name="Claude Fable 5.1 (DevRelay experimental seat)",
         adapter_type="devrelay_http",
         input_price=0.0, output_price=0.0,
         env_key="DEVRELAY_TOKEN", base_url=None,
-        timeout_seconds=120,
+        timeout_seconds=180,
         supports_temperature=False,  # DevRelay契約にtemperatureパラメータなし
         billing="subscription",
         tier="",
@@ -446,7 +450,7 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         adapter_type="devrelay_http",
         input_price=0.0, output_price=0.0,
         env_key="DEVRELAY_TOKEN", base_url=None,
-        timeout_seconds=120,
+        timeout_seconds=180,
         supports_temperature=False,
         billing="subscription",
         tier="",
@@ -457,7 +461,7 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         adapter_type="devrelay_http",
         input_price=0.0, output_price=0.0,
         env_key="DEVRELAY_TOKEN", base_url=None,
-        timeout_seconds=120,
+        timeout_seconds=180,
         supports_temperature=False,
         billing="subscription",
         tier="",
@@ -468,7 +472,7 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         adapter_type="devrelay_http",
         input_price=0.0, output_price=0.0,
         env_key="DEVRELAY_TOKEN", base_url=None,
-        timeout_seconds=120,
+        timeout_seconds=180,
         supports_temperature=False,
         billing="subscription",
         tier="",
@@ -485,7 +489,7 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         adapter_type="devrelay_http",
         input_price=0.0, output_price=0.0,
         env_key="DEVRELAY_TOKEN", base_url=None,
-        timeout_seconds=120,
+        timeout_seconds=180,
         supports_temperature=False,
         billing="subscription",
         tier="",
@@ -497,7 +501,7 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         adapter_type="devrelay_http",
         input_price=0.0, output_price=0.0,
         env_key="DEVRELAY_TOKEN", base_url=None,
-        timeout_seconds=120,
+        timeout_seconds=180,
         supports_temperature=False,
         billing="subscription",
         tier="",
@@ -513,7 +517,7 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         adapter_type="devrelay_http",
         input_price=0.0, output_price=0.0,
         env_key="DEVRELAY_TOKEN", base_url=None,
-        timeout_seconds=120,
+        timeout_seconds=180,
         supports_temperature=False,
         billing="subscription",
         tier="",
@@ -525,7 +529,7 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
         adapter_type="devrelay_http",
         input_price=0.0, output_price=0.0,
         env_key="DEVRELAY_TOKEN", base_url=None,
-        timeout_seconds=120,
+        timeout_seconds=180,
         supports_temperature=False,
         billing="subscription",
         tier="",

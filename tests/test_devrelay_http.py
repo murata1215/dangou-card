@@ -35,7 +35,7 @@ def make_model(**overrides) -> ModelInfo:
         adapter_type="devrelay_http",
         input_price=0.0, output_price=0.0,
         env_key="DEVRELAY_TOKEN", base_url=None,
-        timeout_seconds=120,
+        timeout_seconds=180,
         supports_temperature=False,
         billing="subscription",
         tier="",
@@ -98,7 +98,7 @@ def test_request_assembly():
     assert body["model"] == "claude-fable-5-1"  # "devrelay/" 接頭辞が剥がれている
     assert body["seatKey"] == "P05"
     assert body["prompt"] == "USER_TEXT"
-    assert body["timeoutS"] == 120
+    assert body["timeoutS"] == 180
     assert body["system"] == f"SYSTEM_TEXT\n\n{ANONYMIZATION_LINE}"
 
 
@@ -261,7 +261,7 @@ def test_read_timeout_raises_without_retry_and_sets_http_timeout():
     assert "timeout" in str(exc.value).lower()
 
     client = provider._get_client(provider.model_info.timeout_seconds + 30)
-    assert client.timeout.read == 150.0  # timeout_seconds(120) + HTTP_TIMEOUT_MARGIN_S(30)
+    assert client.timeout.read == 210.0  # timeout_seconds(180) + HTTP_TIMEOUT_MARGIN_S(30)
 
 
 # --- 10. 0円計上 ---
@@ -343,6 +343,31 @@ def test_dr_seats_model_ids_are_unique_and_namespaced():
         info.model_id for key, info in MODEL_REGISTRY.items() if key not in dr_keys
     }
     assert non_dr_model_ids.isdisjoint(dr_model_ids)
+
+
+def test_registry_dr_seats_send_timeout_180():
+    """サイクル10.13: DR席8本の実レジストリ定義が timeoutS=180 を送信し、
+    httpxクライアントのread timeoutが210秒（180+HTTP_TIMEOUT_MARGIN_S）になることを確認する。"""
+    dr_keys = (
+        "DR_FABLE", "DR_OPUS", "DR_OPUS48", "DR_SONNET5",
+        "DR_TERRA", "DR_SOL", "DR_HAIKU", "DR_LUNA",
+    )
+    for key in dr_keys:
+        info = MODEL_REGISTRY[key]
+        assert info.timeout_seconds == 180
+
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(200, json=success_payload())
+
+        provider = HttpAgentProvider(info, transport=httpx.MockTransport(handler))
+        provider.complete(system="s", messages=[{"role": "user", "content": "u"}])
+
+        assert captured["body"]["timeoutS"] == 180, key
+        client = provider._get_client(info.timeout_seconds + 30)
+        assert client.timeout.read == 210.0, key
 
 
 # --- 13. 匿名化行 ---
