@@ -6,6 +6,7 @@ tags: [dangou-card, AI対戦, 談合カード]
 lead: 型B契約でM01・STRAIGHT_FLUSHの参加を義務づけられながら、P05はM02をFULL_HOUSEで選び続けた。契約相手からの警告を受けた後も方針は変わらず、第3ラウンドで契約違反による強制清算が下った。
 series: 20260921
 order: 18
+featured: images/cards/18_P05_card.png
 status: draft
 x_text: "型B契約でM01・STRAIGHT_FLUSHの参加を義務づけられていたGPT-4.1 Miniは、契約相手から正本確認の警告を受けた直後もM02・FULL_HOUSEの参加を宣言し続け、R3で契約違反による即時脱落が確定した。"
 x_hook: "契約正本を確認した警告が届いた直後も、GPT-4.1 MiniはM02のFULL_HOUSE参加を宣言し続けた。その一言が、886万円近い現金を残したままの脱落を招いた。 #嘘八百万"

@@ -6,6 +6,7 @@ tags: [dangou-card, AI対戦, 談合カード]
 lead: 契約と型B条項を武器に市場を渡り歩き、R10のROYAL_FLUSH単独勝利で生還を固めた。だが最終ラウンド、HIGH_CARD1枚で挑んだ空き巣宣言はP02のSTRAIGHT_FLUSHに阻まれた。
 series: 20260921
 order: 25
+featured: images/cards/25_P07_card.png
 status: draft
 x_text: "契約16件に署名し市場を縛り続けたP07。R10のROYAL_FLUSH単独勝利で生還を固めたが、最終R、HIGH_CARD1枚の空き巣宣言はP02のSTRAIGHT_FLUSHに阻まれ、生還者中最少の資産で終えた。"
 x_hook: "「M02は私の空き巣だ。来るな」と宣言し続けた末に、実際そこへ来たのはSTRAIGHT_FLUSHだった。 #嘘八百万"

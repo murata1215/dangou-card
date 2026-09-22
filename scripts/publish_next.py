@@ -154,13 +154,20 @@ def _article_kind(article_name: str) -> str:
     return "memoir"
 
 
-def select_attachment_image(date: str, order: str, article_name: str, body: str) -> Path | None:
+def select_attachment_image(
+    date: str, order: str, article_name: str, body: str, featured_rel: str | None = None,
+) -> Path | None:
     """投稿セット①に添付する画像のローカル絶対パスを選ぶ。
 
-    手記（memoir）→ 同記事の `*_moment.png`、system → `*_roster.png`、summary → `*_results.png`。
-    見つからなければ本文中の最初の画像参照。それも無ければ None。
+    サイクル10.18: フロントマターに `featured:`（キャラカード）があれば最優先で使う。
+    無ければ従来どおり、手記（memoir）→ 同記事の `*_moment.png`、system → `*_roster.png`、
+    summary → `*_results.png`。見つからなければ本文中の最初の画像参照。それも無ければ None。
     アップロード後のURLではなく、X に直接添付するためのローカル絶対パスを返す。
     """
+    if featured_rel:
+        candidate = BLOG_ROOT / date / featured_rel
+        if candidate.exists():
+            return candidate.resolve()
     images_dir = BLOG_ROOT / date / "images"
     kind = _article_kind(article_name)
     suffix = _IMAGE_SUFFIX_BY_KIND[kind]
@@ -534,7 +541,12 @@ def run_publish(order_override: str | None, dry_run: bool, force: bool = False) 
             placeholder_map[rel] = placeholder
             print(f"  {i}. {rel} (alt={alt!r}) -> アップロード予定（未実行） -> {placeholder} (仮)")
 
-        featured_placeholder = next(iter(placeholder_map.values()), None)
+        featured_rel = fm.get("featured")
+        if featured_rel:
+            featured_placeholder = "https://pixblog.net/uploads/DRYRUN_PLACEHOLDER_FEATURED.png"
+            print(f"  featured: {featured_rel} -> アップロード予定（未実行・本文画像とは別枠） -> {featured_placeholder} (仮)")
+        else:
+            featured_placeholder = next(iter(placeholder_map.values()), None)
         body_with_urls = build_body_with_public_urls(body, placeholder_map)
         payload = build_publish_payload(fm, body_with_urls, featured_placeholder)
 
@@ -551,7 +563,7 @@ def run_publish(order_override: str | None, dry_run: bool, force: bool = False) 
         x_hook = fm.get("x_hook")
         print()
         if x_hook:
-            image_path = select_attachment_image(date, row["order"], article_path.name, body)
+            image_path = select_attachment_image(date, row["order"], article_path.name, body, featured_rel)
             post_set = build_post_set(row["order"], x_hook, fm.get("title", ""), draft_url, image_path)
             print(post_set)
             hw = hook_len(x_hook)
@@ -595,7 +607,18 @@ def run_publish(order_override: str | None, dry_run: bool, force: bool = False) 
         print("  しばらく待ってから同じ --order で再実行してください。")
         sys.exit(1)
 
-    featured_url = next(iter(url_map.values()), None)
+    # サイクル10.18: フロントマターに featured（キャラカード）があれば、本文画像とは
+    # 別枠でアップロードしてそちらを featured_media_url に使う。本文の images/... 置換
+    # 対象には含めない（本文は1〜2枚のガードとは無関係）。
+    featured_rel = fm.get("featured")
+    if featured_rel:
+        featured_path = BLOG_ROOT / date / featured_rel
+        featured_url = try_upload_image(client, featured_path)
+        if not featured_url:
+            print(f"[中断] featured画像のアップロードに失敗しました。POSTは行いません: {featured_rel}")
+            sys.exit(1)
+    else:
+        featured_url = next(iter(url_map.values()), None)
 
     body_with_urls = build_body_with_public_urls(body, url_map)
     payload = build_publish_payload(fm, body_with_urls, featured_url)
@@ -631,7 +654,7 @@ def run_publish(order_override: str | None, dry_run: bool, force: bool = False) 
     print()
     x_hook = fm.get("x_hook")
     if x_hook:
-        image_path = select_attachment_image(date, row["order"], article_path.name, body)
+        image_path = select_attachment_image(date, row["order"], article_path.name, body, featured_rel)
         post_set = build_post_set(row["order"], x_hook, fm.get("title", ""), public_url or "", image_path)
         print(post_set)
         hw = hook_len(x_hook)
@@ -674,9 +697,10 @@ def cmd_replay(order: str) -> None:
             url = row["url"] if row["url"] and row["url"] != "—" else "（公開URL不明・plan.mdを確認してください）"
             x_hook = fm.get("x_hook")
             x_text = fm.get("x_text")
+            featured_rel = fm.get("featured")
             print(f"[再表示] {date} order={order} file={article_path.name} status={row['status']!r}")
             if x_hook:
-                image_path = select_attachment_image(date, order, article_path.name, body)
+                image_path = select_attachment_image(date, order, article_path.name, body, featured_rel)
                 post_set = build_post_set(order, x_hook, fm.get("title", ""), url, image_path)
                 print(post_set)
             elif x_text:
