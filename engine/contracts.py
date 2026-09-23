@@ -12,8 +12,8 @@ from typing import Any
 import uuid
 
 from engine.models import (
-    Contract, ContractStatus, Obligation, ObligationType,
-    MarketCommit, PlayerState, CardRank,
+    Contract, ContractStatus, Obligation, ObligationType, ConditionType,
+    MarketCommit, MarketResult, PlayerState, CardRank,
 )
 
 
@@ -57,6 +57,65 @@ def validate_type_b_card_details(details: dict[str, Any]) -> str | None:
             f"Invalid type_b_card obligation: card_rank={rank_name!r} "
             f"(valid: {', '.join(CardRank.__members__)})"
         )
+    return None
+
+
+def validate_type_c_details(
+    details: dict[str, Any],
+    valid_market_ids: set[str],
+    valid_player_ids: set[str],
+) -> str | None:
+    """
+    type_c_conditional 義務の details を検証する（v0.10 §1.2, §2）
+
+    組成時の支払能力チェックは行わない（v0.10 §1.2）。1条項でも不正なら
+    契約提案全体を却下する（呼び出し元 engine/actions.py の責務）。
+
+    Args:
+        details: {"amount": int, "condition_type": str, "condition": dict}
+        valid_market_ids: 有効な市場ID集合（例: {"M01", ...}）
+        valid_player_ids: 有効なプレイヤーID集合（条件対象は契約当事者である必要はない）
+
+    Returns:
+        不正ならエラーメッセージ、問題なければNone
+    """
+    amount = details.get("amount")
+    if not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0:
+        return f"type_c_conditional amount must be a positive int, got {amount!r}"
+
+    condition_type = details.get("condition_type")
+    if condition_type not in {c.value for c in ConditionType}:
+        return (
+            f"Invalid type_c_conditional condition_type: {condition_type!r} "
+            f"(valid: {', '.join(c.value for c in ConditionType)})"
+        )
+
+    condition = details.get("condition")
+    if not isinstance(condition, dict):
+        return f"type_c_conditional condition must be a dict, got {condition!r}"
+
+    if condition_type == ConditionType.MARKET_WINNER.value:
+        market_id = condition.get("market_id")
+        target_player = condition.get("target_player")
+        if market_id not in valid_market_ids:
+            return (
+                f"Invalid type_c_conditional condition.market_id: {market_id!r} "
+                f"(valid: {sorted(valid_market_ids)})"
+            )
+        if target_player not in valid_player_ids:
+            return f"Invalid type_c_conditional condition.target_player: {target_player!r}"
+    elif condition_type == ConditionType.ELIMINATED.value:
+        target_player = condition.get("target_player")
+        if target_player not in valid_player_ids:
+            return f"Invalid type_c_conditional condition.target_player: {target_player!r}"
+    elif condition_type == ConditionType.MARKET_SURGE.value:
+        market_id = condition.get("market_id")
+        if market_id not in valid_market_ids:
+            return (
+                f"Invalid type_c_conditional condition.market_id: {market_id!r} "
+                f"(valid: {sorted(valid_market_ids)})"
+            )
+
     return None
 
 
@@ -265,6 +324,131 @@ def get_active_type_a_obligations(
                     and ob.counterparty not in excluded):
                 result.append(ob)
     return result
+
+
+def get_active_type_c_obligations(
+    contracts: list[Contract],
+    round_num: int,
+    excluded_players: set[str] | None = None,
+) -> list[Obligation]:
+    """
+    指定ラウンドの有効な型C義務を取得する（v0.10）
+
+    条件判定フック（settlement.py）で使用。get_active_type_a_obligations と同形。
+
+    Args:
+        contracts: 全契約リスト
+        round_num: 対象ラウンド（決済ラウンド）
+        excluded_players: 除外するプレイヤーID（既に脱落済みで義務が失効済みの者）
+
+    Returns:
+        有効な型C義務のリスト
+    """
+    excluded = excluded_players or set()
+    result: list[Obligation] = []
+    for contract in contracts:
+        if contract.status != ContractStatus.ACTIVE:
+            continue
+        for ob in contract.obligations:
+            if (ob.round_num == round_num
+                    and not ob.is_fulfilled
+                    and not ob.is_expired
+                    and ob.ob_type == ObligationType.TYPE_C_CONDITIONAL
+                    and ob.obligor not in excluded
+                    and ob.counterparty not in excluded):
+                result.append(ob)
+    return result
+
+
+def evaluate_type_c_condition(
+    ob: Obligation,
+    *,
+    market_results: dict[str, MarketResult],
+    surged_by_market: dict[str, bool],
+    eliminated_player_ids: set[str],
+    players: dict[str, PlayerState],
+) -> tuple[bool, str]:
+    """
+    型Cの条件を判定する純関数（v0.10 §2）
+
+    副作用なし。判定に使う事実はすべて呼び出し元（settlement.py）が
+    その時点までに確定済みのものを渡す（§3の不変条件: 3条件すべてスナップショット前に判定）。
+
+    Args:
+        ob: 判定対象の型C義務（ob.details = {"condition_type", "condition", "amount"}）
+        market_results: 当該ラウンドで確定済みの市場結果（market_id → MarketResult）
+        surged_by_market: 当該ラウンドの市場高騰判定結果（market_id → bool）
+        eliminated_player_ids: 当該Settlementで型B監査により脱落確定した者のID集合
+            （実際の eliminate() は Step 8 まで走らないため、players[pid].is_alive は
+            まだTrueのケースがある。このため下記 eliminated 判定は両方をORで見る）
+        players: 全プレイヤー状態（player_id → PlayerState）。過去ラウンドに脱落済みの
+            プレイヤーは is_alive=False になっている
+
+    Returns:
+        (成立したか, 理由文字列)
+    """
+    condition_type = ob.details.get("condition_type")
+    condition = ob.details.get("condition", {})
+
+    if condition_type == ConditionType.MARKET_WINNER.value:
+        market_id = condition.get("market_id")
+        target_player = condition.get("target_player")
+        result = market_results.get(market_id)
+        if result is None:
+            return False, f"market {market_id} was not resolved this round"
+        if target_player in result.winners:
+            return True, f"{target_player} is a winner of {market_id}"
+        return False, f"{target_player} is not a winner of {market_id}"
+
+    if condition_type == ConditionType.ELIMINATED.value:
+        target_player = condition.get("target_player")
+        target_state = players.get(target_player)
+        is_alive = target_state.is_alive if target_state is not None else False
+        if target_player in eliminated_player_ids or not is_alive:
+            return True, f"{target_player} is eliminated"
+        return False, f"{target_player} is not eliminated"
+
+    if condition_type == ConditionType.MARKET_SURGE.value:
+        market_id = condition.get("market_id")
+        if surged_by_market.get(market_id, False):
+            return True, f"market {market_id} surged"
+        return False, f"market {market_id} did not surge"
+
+    return False, f"unknown condition_type: {condition_type!r}"
+
+
+def expire_obligations(
+    contracts: list[Contract],
+    expired_obligation_ids: set[str],
+) -> list[Contract]:
+    """
+    指定された義務IDの義務を失効済みにする（v0.10・型Cの不成立/消滅用）
+
+    engine.elimination.expire_obligations_for_player とは独立の汎用ヘルパー
+    （既存関数は一切変更しない）。fulfill_obligations と対になる形で、
+    義務IDを直接指定して is_expired=True にする。
+
+    Args:
+        contracts: 全契約リスト
+        expired_obligation_ids: 失効させる義務ID集合
+
+    Returns:
+        更新された契約リスト
+    """
+    if not expired_obligation_ids:
+        return contracts
+    updated: list[Contract] = []
+    for contract in contracts:
+        new_obs: list[Obligation] = []
+        changed = False
+        for ob in contract.obligations:
+            if ob.obligation_id in expired_obligation_ids:
+                new_obs.append(ob.model_copy(update={"is_expired": True}))
+                changed = True
+            else:
+                new_obs.append(ob)
+        updated.append(contract.model_copy(update={"obligations": new_obs}) if changed else contract)
+    return updated
 
 
 def execute_type_a_atomic(

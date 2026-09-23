@@ -280,6 +280,25 @@ class ObligationType(str, Enum):
     TYPE_B_NO_MARKET = "type_b_no_market"
     """特定市場へ参加しないこと"""
 
+    TYPE_C_CONDITIONAL = "type_c_conditional"
+    """条件付き金銭義務（v0.10）。指定条件が成立した場合のみ型Aと同一のAtomic判定に合流する"""
+
+
+class ConditionType(str, Enum):
+    """
+    型Cの条件語彙 v1（v0.10 §2）
+
+    いずれも観測可能な公開事実のみで、Settlement内で機械的に判定する。
+    """
+    MARKET_WINNER = "market_winner"
+    """指定ラウンドの指定市場で、特定プレイヤーが勝者になること"""
+
+    ELIMINATED = "eliminated"
+    """特定プレイヤーが、指定ラウンド終了時点までに脱落していること"""
+
+    MARKET_SURGE = "market_surge"
+    """指定ラウンドの指定市場で、市場高騰が発生すること"""
+
 
 class Obligation(BaseModel):
     """
@@ -314,13 +333,17 @@ class Obligation(BaseModel):
     - 型B_MARKET: {"market_id": str} — 参加すべき市場
     - 型B_CARD: {"card_rank": str} — 使用すべきカードランク名
     - 型B_NO_MARKET: {"market_id": str} — 参加してはいけない市場
+    - 型C（v0.10）: {"amount": int, "condition_type": str, "condition": dict} — 条件成立時の支払額と条件。
+      condition_type="market_winner" は condition={"market_id": str, "target_player": str}、
+      condition_type="eliminated" は condition={"target_player": str}、
+      condition_type="market_surge" は condition={"market_id": str}
     """
 
     is_fulfilled: bool = False
     """履行済みフラグ"""
 
     is_expired: bool = False
-    """失効済みフラグ（脱落者関連で失効した場合True）"""
+    """失効済みフラグ（脱落者関連で失効した場合True。型C（v0.10）では条件不成立による消滅もこのフラグで表す）"""
 
 
 class ContractStatus(str, Enum):

@@ -94,7 +94,9 @@ class TestPromptLengthBudgetUnaffected:
         config = GameConfig.baseline_v1_s2(12)
         prompt = build_system_prompt("P01", config)
         # v0.8サイクル8.2でtest_cycle5_prompt_salience.pyと同じ8300字上限へ改定
-        assert len(prompt) <= 8300, len(prompt)
+        # Cycle 10.1（2026-09-19）: v0.10 型C分でtest_cycle5_prompt_salience.pyと
+        # 同じ9100字上限へ改定
+        assert len(prompt) <= 9100, len(prompt)
 
     def test_negotiation_prompt_length_budget_unaffected(self):
         config = GameConfig.baseline_v1_s2(12)

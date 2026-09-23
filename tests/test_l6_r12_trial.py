@@ -1,6 +1,7 @@
 """L1〜L6 R12実戦試験のAPI不要な安全設定テスト。"""
 
 import json
+import sys
 
 import pytest
 
@@ -232,3 +233,72 @@ def test_after_report_reads_manifest_events_and_budget_abort(tmp_path):
     assert "いいえ（中断）" in report
     assert "10 | 0 | 5 | 3" in report
     assert "1 / 1 / 1" in report
+
+
+def test_baseline_v1_s2_l6_prizes_pass_survivability_and_keep_s2_flags():
+    """サイクル10.4: 6人本戦用プリセット（1市場24万）の賞金・フラグを固定する。
+
+    baseline_v1_s2(6)の素の32万/市場は1000試合Bot実測で全員生還
+    9/1000件を記録し§1.5に反する（test_s2_six_player_prizes_...参照）。
+    このプリセットはその代替として24万/市場を採用する。
+    """
+    config = GameConfig.baseline_v1_s2_l6()
+
+    assert config.num_players == 6
+    assert config.prize_tiers == [720_000] * 12
+    assert config.total_prize == 8_640_000
+    # S2フラグ（型C・首位公示・順位通知含む）はbaseline_v1_s2(6)から継承
+    assert config.type_c_enabled is True
+    assert config.leader_announce_enabled is True
+    assert config.rank_notice_enabled is True
+    assert config.surge_enabled is True
+    assert config.surge_full_participation_max_alive == 3  # 高騰閾値は変更しない
+    assert config.survival_cash == 2_000_000
+
+    normal_markets = generate_markets(1, config, {})
+    final_markets = generate_markets(12, config, {})
+    assert [m.base_prize for m in normal_markets] == [240_000, 240_000, 240_000]
+    assert [m.base_prize for m in final_markets] == [720_000, 720_000, 720_000]
+
+
+def test_llm_trial_cli_prize_preset_l6_selects_new_config(capsys):
+    """--prize-preset l6 がCLI経由でbaseline_v1_s2_l6()を選択することを確認する
+    （--validate-onlyのためAPIは呼ばない）。"""
+    import scripts.llm_trial as llm_trial_module
+
+    argv = [
+        "llm_trial.py", "--phase", "C", "--ruleset", "S2",
+        "--roster", "L1,L2,L3,L4,L5,L6",
+        "--games", "1", "--seed", "1", "--prize-preset", "l6",
+        "--validate-only",
+    ]
+    orig_argv = sys.argv
+    try:
+        sys.argv = argv
+        llm_trial_module.main()
+    finally:
+        sys.argv = orig_argv
+
+    manifest = json.loads(capsys.readouterr().out)
+    assert manifest["prize_tiers"] == [720_000] * 12
+    assert manifest["num_players"] == 6
+
+
+def test_llm_trial_cli_prize_preset_l6_rejects_wrong_roster_size():
+    """--prize-preset l6 は6人ロスター以外・S1では拒否する。"""
+    import scripts.llm_trial as llm_trial_module
+
+    argv = [
+        "llm_trial.py", "--phase", "C", "--ruleset", "S2",
+        "--roster", "L1,L2,L3,L4,L5,L6,M1",
+        "--games", "1", "--seed", "1", "--prize-preset", "l6",
+        "--validate-only",
+    ]
+    orig_argv = sys.argv
+    try:
+        sys.argv = argv
+        with pytest.raises(SystemExit) as exc:
+            llm_trial_module.main()
+        assert exc.value.code not in (0, None)
+    finally:
+        sys.argv = orig_argv

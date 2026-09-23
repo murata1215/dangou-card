@@ -188,7 +188,10 @@ def test_phase2_structured_schema_reserve_is_budgeted_only_for_target_models():
     # Cycle 5（2026-08-26）: D1便益/コスト節の追加でsystem prompt長が5,901→7,079字に
     # 増加し、H1予約が0.03を超過したため、人間承認済みのPHASE_DEFAULTS[2]更新
     # （max_cost_per_model 0.03→0.035）に合わせて上限を更新。
-    assert h1 < 0.035
+    # Cycle 10.1（2026-09-19）: v0.10 型Cのプロンプト文面追加でH1予約が0.035を超過
+    # したため、PHASE_DEFAULTS[2]更新（max_cost_per_model 0.035→0.04）に合わせて
+    # 上限を更新。
+    assert h1 < 0.04
     assert mm._phase2_worst_case_cost(MODEL_REGISTRY["L1"], system, 400) == pytest.approx(
         mm._worst_case_cost(MODEL_REGISTRY["L1"], system, mm.GAME2_USER, 400)
     )
@@ -220,8 +223,21 @@ def test_gemini_phase2_overrides_and_reserves_are_model_specific():
     # Cycle 9.2（2026-08-30）: v0.9 free_cash_mode="entry_fee"向けにFree Cash文言を
     # 「お金の使い方」節へ置換した結果、system prompt長が8,187→8,181字に変化したため、
     # 八度目の期待値更新。M3/H3とも引き続き0.03未満。
-    assert mm._phase2_worst_case_cost(MODEL_REGISTRY["M3"], system, 512) == pytest.approx(0.016704)
-    assert mm._phase2_worst_case_cost(MODEL_REGISTRY["H3"], system, 912) == pytest.approx(0.027072)
+    # Cycle 10.1（2026-09-19）: v0.10 型Cでcontract_proposeのob_type enumに
+    # "type_c_conditional"を追加し、かつRULES_SUMMARYへ型Cのプロンプト文面
+    # （TYPE_C_CONTRACT_RULES/TYPE_C_ACTION_TEMPLATE、baseline_v1_s2は
+    # type_c_enabled=Trueが既定）を追加した結果、system prompt長・schemaバイト数の
+    # 両方が増加したため、九度目の期待値更新。M3/H3とも引き続き0.03未満。
+    # Cycle 10.2（2026-09-19）: v0.10 首位公示（leader_announce_enabled、
+    # baseline_v1_s2でTrue）でRULES_SUMMARYの公開情報一覧に1行追加した結果、
+    # system prompt長が8,996→9,036字に増加したため、十度目の期待値更新。
+    # M3/H3とも引き続き0.03未満に収まる。
+    # Cycle 10.3（2026-09-19）: v0.10 目的文の強化（## 目的節の新設・毎R目標
+    # リマインド）＋自分の順位通知（rank_notice_enabled）。目的節の新設分を吸収する
+    # ため既存文言を複数箇所で圧縮し、system prompt長は差し引き9,036→8,981字に
+    # 減少したため、十一度目の期待値更新。M3/H3とも引き続き0.03未満に収まる。
+    assert mm._phase2_worst_case_cost(MODEL_REGISTRY["M3"], system, 512) == pytest.approx(0.0173145)
+    assert mm._phase2_worst_case_cost(MODEL_REGISTRY["H3"], system, 912) == pytest.approx(0.027886)
     assert mm._phase2_worst_case_cost(MODEL_REGISTRY["M3"], system, 512) < 0.03
     assert mm._phase2_worst_case_cost(MODEL_REGISTRY["H3"], system, 912) < 0.03
 

@@ -1207,6 +1207,9 @@ def main() -> None:
                         help="固定出力ID。同じIDの既存ログは二重送信防止のため拒否する")
     parser.add_argument("--validate-only", action="store_true", default=False,
                         help="Phase Cの公開manifestを表示して終了（adapter/APIを呼ばない）")
+    parser.add_argument("--prize-preset", type=str, default=None, choices=["l6"],
+                        help="賞金プリセットの上書き。l6: baseline_v1_s2_l6()"
+                             "（6人本戦・1市場24万、§1.5充足をBot実測で確認済み）")
     args = parser.parse_args()
 
     # 修正8: レポート再生成モード
@@ -1230,13 +1233,19 @@ def main() -> None:
         parser.error("--validate-only は Phase C 専用です")
     if args.run_id is not None and (not args.run_id.strip() or "/" in args.run_id or "\\" in args.run_id):
         parser.error("--run-id は空白・パス区切りを含まないIDで指定してください")
+    if args.prize_preset is not None and args.phase != "C":
+        parser.error("--prize-preset は Phase C 専用です")
 
     # Phase C ロスター決定（--roster指定 or デフォルト）
     phase_c_roster = args.roster.split(",") if args.roster else PHASE_C_ROSTER
     # Phase C はロスター長、A/B は8人固定
     num_players = len(phase_c_roster) if args.phase == "C" else 8
 
-    if args.ruleset == "S2":
+    if args.prize_preset == "l6":
+        if args.ruleset != "S2" or num_players != 6:
+            parser.error("--prize-preset l6 は --ruleset S2 かつ6人ロスター専用です")
+        config = GameConfig.baseline_v1_s2_l6()
+    elif args.ruleset == "S2":
         config = GameConfig.baseline_v1_s2(num_players=num_players)
     else:
         config = GameConfig.baseline_v1(num_players=num_players)

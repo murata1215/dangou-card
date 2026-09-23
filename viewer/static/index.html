@@ -220,7 +220,9 @@ async function loadGames() {
     games.forEach((g, i) => {
       const opt = document.createElement('option');
       opt.value = JSON.stringify({trial_dir: g.trial_dir, game_id: g.game_id});
-      opt.textContent = `${g.trial_dir} / ${g.game_id} (${g.players}P, ${g.total_entries}件)`;
+      const d = g.latest_timestamp ? ` · ${g.latest_timestamp.slice(5, 10).replace('-', '/')}` : '';
+      const t = g.is_test ? ' 🔧試験' : '';
+      opt.textContent = `${g.trial_dir} / ${g.game_id} (${g.players}P, ${g.total_entries}件${d})${t}`;
       sel.appendChild(opt);
     });
     // 最新を選択
@@ -1116,6 +1118,26 @@ function fmtObligation(t) {
       return `<span class="ob-tag ob-b">型B</span> 🃏 <b>${ob}</b> は <b>${escapeHtml(label)}</b>`
            + ` を使用する${r}`;
     }
+    case 'type_c_conditional': {
+      // v0.10: 型C（条件付き金銭契約）。details.condition_type/conditionから
+      // 条件の要旨を組み立てる（llm/prompt_builder.py:_format_type_c_conditionと同趣旨）。
+      const amt = Number.isFinite(Number(d.amount)) ? yen(d.amount) : '—';
+      const cond = (d.condition && typeof d.condition === 'object' && !Array.isArray(d.condition)) ? d.condition : {};
+      const ct = safeStr(d.condition_type);
+      let condText;
+      if (ct === 'market_winner') {
+        condText = `${escapeHtml(safeStr(cond.market_id) || '?')}の勝者が`
+                 + `${escapeHtml(pidLabel(safeStr(cond.target_player) || '?'))}`;
+      } else if (ct === 'eliminated') {
+        condText = `${escapeHtml(pidLabel(safeStr(cond.target_player) || '?'))}が脱落`;
+      } else if (ct === 'market_surge') {
+        condText = `${escapeHtml(safeStr(cond.market_id) || '?')}が高騰`;
+      } else {
+        condText = escapeHtml(ct || '?');
+      }
+      return `<span class="ob-tag ob-c">型C</span> 🎲 <b>${ob}</b> は <b>${cp}</b> に `
+           + `${amt} を支払う（条件: ${condText}）${r}`;
+    }
     default:
       return `<span class="ob-unknown">未対応の契約条項: `
            + `${escapeHtml(safeStr(t.ob_type) || '(種別不明)')}</span>`;
@@ -1139,6 +1161,15 @@ function fmtOutcome(o) {
       return `${r}<span class="oc-ok">🤖 自動履行</span>`;
     case 'AUTO_COMMIT_FAILURE':
       return `${r}<span class="oc-ng">🤖 自動履行失敗</span>`;
+    case 'TYPE_C_EVALUATED': {
+      // v0.10: 型C（条件付き金銭契約）の条件判定結果。不成立は失敗ではないため
+      // oc-ng（赤=違反/失敗）ではなく中立色のoc-noneを使う。
+      if (d.result === 'fired') {
+        const amt = Number.isFinite(Number(d.amount)) ? yen(d.amount) : '—';
+        return `${r}<span class="oc-ok">🎲 型C 条件成立 — ${amt}をAtomicへ合流</span>`;
+      }
+      return `${r}<span class="oc-none">🎲 型C 条件不成立（支払いなし）</span>`;
+    }
     default:
       return `${r}<span class="ob-unknown">未対応の結果: `
            + `${escapeHtml(safeStr(o.event_type) || '(種別不明)')}</span>`;
@@ -1228,6 +1259,12 @@ function renderSituation() {
     const c = (rd.cash || {})[pid] || {};
     return { pid, cash: c.cash, debt: c.debt, free: c.free_cash };
   }).sort((a, b) => (b.cash || -1) - (a.cash || -1));
+  // v0.10サイクル10.2: 首位公示（IDのみ。金額・順位は元々このランキング自体が
+  // god専用ではないため新たな秘匿情報の漏洩ではない）。同額なら全員に付く。
+  const leaderIds = new Set(rd.leader_ids || []);
+  // v0.10サイクル10.3: 自己順位通知は本人にのみ届く秘匿情報。god限定で表示する
+  // （サーバ側log_parser.pyのview=="god"判定と二重防御。publicはranks自体が空）。
+  const rankMap = godMode ? (rd.ranks || {}) : {};
   let rHtml = '<div class="sit-card"><h4>💰 資産ランキング</h4>';
   ranked.forEach((x, i) => {
     const elim = elimMap[x.pid] !== undefined;
@@ -1236,7 +1273,10 @@ function renderSituation() {
     const debtStr = (x.debt != null && x.debt > 0) ? ` <span class="sit-debt">借金${yen(x.debt)}</span>` : '';
     const failureBadge = elimKindMap[x.pid] === 'failure' ? ' <span class="auto-badge auto-badge-failure" title="合法な提出が1つも無く脱落">AUTO失敗</span>' : '';
     const elimStr = elim ? ` <span class="sit-elim">脱落(${elimMap[x.pid]})</span>${failureBadge}` : '';
-    rHtml += `<div class="sit-row">${i + 1}. <b>${escapeHtml(pidLabel(x.pid))}</b> ${yen(x.cash)}${debtStr}${ok}${elimStr}</div>`;
+    const crown = leaderIds.has(x.pid) ? ' <span class="sit-crown" title="今ラウンドの資産首位として公示">👑</span>' : '';
+    const ri = rankMap[x.pid];
+    const rankStr = ri ? ` <span class="sit-rank" title="本人にのみ通知された自己順位（神視点）">${ri.tied ? '同率' : ''}${ri.rank}位/${ri.n_alive}</span>` : '';
+    rHtml += `<div class="sit-row">${i + 1}. <b>${escapeHtml(pidLabel(x.pid))}</b>${crown}${rankStr} ${yen(x.cash)}${debtStr}${ok}${elimStr}</div>`;
   });
   rHtml += '</div>';
 

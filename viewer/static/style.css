@@ -466,6 +466,10 @@ body > .god-banner { margin: 0; border-radius: 0; text-align: center; }
 .sit-ok { color: #5cc98a; font-weight: bold; }
 .sit-debt { color: var(--pid-alt); }
 .sit-elim { color: var(--text-muted); }
+/* v0.10サイクル10.2: 首位公示（IDのみの目印。金額・順位を追加表示するものではない） */
+.sit-crown { font-size: 0.95em; }
+/* v0.10サイクル10.3: 自己順位通知（本人にのみ届く秘匿情報。god視点限定表示） */
+.sit-rank { color: var(--text-muted); font-size: 0.85em; }
 /* A-7: AUTO COMMIT / AUTO COMMIT失敗 の視覚的区別（神視点のみ）。
    「本人が約束を破った」のではなく「システムが代行した/合法な提出が
    1つも無かった」ことを一目で判別できるようにする。 */
@@ -487,11 +491,13 @@ body > .god-banner { margin: 0; border-radius: 0; text-align: center; }
   font-size: 11px; font-weight: bold; border: 1px solid; }
 .ob-a { color: var(--cash); border-color: var(--cash); }          /* 型A=金銭 */
 .ob-b { color: var(--action-type); border-color: var(--action-type); } /* 型B=行動 */
+.ob-c { color: #8a5cf6; border-color: #8a5cf6; }                   /* 型C=条件付き金銭（v0.10） */
 .ob-round { color: var(--text-muted); font-size: 11px; margin-left: 4px; }
 .ob-none { font-size: 12px; padding: 2px 0; }
 .ob-unknown { color: #b0763a; font-style: italic; }
 .oc-ok { color: #4caf50; }
 .oc-ng { color: #e05a5a; }
+.oc-none { color: var(--text-muted); }                             /* 型C不成立（v0.10、失敗ではない） */
 .ct-meta { font-size: 12px; opacity: .8; margin: 4px 0; }
 .ct-label { font-size: 11px; font-weight: bold; opacity: .7; margin-top: 6px; }
 .ct-active { color: #4caf50; }

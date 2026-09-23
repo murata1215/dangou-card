@@ -1781,3 +1781,83 @@ AIに伝えるルールと実際の判定が食い違う状態。`entry_fee`モ�
 次タスクで必ず解消すること。LLM API呼び出しなし・`logs/llm/`不変。
 詳細: `doc/devlog/2026-08-30_155134.md`（サイクル9.0）・
 `doc/devlog/2026-08-30_180634.md`（サイクル9.1）。
+
+## 2026-09-19: サイクル10.1 型C（条件付き金銭契約）の実装（v0.10）
+
+正式契約に第3の義務種別「型C: 条件付き金銭義務」を追加した（仕様書
+`doc/uso8000000_dangou_card_spec_v0_10_typec.md`）。「観測可能な事象Eが成立した場合のみ、
+義務者→相手方にX円を自動支払いする」契約で、条件は市場勝者／脱落／市場高騰の3種（v1語彙）。
+専用の決済系・預託プール・エスクローは作らず、条件成立時に既存の型A支払義務へ変換して
+既存のAtomic判定に合流させる設計。「賭け」「予測」等の用途を示す語彙はルール文面・プロンプト
+から意図的に排除し、用途はプレイヤーの発明に委ねる（原則6）。
+
+`engine/models.py`（契約データ構造）・`engine/config.py`（`type_c_enabled: bool = False`、
+S2既定でTrue）・`engine/contracts.py`（条件判定ロジック）・`engine/settlement.py`（型Cの
+条件判定と発火を既存11Stepに挿入）・`engine/actions.py`・`engine/game.py`・
+`llm/response_parser.py`・`llm/phase2_schema.py`・`llm/prompt_builder.py`
+（機能は機械的事実として明示、用途は一切示さない文面）・`viewer/log_parser.py`／
+`index.html`・`scripts/highlights.py`の全層に実装。新規テスト4ファイル計120件
+（`test_type_c_conditional.py`・`test_type_c_parser.py`・`test_type_c_prompt.py`・
+`test_type_c_notices.py`）を追加し全1701件PASS。`type_c_enabled=False`時のS1回帰は
+`dry_run.py`（578イベント）とBot `simulate.py`5試合の双方でgit stash前後比較しdiff0
+（バイト完全一致）を確認。ルールベースBotは契約提案経路を持たないため、S2でのイベント
+発火確認は一時注入エージェントによるフルGame実行で別途確認した（検証用スクリプト・ログは
+作業後削除）。詳細: `doc/devlog/2026-09-19_114517.md`。
+
+## 2026-09-19: サイクル10.2 首位公示（leader_announce_enabled）
+
+「安泰問題」（資産で抜け出したプレイヤーが誰にも気づかれず逃げ切れる）への最小対策として、
+各ラウンドのMarket Openで資産（現金＋未解決の倍掛け預託額−借金残高）が最大の生存者の
+**IDのみ**を全員に公示する機能を実装した。金額・順位・現金・借金は非公開のまま。
+
+`engine/config.py`に`leader_announce_enabled: bool = False`（S2既定でTrue）、
+`engine/player.py`に`total_assets()`（負の資産も表現可能）、`engine/game.py`の
+Market Open直後で同額判定を集合として扱い`LEADER_ANNOUNCED`イベント（`player_ids`のみ）を
+発火。同率首位は全員を公示対象とし、内部順序に依存しない。`llm/prompt_builder.py`の
+RULES_SUMMARY・公開情報ブロックに反映し、`config.leader_announce_enabled`で呼び出し側からも
+二重ゲート。`viewer/`は資産ランキングに王冠マーカー、`scripts/highlights.py`にH17
+「首位交代」を追加。新規`tests/test_leader_announce.py`33件を含め全1734件PASS。
+`dry_run.py`578イベント完全一致（回帰0）。詳細: `doc/devlog/2026-09-19_122124.md`。
+
+## 2026-09-19: サイクル10.3 目的文の強化と順位通知（rank_notice_enabled）
+
+10.2は首位IDのみの公示で下位プレイヤーが自分の位置を知れない問題への対応。(A)
+system prompt先頭に`## 目的`節を新設し目的3行（生存は最低条件・脱落回避・最終資産1位）を
+全4フェーズで毎ラウンド再掲、(B) 各プレイヤー本人にのみ資産順位（`4位/6人`、同率は
+`同率2位/6人`）を通知（順位起因の有利・不利処理は一切なし）。
+
+`engine/config.py`に`rank_notice_enabled`（既定False、S2でTrue）、`engine/player.py`に
+`AssetRank`（金額フィールドを意図的に持たない）と`assets_ranking()`（競技順位1,2,2,4、
+脱落者を順位・分母両方から除外）。`engine/game.py`でMarket Open時に1回計算し
+`RANK_NOTIFIED`イベント（`round,player_id,rank,tied,n_alive`のみ、資産額は含めない）を
+ログ、本人限定で`my_rank`を注入。system prompt長超過回避のため既存文言5箇所を追加圧縮
+（数値・ロジックは不変）。`viewer/`はgod view限定で座席行に順位を表示、public側は空のまま。
+新規`tests/test_rank_notice.py`38件・`tests/test_objective_statement.py`9件、全1781件PASS。
+詳細: `doc/devlog/2026-09-19_163758.md`。
+
+## 2026-09-19: サイクル10.4 6体×12R本戦（v0.10フル装備）の事前準備
+
+6体・12ラウンド・S2 v0.10（型C＋首位公示＋順位通知）本戦の起動準備として、Bot 6種×1000試合
+（seed=42固定）で1市場賞金20/24/28/32万円の4アームを掃引し24万円を採用（平均生還2.82/6）。
+`engine/config.py`に`baseline_v1_s2_l6()`を新規追加（既存`baseline_v1_s2()`は不変）、
+`scripts/llm_trial.py`に`--prize-preset l6`選択口、`tests/test_l6_r12_trial.py`に固定テスト
+3件を追加し全1784件PASS。S2の`surge_enabled`（高騰時プール2倍）により「全員生還が数学的に
+不可能」という仕様書の算術証明が成立しないことを発見し`baseline_v1_s2_l6()`のdocstringに
+明記。本戦自体は本サイクルでは未実行。詳細: `doc/devlog/2026-09-19_170403.md`。
+
+## 2026-09-23: Viewer試合セレクタの並び順改善（本戦を優先表示）
+
+観戦WebUI（`viewer/`）の試合セレクタが、trial名の辞書順ソート（`trial_C_l6r1_light_602`の
+ような非日付命名で`l6...`が`l12...`より文字比較で大きくなり、6人戦テストが12人戦本戦より
+上に来る不具合）になっていたのを修正した。
+
+`viewer/log_parser.py::list_games()`にソートキーを2段導入: (1) `trial_manifest.json`の
+`stop_after_round`（意図的な途中打ち切り＝テスト走行専用フラグ、`scripts/llm_trial.py`の
+`--stop-after-round`由来）が設定されている試合を「テスト」として末尾へ、(2) 各グループ内は
+既存の`latest_timestamp`（最終LLM呼び出し時刻）で新しい順にソート。manifest が無い旧trialは
+本戦扱いとし従来どおり日付順で末尾へ自然に沈む。`viewer/static/index.html`のセレクタラベルに
+日付（`· 09/21`）と試験マーク（`🔧試験`）を追加し、並び順の正しさを目視確認できるようにした。
+全1863件PASS（回帰0）。本番の`dangou-viewer.service`（systemd --userで1ヶ月起動しっぱなし
+だったため旧コードを保持していた）を再起動し、公開URL経由で反映を確認。
+詳細: `archive_worklog_2026-09.md`（`~/.claude/projects/-home-uso8m-dangou-card/memory/`）
+#18-20。

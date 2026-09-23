@@ -422,7 +422,9 @@ class TestPromptLengthBudget:
         prompt = build_system_prompt("P01", config)
         # Cycle 8.2 Step0実測: 8,177字（H1予約額0.03459 <= 0.035の制約から
         # 逆算した8,300を上限とする。Step1のRULES_SUMMARY圧縮後もこの範囲内）
-        assert len(prompt) <= 8300, len(prompt)
+        # Cycle 10.1（2026-09-19）: v0.10 型Cのプロンプト文面追加でbaseline_v1_s2
+        # （type_c_enabled=Trueが既定）が8,300字を超過したため9,100字へ改定。
+        assert len(prompt) <= 9100, len(prompt)
 
 
 class TestActionDescriptionMapping:

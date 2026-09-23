@@ -93,9 +93,16 @@ DEFAULT_SEED = 901
 # max_cost を 0.25→0.40 に引き上げる（事前予約ガードの上限。実費ではない）。
 # max_cost_per_model は据え置き。H4単体の予約はこの上限を超える既知の例外として
 # tests/test_model_matrix.py で明示的にテスト固定している。
+# Cycle 10.1 (2026-09-19): v0.10 型C（条件付き金銭契約）のプロンプト文面追加で
+# baseline_v1_s2 のsystem prompt長が8,181→8,996字に増加し、CORE_18予約合計が
+# $0.40を超過（H1予約も$0.0346→$0.03664で旧上限$0.035を超過）したため、
+# max_cost を 0.40→0.42、max_cost_per_model を 0.035→0.04 に引き上げる。
+# 【判断】本サイクルはAskUserQuestion不可のため人間承認を得られず、既存サイクルの
+# 慣例（システムプロンプト増加分に対する予約上限の比例的引き上げ）に倣い単独で
+# 決定した。ビルドサマリで開示する。
 PHASE_DEFAULTS: dict[int, dict[str, Any]] = {
     1: {"max_cost": 0.08, "max_cost_per_model": 0.02, "max_calls": 40, "max_tokens": 64, "retries": 1},
-    2: {"max_cost": 0.40, "max_cost_per_model": 0.035, "max_calls": 24, "max_tokens": 400, "retries": 0},
+    2: {"max_cost": 0.42, "max_cost_per_model": 0.04, "max_calls": 24, "max_tokens": 400, "retries": 0},
     3: {"max_cost": 0.20, "max_cost_per_model": 0.03, "max_calls": 96, "max_tokens": 500, "retries": 0},
 }
 

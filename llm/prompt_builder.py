@@ -39,7 +39,33 @@ _OB_TYPE_LABELS = {
     "type_b_market": "型B市場指定",
     "type_b_card": "型Bカード指定",
     "type_b_no_market": "型B不参加指定",
+    "type_c_conditional": "型C条件付き金銭",
 }
+
+_CONDITION_TYPE_LABELS = {
+    "market_winner": "市場勝者",
+    "eliminated": "脱落",
+    "market_surge": "市場高騰",
+}
+
+
+def _format_type_c_condition(d: dict[str, Any]) -> str:
+    """型C義務のdetails dict（amount/condition_type/conditionを含む）から
+    条件の要旨文字列を組み立てる（v0.10）
+    """
+    condition_type = d.get("condition_type", "")
+    condition = d.get("condition") or {}
+    label = _CONDITION_TYPE_LABELS.get(condition_type, condition_type)
+    if condition_type == "market_winner":
+        return (
+            f'{label}({condition.get("market_id", "?")}の勝者が'
+            f'{condition.get("target_player", "?")})'
+        )
+    if condition_type == "eliminated":
+        return f'{label}({condition.get("target_player", "?")}が脱落)'
+    if condition_type == "market_surge":
+        return f'{label}({condition.get("market_id", "?")}が高騰)'
+    return label
 
 
 def _format_obligation_detail(ob: dict[str, Any]) -> tuple[str, str]:
@@ -51,6 +77,11 @@ def _format_obligation_detail(ob: dict[str, Any]) -> tuple[str, str]:
     """
     label = _OB_TYPE_LABELS.get(ob["ob_type"], ob["ob_type"])
     d = ob.get("details") or {}
+    if ob["ob_type"] == "type_c_conditional":
+        # v0.10: 型Cはdetailsに"amount"を持つが、条件の要旨も併記しないと
+        # 型Aと区別が付かなくなるため、"amount" in d 分岐より前段で処理する
+        amount = d.get("amount", 0)
+        return label, f'{amount // 10_000}万円（条件: {_format_type_c_condition(d)}）'
     if "amount" in d:
         return label, f'{d["amount"] // 10_000}万円'
     if "market_id" in d:
@@ -779,6 +810,51 @@ def _render_eliminations_block(
     return lines
 
 
+def _render_leader_block(visible_state: dict[str, Any]) -> list[str]:
+    """今ラウンドの資産首位IDを公示する（v0.10サイクル10.2・公開情報）。
+
+    leader_announce_enabled=Falseの試合ではvisible_stateに"leader_ids"キーが
+    存在しないため空リストを返す（既存プロンプトとバイト単位で同一を保つ）。
+    金額・順位・現金・借金は一切出さない。狙う・避ける等の示唆も書かない
+    （事実の提示のみ）。
+    """
+    leader_ids = visible_state.get("leader_ids")
+    if not leader_ids:
+        return []
+    return [f"\n## 今ラウンドの資産首位: {', '.join(leader_ids)}"]
+
+
+def _render_leader_self_notice(player_id: str, visible_state: dict[str, Any]) -> list[str]:
+    """自分が今ラウンドの資産首位のとき、個別財務通知として1行だけ示す（本人限定）。
+
+    _render_leader_block と同じ leader_ids を参照する。示唆語は書かない。
+    """
+    leader_ids = visible_state.get("leader_ids")
+    if not leader_ids or player_id not in leader_ids:
+        return []
+    return ["  あなたは今ラウンドの資産首位として公示されています"]
+
+
+def _render_rank_self_notice(visible_state: dict[str, Any]) -> list[str]:
+    """自分の今ラウンドの資産順位を1行だけ示す（v0.10サイクル10.3・本人限定・秘匿）。
+
+    rank_notice_enabled=Falseの試合、または本人が脱落済みの場合は
+    visible_stateに"my_rank"キーが存在しないため空リストを返す（既存プロンプトと
+    バイト単位で同一を保つ）。player_id を引数に取らない＝他人の順位を描画する
+    経路が型として存在しない（my_rank は _build_visible_state が本人ぶんだけ
+    入れる）。金額は出さない。示唆語も書かない（事実の提示のみ）。
+    """
+    info = visible_state.get("my_rank")
+    if not info:
+        return []
+    rank = info.get("rank")
+    n_alive = info.get("n_alive")
+    if not rank or not n_alive:
+        return []
+    label = f"同率{rank}位" if info.get("tied") else f"{rank}位"
+    return [f"  あなたの現在順位: {label} / {n_alive}人"]
+
+
 def _render_contract_notice_block(
     visible_state: dict[str, Any], round_num: int, *, config: GameConfig | None = None,
 ) -> list[str]:
@@ -866,6 +942,24 @@ def _render_contract_notice_block(
                 f'  [倍掛け] R{round_num}の賞金{eligible_prize}円の倍掛けは、'
                 f'預託後の現金{cash_after}円が今Rの強制最低返済額{min_repay}円を'
                 f'下回るため選択できず、自動的にTAKEになりました'
+            )
+        elif kind == "type_c_fired":
+            lines.append(
+                f'  [{cid}] 型C義務（{n.get("obligation_id", "?")}）の条件'
+                f'（{n.get("condition_type", "?")}）が成立し、'
+                f'{n.get("amount", 0) // 10_000}万円の支払いが型Aと合算して'
+                f'Atomic判定されました。'
+            )
+        elif kind == "type_c_not_met":
+            lines.append(
+                f'  [{cid}] 型C義務（{n.get("obligation_id", "?")}）の条件'
+                f'（{n.get("condition_type", "?")}）は不成立でした。'
+                f'支払い義務は消滅しました（記録のみ）。'
+            )
+        elif kind == "type_c_expired":
+            lines.append(
+                f'  [{cid}] 型C義務（{n.get("obligation_id", "?")}）は'
+                f'当事者の脱落により失効しました。'
             )
         else:
             # 未知のnotice kindは誤った固定文で描画しないよう安全にskipする
@@ -1414,17 +1508,67 @@ def _render_message_list(
     return lines
 
 
+# --- v0.10: 型C（条件付き金銭契約）のプロンプト文面 ---
+# 仕様書 doc/uso8000000_dangou_card_spec_v0_10_typec.md §6.2/§6.3 の文面をそのまま
+# プレーン文字列で保持する（f-stringにしない。中の{}はRULES_SUMMARYの.format()には
+# 一切渡さず、既にレンダリング済みの値として差し込むためエスケープ不要）。
+# config.type_c_enabled=False のときは空文字列を差し込み、RULES_SUMMARYの
+# 該当行はバイト単位で従来と同一になる（既存行の末尾へ連結する形で挿入するため）。
+TYPE_C_CONTRACT_RULES = """
+- 型C（条件付き金銭）: 指定した観測可能な事象が成立した場合のみ、指定額を相手方へ自動支払いする。
+  条件が成立しなかった場合、支払い義務は発生しない（何も起きない）。
+  - 指定できる条件は次の3種:
+    (1) 指定ラウンドの指定市場で、特定プレイヤーが勝者になること（同ランク山分けの勝者も勝者に含む）
+    (2) 特定プレイヤーが、指定ラウンド終了時点までに脱落していること
+    (3) 指定ラウンドの指定市場で、市場高騰が発生すること
+  - 条件の対象となるプレイヤーは、契約当事者である必要はない
+  - 条件が成立した場合の支払いは型Aと同じ扱い（決済時に支払不能なら履行不能=即時脱落）
+  - 契約時点で支払額を所持している必要はない
+  - 1つの契約に、型A・型B・型Cの義務を複数含めることができる"""
+
+TYPE_C_ACTION_TEMPLATE = """
+- 型Cの terms 記述例:
+  {"obligor": "自分のID", "counterparty": "P07", "ob_type": "type_c_conditional", "round_num": 10,
+   "details": {"amount": 1000000, "condition_type": "market_winner",
+               "condition": {"market_id": "M02", "target_player": "P05"}}}
+  ※condition_type: market_winner(市場勝者) / eliminated(脱落) / market_surge(市場高騰)
+  ※market_winner は market_id と target_player、eliminated は target_player、market_surge は market_id を condition に指定"""
+
+
+# --- v0.10サイクル10.2: 首位公示のプロンプト文面 ---
+# 「公開情報」一覧への追記1行。狙う・避ける・警戒する等の示唆は一切書かない
+# （事実の提示のみ）。config.leader_announce_enabled=False のときは空文字列を
+# 差し込み、RULES_SUMMARYの該当行はバイト単位で従来と同一になる
+# （既存行の末尾へ連結する形で挿入するため。型Cと同じ方式）。
+LEADER_ANNOUNCE_RULES_LINE = """
+- 各ラウンドの資産首位のID（資産＝現金＋倍掛け預託−借金残高。額は非公開）"""
+
+
+# --- v0.10サイクル10.3: 目的文の強化・自己順位通知のプロンプト文面 ---
+# 目的3行はフラグに依存しない（S1 rulesetを含め常時表示）。
+OBJECTIVE_LINES = """生き残ることは最低条件であり、生き残っただけでは勝利ではない。
+最終目的は、脱落を避けながら最終資産で1位になることである。
+生還者の中で最も資産が多いプレイヤーが勝者である。"""
+
+OBJECTIVE_REMINDER_LINE = "  目標: 生還者の中で最終資産1位（生還は最低条件）"
+
+
 # --- システムプロンプト（ルール詳細） ---
 # Step 3.3: キャッシュ閾値(2048トークン)超えのため仕様書v0.5準拠で詳細化
 # ルールの内容は変えず、仕様書に存在する事実を忠実に記載
 RULES_SUMMARY = """# 談合カード ルール
 
+## 目的
+生き残ることは最低条件であり、生き残っただけでは勝利ではない。
+最終目的は、脱落を避けながら最終資産で1位になることである。
+生還者の中で最も資産が多いプレイヤーが勝者である。
+
 ## ゲーム概要
 - プレイヤー{num_players}体が12ラウンドで競う市場争奪ゲーム
 - 毎ラウンド3つの市場が出現し、各プレイヤーは秘密裏に「参加市場」と「使用カード」をコミットする
 - 同じ市場に参加したプレイヤーのうち、最高ランクのカードを出した者が賞金プール全額を獲得
-- 目的: 12ラウンド終了時に「借金残高=0」かつ「現金{survival_cash_man}万円以上」で生還すること
-- **生存は最低限の条件であり勝利ではない。** 生存者中の最終現金が高いほど上位（総合1位が最高評価）。生存を失わない範囲で上位を狙うのが期待され、条件を失えば明確な敗北
+- 生還条件: R12終了時に「借金残高=0」かつ「現金{survival_cash_man}万円以上」
+- 生存者中の最終現金が高いほど上位。条件を失えば明確な敗北
 
 ## 生還条件と脱落
 - 生還: R12のFinance終了時にDebt=0かつCash≧{survival_cash_man}万円
@@ -1483,18 +1627,18 @@ RULES_SUMMARY = """# 談合カード ルール
 - 提案時の検証: round_numは今R以降、market_idはM01〜M03、amountは正の整数、義務者・相手方は当事者のみ。不正な提案は不成立（枠は消費）
 - 解除: 未到来の義務が残る契約は、生存する全当事者が contract_cancel を出せば解除できる（履行済み・監査済み義務はそのまま）。残義務ゼロの契約は自動で閉じる
 - 契約の存在と当事者名は全員に公示、内容は当事者のみ
-- 義務単位で管理: 脱落者が義務者or相手方の義務のみ失効、生存者間の義務は継続（脱落者への未回収債権は消滅）
+- 義務単位で管理: 脱落者が義務者or相手方の義務のみ失効、生存者間の義務は継続（脱落者への未回収債権は消滅）{type_c_contract_block}
 
 ## 匿名通信・公開報奨
 - 匿名通信: {anon_fee_man}万円で発信者を伏せた1メッセージを全体へ（1プレイヤー1ラウンド2通まで）
 {anon_fee_note}
 {bounty_deposit_line}
   - 達成者型: 達成者自身の行動として観測可能な事実が条件（例: 「P07と同じ市場で勝利したAIへ50万」）
-  - イベント型（保険型）: 特定イベントが条件（例: 「P07が脱落した場合、P03へ100万」）
+  - イベント型: 特定イベントが条件（例: 「P07が脱落した場合、P03へ100万」）
   - 匿名掲載可（手数料+10%）。取り下げ自由（預託金返還）
 
 ## 公開情報と秘匿情報
-- 公開: 初期借入額、総賞金予算、市場と賞金、使用済み全カード、各市場の参加者・使用カード（決着後）、勝者と獲得額、契約の存在と当事者名、カードトレード成立の事実（当事者名）、市場高騰の発生、倍掛け状況（選択者・預託額・成否）、公開報奨、全体チャット、AUTO COMMIT発生、脱落者と理由種別
+- 公開: 初期借入額、総賞金予算、市場と賞金、使用済み全カード、各市場の参加者・使用カード（決着後）、勝者と獲得額、契約の存在と当事者名、カードトレード成立の事実（当事者名）、市場高騰の発生、倍掛け状況（選択者・預託額・成否）、公開報奨、全体チャット、AUTO COMMIT発生、脱落者と理由種別{leader_announce_rules_block}
 - 秘匿: 未使用カード、{secret_cash_words}、DM、契約内容、カードトレードで交換されたカード・現金、匿名通信・匿名報奨の掲載者、個別財務通知、次ラウンドのコミット内容
 
 ## 口約束と正式契約の違い
@@ -1529,7 +1673,7 @@ strategyに必ず"emotion"を含めてください。現在のあなたの感情
     {{"obligor": "{me}", "counterparty": "{other}", "ob_type": "type_a_payment", "round_num": 9, "details": {{"amount": 300000}}}}
   ]}}
   ※例: {other}がR8にM03へ不参加の代わりに{me}がR9に30万円払う。round_numは提案時点以降を指定（番号は架空）
-  ※ob_type: type_a_payment(金銭支払:amount) / type_b_market(市場指定:market_id) / type_b_card(カード指定:card_rankへ大文字カード名) / type_b_no_market(不参加指定:market_id)
+  ※ob_type: type_a_payment(金銭支払:amount) / type_b_market(市場指定:market_id) / type_b_card(カード指定:card_rankへ大文字カード名) / type_b_no_market(不参加指定:market_id){type_c_action_block}
   ※withは複数可（3者以上の契約）。片務契約（termsが自分の義務だけ）も可
 - {{"type": "contract_sign", "contract_id": "..."}}
 - {{"type": "contract_cancel", "contract_id": "..."}}
@@ -1549,10 +1693,10 @@ strategyに必ず"emotion"を含めてください。現在のあなたの感情
 - transfer: 便益=即時決済でその場の信用や協力を買える。{transfer_cost_note}。返金は相手の任意
 - repay: 便益=借金残高が減り、以後の利息（{interest_pct}%/R）と強制最低返済額が下がる。コスト=現金が減る（Entry Fee・契約・トレードの原資と共通）
 - anonymous_broadcast: 便益=発信者を伏せて情報や噂を全体に流せる。信用を賭けずに市場誘導・他人の同盟を揺さぶれる。コスト=1通{anon_fee_man}万円の現金払い、1R2通まで
-- contract_propose / contract_sign: 便益=相手の行動・支払いを確定できる（不参加市場を作って弱いカードで勝つ、使用カードを固定する、将来支払いを保証させる）。自分が義務を負えば約束の信用が増し、片務契約は署名されやすい。コスト=義務者は違反・履行不能で即時脱落し、行動の自由を失う
+- contract_propose / contract_sign: 便益=相手の行動・支払いを確定できる（不参加市場を作って弱いカードで勝つ、使用カードを固定する、将来支払いを保証させる）。片務契約は署名されやすい。コスト=義務者は違反・履行不能で即時脱落
 - contract_cancel: 便益=不要な契約を全当事者合意で無効化できる（違反脱落を避ける正規の手段）。コスト=生存する全当事者が出すまで成立しない
-- bounty_post: 便益=自分で実行できない結果を第三者の行動として金で買える。匿名掲載も可。コスト={bounty_cost_note}、匿名掲載は手数料+10%。取り下げれば預託金返還
-- card_trade_propose / card_trade_accept / card_trade_reject: 便益=信用不要で原子的に執行され、手札の穴を埋めて勝てる市場を作れる。弱いカードを現金付きで手放し返済原資にもできる。最大5人へ同時提案し先着受諾で成立。コスト=成立は1R1回、R12不可。現金は{within_spendable_word}、不能なら不成立（脱落なし）
+- bounty_post: 便益=自分で実行できない結果を第三者の行動として金で買える（匿名掲載可）。コスト={bounty_cost_note}（匿名+10%）。取り下げれば預託金返還
+- card_trade_propose / card_trade_accept / card_trade_reject: 便益=信用不要で原子的に執行され、手札の穴を埋めて勝てる市場を作れる。最大5人へ同時提案し先着受諾で成立。コスト=成立は1R1回、R12不可。現金は{within_spendable_word}、不能なら不成立（脱落なし）
 
 コミットフェイズのアクション:
 - {{"type": "market_commit", "market_id": "M01", "card": "ONE_PAIR"}}
@@ -1647,12 +1791,12 @@ def build_system_prompt(player_id: str, config: GameConfig) -> str:
             money_section = (
                 "## お金の使い方\n"
                 "- 送金・型A金銭契約・報奨の預託・カードトレードの現金は"
-                "**現金**から払う。借入金も最初から使える（返すのは自分）\n"
-                f"- ただし今RのEntry Fee {entry_fee_man}万円分は交渉中の"
-                "支払いに使えない（Commitで必ず引かれる）。支払可能額 = "
+                "**現金**から払う（借入金も含む。返すのは自分）\n"
+                f"- 今RのEntry Fee {entry_fee_man}万円分は交渉中の支払いに"
+                "使えない（Commitで必ず引かれる）。支払可能額 = "
                 f"現金 − {entry_fee_man}万円\n"
-                "- 型A契約の支払能力は執行時（指定RのSettlement、Entry Fee"
-                "支払い後）の現金で判定。不足すれば履行不能で脱落\n"
+                "- 型A契約の支払能力は執行時（指定RのSettlement後）の"
+                "現金で判定。不足すれば履行不能で脱落\n"
                 "- Entry Fee・利息・強制返済・匿名通信費はシステムへの支払い"
             )
         else:  # "cash"
@@ -1684,6 +1828,20 @@ def build_system_prompt(player_id: str, config: GameConfig) -> str:
         transfer_cost_note = "コスト=現金が減る。Entry Fee分は残すこと"
         bounty_cost_note = "預託は現金から"
 
+    # v0.10: 型C（条件付き金銭契約）。無効時は空文字列＝既存行と完全に同一バイト列
+    if config.type_c_enabled:
+        type_c_contract_block = TYPE_C_CONTRACT_RULES
+        type_c_action_block = TYPE_C_ACTION_TEMPLATE
+    else:
+        type_c_contract_block = ""
+        type_c_action_block = ""
+
+    # v0.10サイクル10.2: 首位公示。無効時は空文字列＝既存行と完全に同一バイト列
+    if config.leader_announce_enabled:
+        leader_announce_rules_block = LEADER_ANNOUNCE_RULES_LINE
+    else:
+        leader_announce_rules_block = ""
+
     rules = RULES_SUMMARY.format(
         num_players=config.num_players,
         survival_cash_man=config.survival_cash // 10_000,
@@ -1711,12 +1869,15 @@ def build_system_prompt(player_id: str, config: GameConfig) -> str:
         within_spendable_word=within_spendable_word,
         transfer_cost_note=transfer_cost_note,
         bounty_cost_note=bounty_cost_note,
+        type_c_contract_block=type_c_contract_block,
+        type_c_action_block=type_c_action_block,
+        leader_announce_rules_block=leader_announce_rules_block,
     )
 
     identity = (
         f"\n\nあなたは{player_id}です。"
-        f"目的: 生存条件（現金{config.survival_cash // 10_000}万円以上 + 借金0）を確保したうえで、"
-        f"最終現金で総合1位を狙うこと。\n"
+        f"生存条件（現金{config.survival_cash // 10_000}万円以上 + 借金0）を満たしたうえで、"
+        f"最終資産で1位を狙え。\n"
         f"嘘をついてもよい。交渉・談合・裏切りは自由。口約束は無料だが拘束力がなく、"
         f"正式契約は相手の署名一つで相手の行動・支払いを確定させられる（違反は義務者が即脱落）。"
     )
@@ -1897,6 +2058,17 @@ def build_negotiation_prompt(
         entry_fee_deduction=config.entry_fee,
         entry_fee_note="（1R1市場のため、参加できる市場は1つだけです。Entry Feeはコミット時に自動徴収され、不足の場合は破産脱落）",
     ))
+    # v0.10サイクル10.2: 首位公示の個別財務通知（本人が首位のときのみ・秘密情報）。
+    # config側でも明示的にゲートする（visible_stateにleader_idsが紛れ込んでいても
+    # 無効時は出さない。実運用ではgame.py側がOFF時にキー自体を作らないため
+    # 二重の防御だが、無効時のバイト単位一致を関数境界だけに依存させない）。
+    if config.leader_announce_enabled:
+        lines.extend(_render_leader_self_notice(player_state.player_id, visible_state))
+    # v0.10サイクル10.3: 自己順位（本人限定・秘匿）。首位公示と同じ理由で二重ゲート
+    if config.rank_notice_enabled:
+        lines.extend(_render_rank_self_notice(visible_state))
+    # v0.10サイクル10.3: 目的の再掲（フラグ非依存・毎R毎ターン1行）
+    lines.append(OBJECTIVE_REMINDER_LINE)
 
     # A-5: 自分の過去AUTO COMMIT記録（事実のみ・本人限定）
     lines.extend(_render_auto_commit_block(visible_state))
@@ -1917,6 +2089,11 @@ def build_negotiation_prompt(
     # 生存者
     alive = visible_state.get("alive_players", [])
     lines.append(f"\n## 生存者: {', '.join(alive)}")
+
+    # v0.10サイクル10.2: 首位公示（公開情報。IDのみ、金額・順位は出さない）。
+    # 個別財務通知と同じ理由でconfig側でも明示的にゲートする。
+    if config.leader_announce_enabled:
+        lines.extend(_render_leader_block(visible_state))
 
     # 脱落者（公示。§8.1公開情報）
     lines.extend(_render_eliminations_block(visible_state, round_num))
@@ -2221,6 +2398,11 @@ def build_commit_prompt(
             "（1R1市場のため、参加できる市場は1つだけです。Entry Feeはコミット時に自動徴収され、不足の場合は破産脱落）"
         ),
     ))
+    # v0.10サイクル10.3: 自己順位（本人限定・秘匿）。首位公示と同じ理由で二重ゲート
+    if config.rank_notice_enabled:
+        lines.extend(_render_rank_self_notice(visible_state))
+    # v0.10サイクル10.3: 目的の再掲（フラグ非依存・毎R毎ターン1行）
+    lines.append(OBJECTIVE_REMINDER_LINE)
 
     # A-5: 自分の過去AUTO COMMIT記録（事実のみ・本人限定）
     lines.extend(_render_auto_commit_block(visible_state))
@@ -2416,6 +2598,12 @@ def build_reflection_prompt(
             # v0.8サイクル8.3 F17: reflectionは次R予測のため見込み行の主語を明示する
             forecast_label=f"次R（R{round_num + 1}）賞金0の場合",
         ))
+
+    # v0.10サイクル10.3: 自己順位（本人限定・秘匿）。首位公示と同じ理由で二重ゲート
+    if config.rank_notice_enabled:
+        lines.extend(_render_rank_self_notice(visible_state))
+    # v0.10サイクル10.3: 目的の再掲（フラグ非依存・毎R毎ターン1行）
+    lines.append(OBJECTIVE_REMINDER_LINE)
 
     lines.append(
         f"\n次のラウンド以降の自分に残したいことを{config.memory_max_chars}字以内で自由に書いてください。\n"
@@ -2754,6 +2942,11 @@ def build_double_up_prompt(
     hand_rank_names = set(hand_names)
     lines.append(f"  残りカード: {', '.join(hand_names)}（{len(hand_names)}枚）")
     lines.append(f"  残りラウンド（このRを含む）: {remaining}")
+    # v0.10サイクル10.3: 自己順位（本人限定・秘匿）。首位公示と同じ理由で二重ゲート
+    if config.rank_notice_enabled:
+        lines.extend(_render_rank_self_notice(visible_state))
+    # v0.10サイクル10.3: 目的の再掲（フラグ非依存・毎R毎ターン1行）
+    lines.append(OBJECTIVE_REMINDER_LINE)
 
     # P1-3: 自分の既存の倍掛け預託（今回とは別の、前ラウンド以前からの分）があれば表示
     double_ups = visible_state.get("double_ups", [])

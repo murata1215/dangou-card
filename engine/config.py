@@ -140,6 +140,28 @@ class GameConfig(BaseModel):
     card_trade_broadcast_max: int = 5
     """ブロードキャスト提案の宛先数上限（v0.7.1）"""
 
+    type_c_enabled: bool = False
+    """正式契約 型C（条件付き金銭契約）の有効フラグ（v0.10）。既定False、S2 rulesetでTrue"""
+
+    leader_announce_enabled: bool = False
+    """首位公示の有効フラグ（v0.10 サイクル10.2）。既定False、S2 rulesetでTrue。
+    各ラウンドのMarket Openで、資産（現金+倍掛け預託-借金残高）が最大の生存者の
+    IDのみを全員に公示する。同額なら該当者全員を公示する。システムは順位以外に
+    何もしない（ペナルティ・報酬なし）。"""
+
+    rank_notice_enabled: bool = False
+    """自己順位通知の有効フラグ（v0.10 サイクル10.3）。既定False、S2 rulesetでTrue。
+    各ラウンドのMarket Openで、資産（現金+倍掛け預託-借金残高。leader_announce_enabled
+    と同一定義・同一タイミング）に基づく順位を、本人にだけ「4位 / 6人」の形で通知する。
+    他プレイヤーの順位・資産額は一切通知しない（公開されるのは首位のIDのみ＝10.2）。
+    同額は同順位で次の順位は人数分スキップする（1,2,2,4）。分母は生存者数で、脱落者は
+    順位・分母の両方から除外する。システムは順位に応じた優遇・不利を一切行わない。
+
+    Note: 「資産＝現金＋倍掛け預託−借金残高」の定義文はプロンプト上
+    LEADER_ANNOUNCE_RULES_LINE が唯一の出典。本フラグだけをTrueにして
+    leader_announce_enabled をFalseにすると、順位の分母となる「資産」の定義が
+    プロンプトに一度も現れない。両フラグはS2プリセットで常にセットで有効化する。"""
+
     # --- CoT (Chain-of-Thought) ---
     enable_cot: bool = False
     """True: LLMにreasoningフィールド（推論）を要求する。神視点のみ記録、他プレイヤーにはリークしない"""
@@ -288,6 +310,9 @@ class GameConfig(BaseModel):
             "card_trade_enabled": True,
             "memory_enabled": True,
             "final_reflection_enabled": True,
+            "type_c_enabled": True,
+            "leader_announce_enabled": True,
+            "rank_notice_enabled": True,
         })
 
     @classmethod
@@ -336,4 +361,40 @@ class GameConfig(BaseModel):
             # v0.9: 借りた金を交渉に使えるようにする。Free Cash（借金控除）
             # をやめ、今RのEntry Fee分だけ留保する方式へ切り替える。
             "free_cash_mode": "entry_fee",
+            "type_c_enabled": True,
+            "leader_announce_enabled": True,
+            "rank_notice_enabled": True,
+        })
+
+    @classmethod
+    def baseline_v1_s2_l6(cls) -> "GameConfig":
+        """
+        RULESET_BASELINE_V1_S2 の6人版・実戦用賞金プリセット（サイクル10.4）
+
+        baseline_v1_s2(6)の賞金（1市場32万）は §1.5
+        （全員生還は算術的に不可能でなければならない）を満たさない。
+        Bot 6種(Random/Conservative/StrongCardSave/HighPrizeHunter/
+        Collusion/Betrayal)×1000試合（seed=42）による実測（`--prize-scale`
+        掃引 20/24/28/32万）:
+
+          | 1市場 | 平均生還者数 | 全員生還 | 生存者0 |
+          |---|---|---|---|
+          | 20万 | 2.35/6 | 0/1000 | 3/1000 (0.3%) |
+          | 24万 | 2.82/6 | 0/1000 | 1/1000 (0.1%) |
+          | 28万 | 3.23/6 | 3/1000 (0.3%) | 0/1000 |
+          | 32万(素のbaseline_v1_s2(6)) | 3.60/6 | 9/1000 (0.9%) | 0/1000 |
+
+        注意: surge_enabled=True下では市場高騰時にプールが2倍になる
+        （market.py resolve_market の `total_pool *= 2`）ため、
+        config.total_prizeを生存線と比較する素朴な算術（§1.5の証明の前提）
+        は成立しない。28万・32万で全員生還が実際に発生したのはこのため。
+        したがって本プリセットの採否は上記のBotシミュレーション実測のみを
+        根拠とする。24万を採用: 目標帯(1〜3/6)に収まり、全員生還0/1000、
+        生存者0の試合も1000中1件と4値中最少。
+        """
+        base = cls.baseline_v1_s2(6)
+        prize_tiers = [720_000] * 12
+        return base.model_copy(update={
+            "prize_tiers": prize_tiers,
+            "total_prize": sum(prize_tiers),
         })

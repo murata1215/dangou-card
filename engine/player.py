@@ -6,8 +6,9 @@
 """
 
 import math
+from typing import Iterable, NamedTuple, Sequence
 
-from engine.models import Card, CardRank, PlayerState
+from engine.models import Card, CardRank, DoubleUpDeposit, PlayerState
 from engine.cards import create_deck
 from engine.config import GameConfig
 
@@ -103,6 +104,93 @@ def spendable_cash(player: PlayerState, config: GameConfig, *, at_settlement: bo
         return max(0, player.cash - config.entry_fee)
     # "debt"（既定・旧挙動）
     return max(0, player.cash - player.debt_balance)
+
+
+def total_assets(
+    player: PlayerState, double_up_deposits: Sequence[DoubleUpDeposit],
+) -> int:
+    """
+    資産（首位公示・v0.10サイクル10.2）を返す。
+
+    資産 = 現金 + 未解決の倍掛け預託額 − 借金残高（利息計上後）。
+
+    free_cash（§2.4）と異なり max(0, ...) でクリップしない。借金超過分を
+    負の資産として表現できることが、首位判定（資産最大の生存者を探す）で
+    プレイヤー間の実際の優劣を保つために必要なため。
+
+    倍掛け預託は成立時点で現金から実引き落とし済み（DoubleUpDeposit生成の
+    設計）なので、未解決（resolved=False）の預託額を現金へ足し戻す。これに
+    より倍掛け中の現金を「見かけ上減らして首位を隠す」抜け道を塞ぐ。
+
+    Args:
+        player: プレイヤー状態
+        double_up_deposits: ゲーム全体の倍掛け預託リスト（player_idで絞り込む）
+    """
+    pending_deposit = sum(
+        d.deposit_amount
+        for d in double_up_deposits
+        if d.player_id == player.player_id and not d.resolved
+    )
+    return player.cash + pending_deposit - player.debt_balance
+
+
+class AssetRank(NamedTuple):
+    """自己順位通知（v0.10 サイクル10.3）用の順位情報。
+
+    金額フィールドを意図的に持たない。`dict(rank_info)` 一発で絶対額が
+    プロンプト・ログへ流れる経路を作らないため。
+    """
+
+    rank: int
+    tied: bool
+    n_alive: int
+
+
+def assets_ranking(
+    players: Iterable[PlayerState],
+    double_up_deposits: Sequence[DoubleUpDeposit],
+) -> dict[str, AssetRank]:
+    """
+    生存者の資産（total_assets、首位公示10.2と同一定義・同一時点）から
+    競技順位（standard competition ranking）を計算する（v0.10 サイクル10.3）。
+
+    同額は同順位、次の順位は同額者数分スキップする（1,2,2,4）。
+    分母（n_alive）は生存者数で、脱落者は順位・分母の両方から除外する。
+    並びは (-assets, player_id) で決定的にする（引数の順序に依存しない）。
+
+    Args:
+        players: ゲーム全プレイヤー（is_alive=Falseは除外される）
+        double_up_deposits: ゲーム全体の倍掛け預託リスト
+
+    Returns:
+        player_id -> AssetRank の辞書。キーは生存者のみ
+        （脱落者は不在。呼び出し側の .get() が None で「通知しない」を表現する）。
+        生存者0人なら空辞書を返す。
+    """
+    alive = [p for p in players if p.is_alive]
+    if not alive:
+        return {}
+    n_alive = len(alive)
+    ordered = sorted(
+        alive,
+        key=lambda p: (-total_assets(p, double_up_deposits), p.player_id),
+    )
+    result: dict[str, AssetRank] = {}
+    assets_by_id = {p.player_id: total_assets(p, double_up_deposits) for p in ordered}
+    rank = 1
+    i = 0
+    while i < len(ordered):
+        current_assets = assets_by_id[ordered[i].player_id]
+        j = i
+        while j < len(ordered) and assets_by_id[ordered[j].player_id] == current_assets:
+            j += 1
+        group_size = j - i
+        tied = group_size > 1
+        for k in range(i, j):
+            result[ordered[k].player_id] = AssetRank(rank=rank, tied=tied, n_alive=n_alive)
+        rank += group_size
+        i = j
+    return result
 
 
 def insufficient_funds_reason(config: GameConfig, purpose: str) -> str:

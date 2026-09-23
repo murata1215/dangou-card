@@ -9,7 +9,7 @@ from typing import Any
 
 from engine.models import (
     PlayerState, Market, MarketCommit, MarketResult,
-    Contract, Bounty, GameEvent, DoubleUpDeposit,
+    Contract, Bounty, GameEvent, DoubleUpDeposit, ConditionType, Obligation,
 )
 from engine.config import GameConfig
 from engine.events import EventLogger
@@ -207,6 +207,7 @@ def execute_settlement(
     config: GameConfig,
     logger: EventLogger,
     double_up_deposits: list[DoubleUpDeposit] | None = None,
+    type_c_records: list[dict[str, Any]] | None = None,
 ) -> tuple[
     dict[str, PlayerState],
     list[Contract],
@@ -242,6 +243,11 @@ def execute_settlement(
         double_up_deposits: 倍掛け預託リスト（v0.8 D2）。dep.success_round == round_num の
             ものをここで解決する。要素は同一オブジェクトを直接ミューテートする
             （game.py の self.double_up_deposits と共有される前提）。省略時は倍掛け処理なし。
+        type_c_records: 型C（条件付き金銭契約, v0.10）の評価結果を追記する出力用リスト。
+            double_up_deposits と同じ「共有ミューテーション」慣習——呼び出し元が
+            空リストを渡せば各要素dictを追記する。Noneなら記録しない
+            （返り値のtupleは6要素のまま変更しない）。config.type_c_enabled=False
+            なら型C関連処理は一切実行されず、既存ログ・戻り値と完全に一致する。
 
     Returns:
         (更新されたplayers, 更新されたcontracts, 更新されたbounties,
@@ -251,6 +257,45 @@ def execute_settlement(
     # Settlement全体で蓄積する脱落者セット
     eliminated_this_settlement: set[str] = set()
     carryovers: dict[str, int] = {}
+
+    # v0.10: 型C（条件付き金銭契約）候補の事前取得。
+    # 義務者が過去ラウンドで既に脱落済みの義務は is_expired=True 済みのため
+    # get_active_type_c_obligations が自然に除外する
+    # （§2.1「決済ラウンドに義務者が既に脱落」＝判定自体が行われない）。
+    # config.type_c_enabled=False の場合は空リストのまま＝以降の型C処理は完全に無効。
+    type_c_candidates: list[Obligation] = []
+    if config.type_c_enabled:
+        type_c_candidates = contract_ops.get_active_type_c_obligations(contracts, round_num)
+    type_c_results: dict[str, tuple[bool, str]] = {}
+    market_results_by_id: dict[str, MarketResult] = {}
+    surged_by_market: dict[str, bool] = {}
+
+    def _log_type_c_evaluated(ob: "Obligation", step: int, fired: bool, reason: str) -> None:
+        result = "fired" if fired else "not_fired"
+        logger.log("TYPE_C_EVALUATED", round_num, "settlement", step=step, data={
+            "contract_id": ob.contract_id,
+            "obligation_id": ob.obligation_id,
+            "condition_type": ob.details.get("condition_type"),
+            "result": result,
+            "reason": reason,
+            "obligor": ob.obligor,
+            "counterparty": ob.counterparty,
+            "amount": ob.details.get("amount", 0),
+            "condition": ob.details.get("condition", {}),
+        })
+        if type_c_records is not None:
+            type_c_records.append({
+                "round": round_num,
+                "contract_id": ob.contract_id,
+                "obligation_id": ob.obligation_id,
+                "condition_type": ob.details.get("condition_type"),
+                "result": result,
+                "reason": reason,
+                "obligor": ob.obligor,
+                "counterparty": ob.counterparty,
+                "amount": ob.details.get("amount", 0),
+                "condition": ob.details.get("condition", {}),
+            })
 
     # =========================================================================
     # Step 1: Reveal — 全市場の参加者・使用カードを公開
@@ -289,6 +334,10 @@ def execute_settlement(
         is_surge = _should_surge(len(mc), alive_count, config)
         result = market_ops.resolve_market(market, mc, config.entry_fee, surge=is_surge)
         market_results.append(result)
+        # v0.10: 型C market_winner/market_surge 判定用（MarketResult.surgedは
+        # 0参加者時に欠落するため、ここで確定するローカルの is_surge を真値とする）
+        market_results_by_id[market.market_id] = result
+        surged_by_market[market.market_id] = is_surge
 
         if not result.winners:
             # 参加者0: キャリーオーバー（§4.7）
@@ -317,6 +366,25 @@ def execute_settlement(
             "carryover": carryovers.get(market.market_id, 0),
             "surged": is_surge,
         })
+
+    # v0.10: 型C — market_winner / market_surge 条件の判定
+    # （市場の勝者確定・高騰判定の直後、§3 論理Step2/3）
+    if type_c_candidates:
+        for ob in type_c_candidates:
+            condition_type = ob.details.get("condition_type")
+            if condition_type not in (
+                ConditionType.MARKET_WINNER.value, ConditionType.MARKET_SURGE.value,
+            ):
+                continue
+            fired, reason = contract_ops.evaluate_type_c_condition(
+                ob,
+                market_results=market_results_by_id,
+                surged_by_market=surged_by_market,
+                eliminated_player_ids=eliminated_this_settlement,
+                players=players,
+            )
+            type_c_results[ob.obligation_id] = (fired, reason)
+            _log_type_c_evaluated(ob, step=2, fired=fired, reason=reason)
 
     # =========================================================================
     # Step 2.5: 倍掛け前ラウンド預託の解決（v0.8 D2）
@@ -350,6 +418,33 @@ def execute_settlement(
         contracts = elim_ops.expire_obligations_for_player(violator_id, contracts)
         eliminated_this_settlement.add(violator_id)
 
+    # v0.10: 型C — eliminated 条件の判定（型B監査完了の直後、§3 論理Step6）。
+    # ここで脱落確定した者（violators）は上の expire_obligations_for_player で
+    # 既に自身の型C義務（支払・受取とも）を失効済み——Step5のAtomic合流時に
+    # eliminated_this_settlement で二重に除外する
+    if type_c_candidates:
+        for ob in type_c_candidates:
+            if ob.details.get("condition_type") != ConditionType.ELIMINATED.value:
+                continue
+            fired, reason = contract_ops.evaluate_type_c_condition(
+                ob,
+                market_results=market_results_by_id,
+                surged_by_market=surged_by_market,
+                eliminated_player_ids=eliminated_this_settlement,
+                players=players,
+            )
+            type_c_results[ob.obligation_id] = (fired, reason)
+            _log_type_c_evaluated(ob, step=3, fired=fired, reason=reason)
+
+        # 3条件すべての判定が完了した時点で、不成立の型C義務を消滅させる
+        # （支払いなし・ペナルティなし・記録のみ。§1.3）
+        not_fired_ids = {
+            ob.obligation_id for ob in type_c_candidates
+            if not type_c_results.get(ob.obligation_id, (False, ""))[0]
+        }
+        if not_fired_ids:
+            contracts = contract_ops.expire_obligations(contracts, not_fired_ids)
+
     # =========================================================================
     # Step 4: 型A判定用スナップショット
     # =========================================================================
@@ -380,9 +475,21 @@ def execute_settlement(
         contracts, round_num, excluded_players=eliminated_this_settlement,
     )
 
-    if type_a_obs:
+    # v0.10: 発火した型C義務を義務者ごとに型Aと合算してAtomic判定に合流させる
+    # （§1.3・§3不変条件）。obligor/counterpartyのいずれかがこのSettlementで
+    # 既に脱落確定していれば除外する（既にexpire_obligations_for_playerで
+    # 失効済みのため、Atomicに乗せても意味がない）
+    fired_type_c_obs = [
+        ob for ob in type_c_candidates
+        if type_c_results.get(ob.obligation_id, (False, ""))[0]
+        and ob.obligor not in eliminated_this_settlement
+        and ob.counterparty not in eliminated_this_settlement
+    ]
+    atomic_obs = type_a_obs + fired_type_c_obs
+
+    if atomic_obs:
         updated_obs, failed_obligors, payments = contract_ops.execute_type_a_atomic(
-            type_a_obs, snapshots,
+            atomic_obs, snapshots,
         )
 
         # 義務のステータスを契約に反映

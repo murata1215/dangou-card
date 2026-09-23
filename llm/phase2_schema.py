@@ -24,7 +24,7 @@ _BOUNTY_TYPES = ["", "achievement", "event"]
 _CONDITION_TYPES = ["", "market_win_against", "same_market", "player_eliminated"]
 _TERM_KEYS = {"obligor", "counterparty", "ob_type", "round_num", "details"}
 _DETAIL_KEYS = {"amount", "market_id", "card_rank"}
-_OB_TYPES = {"type_a_payment", "type_b_market", "type_b_card", "type_b_no_market"}
+_OB_TYPES = {"type_a_payment", "type_b_market", "type_b_card", "type_b_no_market", "type_c_conditional"}
 
 
 def build_phase2_response_schema() -> dict[str, Any]:
@@ -50,7 +50,7 @@ def build_phase2_response_schema() -> dict[str, Any]:
         "properties": {
             "obligor": {"type": "string"},
             "counterparty": {"type": "string"},
-            "ob_type": {"type": "string", "enum": ["type_a_payment", "type_b_market", "type_b_card", "type_b_no_market"]},
+            "ob_type": {"type": "string", "enum": ["type_a_payment", "type_b_market", "type_b_card", "type_b_no_market", "type_c_conditional"]},
             "round_num": {"type": "integer"},
             "details": details,
         },

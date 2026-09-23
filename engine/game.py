@@ -163,6 +163,14 @@ class Game:
         # 全会一致に到達しない — この通知はその起床トリガ専用）。
         self._contract_notices: dict[str, list[dict]] = {}
 
+        # v0.10: 型C（条件付き金銭契約）の発火/不成立/失効通知を、判定が起きた
+        # Settlement Phaseから次のNegotiation Phaseへ持ち越すための一時バケット。
+        # _contract_notices は _phase_negotiation() の冒頭で毎ラウンドリセットされる
+        # （このコメントの直後の変数）ため、Settlement中にpushしても消えてしまう。
+        # ここに積んでおき、次ラウンドのリセット直後に _contract_notices へ移し替える。
+        # type_c_enabled=False なら常に空のまま（S1回帰に一切影響しない）。
+        self._pending_contract_notices: dict[str, list[dict]] = {}
+
         # POST_GAME_REFLECTION専用の神視点transcript。ラウンド跨ぎで消さない。
         # 【絶対条件】_visible_messages() / _build_visible_state() から一切参照しない。
         # CoT reasoning・Handover Memory と同格の構造的隔離対象（rules/project.md:45-59）。
@@ -173,6 +181,17 @@ class Game:
 
         # S2: 倍掛け預託リスト
         self.double_up_deposits: list[DoubleUpDeposit] = []
+
+        # v0.10サイクル10.2: 今ラウンドの資産首位（同率含む全員）のID一覧。
+        # Market Openで確定し、visible_state・プロンプトへ供給する。
+        # leader_announce_enabled=False なら常に空のまま（S1回帰に一切影響しない）。
+        self._current_leader_ids: list[str] = []
+
+        # v0.10サイクル10.3: 今ラウンドの生存者の自己順位（player_id -> AssetRank）。
+        # Market Openで確定し、以後同ラウンド内の全フェーズ（negotiation/commit/
+        # double_up/reflection）で使い回す（フェーズごとに再計算しない）。
+        # rank_notice_enabled=False なら常に空のまま。
+        self._current_rank_by_player: dict[str, player_ops.AssetRank] = {}
 
         # v0.8 E11: 直近Settlementで解決された倍掛け一覧（visible_state公開用の下地）
         self._last_double_ups_resolved: list[dict] = []
@@ -345,6 +364,45 @@ class Game:
             ],
         })
 
+        # v0.10サイクル10.2: 首位公示。安泰問題（誰にも気づかれず資産首位のまま
+        # 逃げ切れる）への最小対策として、資産が最大の生存者のIDのみを公示する。
+        # 資産額・順位・現金・借金は一切公示しない（data・プロンプト両方）。
+        # 同額の場合は該当者全員を公示する（実装の配列順で1名に絞らない）。
+        if self.config.leader_announce_enabled:
+            alive_players = {
+                pid: p for pid, p in self.players.items() if p.is_alive
+            }
+            assets_by_player = {
+                pid: player_ops.total_assets(p, self.double_up_deposits)
+                for pid, p in alive_players.items()
+            }
+            top_assets = max(assets_by_player.values())
+            self._current_leader_ids = sorted(
+                pid for pid, a in assets_by_player.items() if a == top_assets
+            )
+            self.logger.log("LEADER_ANNOUNCED", round_num, "market_open", data={
+                "round": round_num,
+                "player_ids": list(self._current_leader_ids),
+            })
+
+        # v0.10サイクル10.3: 自己順位通知。本人にだけ「4位 / 6人」の形で通知する
+        # （他プレイヤーの順位・資産額は一切通知しない）。首位公示と同一定義
+        # （total_assets）・同一時点（Market Open）で計算し、以後同ラウンド内の
+        # 全フェーズ（negotiation/commit/double_up/reflection）で使い回す。
+        if self.config.rank_notice_enabled:
+            self._current_rank_by_player = player_ops.assets_ranking(
+                self.players.values(), self.double_up_deposits,
+            )
+            for pid in sorted(self._current_rank_by_player):
+                r = self._current_rank_by_player[pid]
+                self.logger.log("RANK_NOTIFIED", round_num, "market_open", data={
+                    "round": round_num,
+                    "player_id": pid,
+                    "rank": r.rank,
+                    "tied": r.tied,
+                    "n_alive": r.n_alive,
+                })
+
     def _reset_round_message_state(self) -> None:
         """ラウンド開始時のメッセージ系stateリセット（Cycle 4）。
 
@@ -372,6 +430,14 @@ class Game:
         self._reset_round_message_state()  # ラウンド開始時にクリア（_round_messages / _anon_broadcast_owners を同時に）
         self._action_failures = {pid: [] for pid in self.players}
         self._contract_notices = {pid: [] for pid in self.players}
+
+        # v0.10: 前Settlementで積まれた型C通知（発火/不成立/失効）を今ラウンドへ繰り越す。
+        # 空なら何もしない（S1/type_c_enabled=False相当は完全にno-op）。
+        if self._pending_contract_notices:
+            for pid, notices in self._pending_contract_notices.items():
+                for notice in notices:
+                    self._push_contract_notice(pid, notice)
+            self._pending_contract_notices = {}
 
         alive_ids = [pid for pid, p in self.players.items() if p.is_alive]
 
@@ -501,6 +567,28 @@ class Game:
         bucket.append(dict(notice))
         if len(bucket) > self._CONTRACT_NOTICE_MAX:
             del bucket[: -self._CONTRACT_NOTICE_MAX]
+
+    def _queue_type_c_notices(self, type_c_records: list[dict[str, Any]]) -> None:
+        """v0.10: 型Cの評価結果を当事者（obligor・counterparty）へ次ラウンド通知として積む
+
+        Settlement Phase中に呼ばれるため、直接 self._contract_notices へは積まず
+        self._pending_contract_notices に積み、次のNegotiation Phase開始直後
+        （_phase_negotiation() のリセット直後）に繰り越す。
+        type_c_records が空（config.type_c_enabled=False）なら何もしない。
+        """
+        for rec in type_c_records:
+            kind = "type_c_fired" if rec["result"] == "fired" else "type_c_not_met"
+            notice = {
+                "turn": 0,
+                "kind": kind,
+                "contract_id": rec["contract_id"],
+                "obligation_id": rec["obligation_id"],
+                "condition_type": rec["condition_type"],
+                "amount": rec["amount"],
+            }
+            for pid in (rec["obligor"], rec["counterparty"]):
+                bucket = self._pending_contract_notices.setdefault(pid, [])
+                bucket.append(dict(notice))
 
     def _record_action_failure(
         self, pid: str, action: Action, reason: str | None,
@@ -1152,6 +1240,7 @@ class Game:
         今ラウンド勝者へのTAKE/DOUBLE提示（_process_double_up、旧Step2）のみを
         Settlement後に呼ぶ。
         """
+        type_c_records: list[dict[str, Any]] = []
         (
             self.players,
             self.contracts,
@@ -1169,7 +1258,13 @@ class Game:
             self.config,
             self.logger,
             double_up_deposits=self.double_up_deposits if self.config.double_up_enabled else None,
+            type_c_records=type_c_records,
         )
+
+        # v0.10: 型Cの発火/不成立を当事者へ次ラウンド通知として積む
+        # （type_c_enabled=Falseならtype_c_recordsは常に空でno-op）
+        if type_c_records:
+            self._queue_type_c_notices(type_c_records)
 
         # S2: 霧のラウンドで使用されたカードを記録
         if round_num in self.config.fog_rounds:
@@ -1677,6 +1772,7 @@ class Game:
             ObligationType.TYPE_B_MARKET: "B(市場指定)",
             ObligationType.TYPE_B_CARD: "B(カード指定)",
             ObligationType.TYPE_B_NO_MARKET: "B(市場禁止)",
+            ObligationType.TYPE_C_CONDITIONAL: "C(条件付き金銭)",
         }
         contract_ledger: list[str] = []
         violation_ledger: list[str] = []
@@ -1695,6 +1791,10 @@ class Game:
                     detail_label = str(ob.details.get("market_id", "?"))
                 elif ob.ob_type == ObligationType.TYPE_B_CARD:
                     detail_label = str(ob.details.get("rank") or ob.details.get("card_id") or "?")
+                elif ob.ob_type == ObligationType.TYPE_C_CONDITIONAL:
+                    amount = ob.details.get("amount")
+                    amount_label = f"{amount // 10_000}万円" if isinstance(amount, int) else "?"
+                    detail_label = f"{amount_label}({ob.details.get('condition_type', '?')})"
                 else:
                     detail_label = str(ob.details.get("market_id", "?"))
 
@@ -1702,8 +1802,16 @@ class Game:
                     status = f"－解除(R{contract.cancelled_round})"
                 elif ob.round_num > result.round_count:
                     status = "－未到達"
-                elif ob.ob_type == ObligationType.TYPE_A_PAYMENT:
-                    status = "✗不履行" if (ob.round_num, ob.obligor) in type_a_failed_pairs else "✓履行"
+                elif ob.ob_type in (
+                    ObligationType.TYPE_A_PAYMENT, ObligationType.TYPE_C_CONDITIONAL,
+                ):
+                    if (ob.round_num, ob.obligor) in type_a_failed_pairs:
+                        status = "✗不履行"
+                    elif ob.ob_type == ObligationType.TYPE_C_CONDITIONAL and ob.is_expired:
+                        # v0.10: 条件不成立による消滅（支払いなし・ペナルティなし）
+                        status = "－不成立"
+                    else:
+                        status = "✓履行"
                 else:
                     status = "✗違反" if ob.obligation_id in violated_obligation_ids else "✓履行"
 
@@ -1782,6 +1890,7 @@ class Game:
                 ObligationType.TYPE_B_MARKET: "型B(市場指定)",
                 ObligationType.TYPE_B_CARD: "型B(カード指定)",
                 ObligationType.TYPE_B_NO_MARKET: "型B(市場禁止)",
+                ObligationType.TYPE_C_CONDITIONAL: "型C(条件付き金銭)",
             }.get(ob.ob_type, str(ob.ob_type))
             parties_label = "・".join(contract.parties)
             revelations.append(
@@ -1813,7 +1922,9 @@ class Game:
                     ob for ob in ob_by_id.values()
                     if ob.obligor == obligor
                     and ob.round_num == event.round_num
-                    and ob.ob_type == ObligationType.TYPE_A_PAYMENT
+                    and ob.ob_type in (
+                        ObligationType.TYPE_A_PAYMENT, ObligationType.TYPE_C_CONDITIONAL,
+                    )
                     and ob.counterparty == pid
                 ]
                 if len(candidates) == 1:
@@ -2063,6 +2174,11 @@ class Game:
             ),
         }
 
+        # v0.10サイクル10.2: 首位公示。leader_announce_enabled=False では
+        # キー自体を追加しない（visible_stateの形状を旧挙動から一切変えない）。
+        if self.config.leader_announce_enabled:
+            state["leader_ids"] = list(self._current_leader_ids)
+
         # 当事者向け: 提案中の契約（当事者のみ閲覧可能）
         if for_player_id is not None:
             # v0.9: 交渉での支払可能額（config.free_cash_mode に依存）。
@@ -2072,6 +2188,20 @@ class Game:
                 state["spendable_cash"] = player_ops.spendable_cash(
                     me, self.config, at_settlement=False,
                 )
+
+            # v0.10サイクル10.3: 自己順位通知。本人ぶんだけ、この
+            # for_player_id is not None ブロック内でのみ追加する（公開stateには
+            # 絶対に出さない＝秘匿の中核）。rank_notice_enabled=False では
+            # キー自体を追加しない。_asdict() は使わず明示的にdict構築し、
+            # 将来AssetRankにフィールドを足しても自動でプロンプトへ漏れないようにする。
+            if self.config.rank_notice_enabled:
+                my_rank = self._current_rank_by_player.get(for_player_id)
+                if my_rank is not None:
+                    state["my_rank"] = {
+                        "rank": my_rank.rank,
+                        "tied": my_rank.tied,
+                        "n_alive": my_rank.n_alive,
+                    }
 
             state["contracts_pending"] = [
                 {

@@ -2,7 +2,7 @@
 ハイライトログ自動生成スクリプト
 
 イベントJSONL + LLMログから名場面を検出しMDレポートを生成する。
-14ルールのルールベース検出（LLM不使用）。
+16ルールのルールベース検出（LLM不使用）。
 
 使用方法:
     uv run python scripts/highlights.py --input-dir logs/llm/trial_A_20260809_175006/
@@ -22,6 +22,31 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 def _extract_market_mentions(text: str) -> list[str]:
     """テキストからM01〜M99の市場名を正規表現で抽出する"""
     return re.findall(r'M\d{2}', text)
+
+
+_CONDITION_TYPE_LABELS = {
+    "market_winner": "市場勝者",
+    "eliminated": "脱落",
+    "market_surge": "市場高騰",
+}
+
+
+def _fmt_type_c_condition(data: dict) -> str:
+    """TYPE_C_EVALUATEDイベントのdataから条件の要旨文字列を組み立てる
+    （llm/prompt_builder.py:_format_type_c_conditionと同趣旨。
+    こちらはObligation.detailsではなくイベントdata直下に
+    condition_type/conditionが載っている前提）。
+    """
+    condition_type = data.get("condition_type", "")
+    condition = data.get("condition") or {}
+    label = _CONDITION_TYPE_LABELS.get(condition_type, condition_type)
+    if condition_type == "market_winner":
+        return f'{label}({condition.get("market_id", "?")}の勝者が{condition.get("target_player", "?")})'
+    if condition_type == "eliminated":
+        return f'{label}({condition.get("target_player", "?")}が脱落)'
+    if condition_type == "market_surge":
+        return f'{label}({condition.get("market_id", "?")}が高騰)'
+    return label
 
 
 def _extract_card_mentions(text: str) -> list[str]:
@@ -208,6 +233,72 @@ def detect_highlights(
                     "round": e.get("round_num"), "player": data.get("player_id"),
                     "detail": f"{data.get('player_id')}: Cash={cash:,}円 ({'生還' if survived else '脱落'})",
                 })
+
+    # === H15: 型C発火 ===
+    # === H16: 型C起因の履行不能脱落 ===
+    # TYPE_A_FAILUREはpaidフィールドを持たないため、型C発火の有無だけでなく
+    # 同一(round, player)で実際にTYPE_A_FAILUREが起きたかで判定する
+    # （評価時点では型Cの発火が最終的な履行不能の原因かは確定しないため、
+    # 「型C発火 かつ 同ラウンド同プレイヤーのTYPE_A_FAILURE」を近似条件とする）。
+    type_a_failure_rounds_players: set[tuple[Any, str]] = set()
+    for e in events:
+        if e.get("event_type") == "TYPE_A_FAILURE":
+            data = e.get("data", {})
+            pid = data.get("player_id")
+            if pid:
+                type_a_failure_rounds_players.add((e.get("round_num"), pid))
+
+    for e in events:
+        if e.get("event_type") != "TYPE_C_EVALUATED":
+            continue
+        data = e.get("data", {})
+        if data.get("result") != "fired":
+            continue
+        rnd = e.get("round_num")
+        obligor = data.get("obligor", "?")
+        cond_text = _fmt_type_c_condition(data)
+        highlights.append({
+            "type": "H15", "label": "型C発火",
+            "round": rnd, "player": obligor,
+            "detail": (
+                f"{obligor}→{data.get('counterparty', '?')}: "
+                f"{data.get('amount', 0):,}円（{cond_text}）"
+            ),
+        })
+        if (rnd, obligor) in type_a_failure_rounds_players:
+            highlights.append({
+                "type": "H16", "label": "型C起因の履行不能脱落",
+                "round": rnd, "player": obligor,
+                "detail": (
+                    f"{obligor}が型C発火（{cond_text}）を含むAtomic決済で"
+                    f"履行不能となり脱落"
+                ),
+            })
+
+    # === H17: 首位交代（v0.10サイクル10.2） ===
+    # 前Rの首位「集合」と今Rの首位「集合」が異なるラウンドを検出する。
+    # 集合比較のため要素の並び順の違いは交代として検出しない（同率タイの
+    # 内部順序に依存させないため）。金額は出さない（IDのみ）。R1は比較対象が
+    # 無いため対象外（R1固有の例外処理ではなく、単に「前R」が存在しないだけ）。
+    leader_ids_by_round: dict[Any, set[str]] = {}
+    for e in events:
+        if e.get("event_type") == "LEADER_ANNOUNCED":
+            rnd = e.get("round_num")
+            leader_ids_by_round[rnd] = set(e.get("data", {}).get("player_ids", []))
+
+    prev_leader_ids: set[str] | None = None
+    for rnd in sorted(r for r in leader_ids_by_round if isinstance(r, int)):
+        cur_leader_ids = leader_ids_by_round[rnd]
+        if prev_leader_ids is not None and cur_leader_ids != prev_leader_ids:
+            highlights.append({
+                "type": "H17", "label": "首位交代",
+                "round": rnd, "player": ", ".join(sorted(cur_leader_ids)),
+                "detail": (
+                    f"首位が {', '.join(sorted(prev_leader_ids))} から "
+                    f"{', '.join(sorted(cur_leader_ids))} へ交代"
+                ),
+            })
+        prev_leader_ids = cur_leader_ids
 
     return highlights
 

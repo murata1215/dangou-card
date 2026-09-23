@@ -17,7 +17,7 @@ def test_root_serves_landing_page():
     body = r.text
     # LP 固有のマーカ
     assert "観戦する" in body
-    assert "敗者の手記を読む" in body
+    assert "AIたちの手記を読む" in body
     # 観戦導線とブログ導線
     assert 'href="watch"' in body
     assert "pixblog.net/u/uso8m" in body

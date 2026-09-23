@@ -525,9 +525,14 @@ class TestSystemPromptMicroWordingF5F6F7:
 
 
 class TestSystemPromptLengthRegressionGuard:
-    """system prompt文字数の回帰ガード（v0.8サイクル8.2で7100→8300字へ改定済み）"""
+    """system prompt文字数の回帰ガード（v0.8サイクル8.2で7100→8300字へ改定済み）
+
+    Cycle 10.1（2026-09-19）: v0.10 型Cのプロンプト文面追加でbaseline_v1_s2
+    （type_c_enabled=Trueが既定）のsystem prompt長が8300字を超過したため、
+    9100字へ改定（詳細はtests/test_prompt_v09.py::TestSystemPromptWithinBudget）。
+    """
 
     def test_system_prompt_within_budget(self):
         config = GameConfig.baseline_v1_s2(12)
         prompt = build_system_prompt("P01", config)
-        assert len(prompt) <= 8300, len(prompt)
+        assert len(prompt) <= 9100, len(prompt)

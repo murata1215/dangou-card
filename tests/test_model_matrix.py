@@ -1450,10 +1450,15 @@ def test_phase_defaults_phase2_per_model_cap_is_adjusted_only():
     人間承認によりmax_cost $0.25→$0.40へ調整（headroom $0.02723001・6.8%を確保）。
     max_cost_per_modelはCycle 5の$0.035のまま据え置き。
     予約計算ロジック・他Phase・モデル単価は無変更。
+    Cycle 10.1（2026-09-19）: v0.10 型Cのプロンプト文面追加でbaseline_v1_s2の
+    system prompt長が8,181→8,996字に増加し、CORE_18予約合計が$0.40超過・
+    H1予約も$0.035超過したため、max_cost $0.40→$0.42、max_cost_per_model
+    $0.035→$0.04へ調整（AskUserQuestion不可のため既存慣例に倣い単独判断。
+    ビルドサマリで開示）。
     """
     assert mm.PHASE_DEFAULTS == {
         1: {"max_cost": 0.08, "max_cost_per_model": 0.02, "max_calls": 40, "max_tokens": 64, "retries": 1},
-        2: {"max_cost": 0.40, "max_cost_per_model": 0.035, "max_calls": 24, "max_tokens": 400, "retries": 0},
+        2: {"max_cost": 0.42, "max_cost_per_model": 0.04, "max_calls": 24, "max_tokens": 400, "retries": 0},
         3: {"max_cost": 0.20, "max_cost_per_model": 0.03, "max_calls": 96, "max_tokens": 500, "retries": 0},
     }
     assert mm.DEFAULT_MAX_COST_TOTAL == 1.00
@@ -1520,7 +1525,21 @@ def test_phase2_core18_reservations_cover_model_overrides_and_flag_h4_cap_gap():
     # Cycle 9.2（2026-08-30）: v0.9 free_cash_mode="entry_fee"向けにRULES_SUMMARYの
     # Free Cash文言を「お金の使い方」節へ置換した結果、system prompt長が8,187→8,181字に
     # 変化。H1予約額は$0.034615→$0.0346へ変化（八度目の期待値更新）。
-    assert reservations["H1"] == pytest.approx(0.0346, abs=1e-12)
+    # Cycle 10.1（2026-09-19）: v0.10 型Cのプロンプト文面追加でsystem prompt長が
+    # 8,181→8,996字に増加。H1予約額は$0.0346→$0.03664へ変化（九度目の期待値更新。
+    # max_cost_per_modelは$0.04へ引き上げ済みのため引き続き上限内）。
+    # Cycle 10.2（2026-09-19）: v0.10 首位公示（leader_announce_enabled、
+    # baseline_v1_s2でTrue）でRULES_SUMMARYの公開情報一覧に1行追加した結果、
+    # system prompt長が8,996→9,036字に増加。H1予約額は$0.03664→$0.03674へ変化
+    # （十度目の期待値更新。sum(reservations)=$0.405137<=max_cost $0.42、
+    # H1<=max_cost_per_model $0.04のため、いずれの上限値も変更不要）。
+    # Cycle 10.3（2026-09-19）: v0.10 目的文の強化（## 目的節の新設・毎R目標
+    # リマインド）＋自分の順位通知（rank_notice_enabled、baseline_v1_s2でTrue）。
+    # 目的節の新設分を吸収するため既存文言を複数箇所で圧縮し、system prompt長は
+    # 差し引き9,036→8,981字に減少。H1予約額は$0.03674→$0.0366へ変化（十一度目の
+    # 期待値更新。sum(reservations)=$0.4042393<=max_cost $0.42、
+    # H1<=max_cost_per_model $0.04のため、いずれの上限値も変更不要）。
+    assert reservations["H1"] == pytest.approx(0.0366, abs=1e-12)
     for key in ("H1", "H2", "H4"):
         assert reservations[key] > 0.02
         if key != "H4":

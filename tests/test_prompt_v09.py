@@ -340,6 +340,17 @@ class TestG4ReflectionOutputInstruction:
 # =============================================================================
 
 class TestSystemPromptWithinBudget:
-    def test_system_prompt_within_budget(self):
-        prompt = build_system_prompt("P01", GameConfig.baseline_v1_s2(12))
+    def test_system_prompt_within_budget_type_c_off(self):
+        # v0.10 Cycle 10.1: baseline_v1_s2はtype_c_enabled=Trueが既定になったため、
+        # 「型C OFF」時の従来予算（8,300字）はtype_c_enabled=Falseへ明示的に
+        # 上書きしたconfigで検証する（回帰ガードの意味を維持）。
+        config = GameConfig.baseline_v1_s2(12).model_copy(update={"type_c_enabled": False})
+        prompt = build_system_prompt("P01", config)
         assert len(prompt) <= 8_300
+
+    def test_system_prompt_within_budget_type_c_on(self):
+        # v0.10 Cycle 10.1: type_c_enabled=True（baseline_v1_s2の既定）では
+        # TYPE_C_CONTRACT_RULES/TYPE_C_ACTION_TEMPLATEの追加分だけ長くなる。
+        # 実測8,996字に対しヘッドルームを持たせて9,100字を新上限とする。
+        prompt = build_system_prompt("P01", GameConfig.baseline_v1_s2(12))
+        assert len(prompt) <= 9_100

@@ -846,6 +846,55 @@ def parse_post_game_reflection(
     return _finalize(stripped, None, None, None, None, None, None, "ok_plaintext")
 
 
+def _validate_type_c_term_shape(i: int, term: dict) -> None:
+    """type_c_conditional termの形（details/condition の構造）のみを検証する
+
+    round_num範囲・market_id/target_playerの実在性チェックは、このparser層には
+    現在ラウンド・config・プレイヤー一覧の文脈が無いため行わない
+    （engine/actions.py の validate_type_c_details() が担当し、既存の
+    ACTION_ERROR経路で表面化する）。
+    """
+    details = term.get("details")
+    if not isinstance(details, dict):
+        raise ParseError(
+            f"terms[{i}]のdetailsが辞書ではありません",
+            'type_c_conditionalのdetailsは'
+            '{"amount": int, "condition_type": "market_winner|eliminated|market_surge", '
+            '"condition": {...}} の形式である必要があります'
+        )
+    amount = details.get("amount")
+    if not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0:
+        raise ParseError(
+            f"terms[{i}]のtype_c_conditional amountが不正: {amount!r}",
+            "amountは正の整数である必要があります"
+        )
+    condition_type = details.get("condition_type")
+    valid_condition_types = {"market_winner", "eliminated", "market_surge"}
+    if condition_type not in valid_condition_types:
+        raise ParseError(
+            f"terms[{i}]のcondition_typeが無効: {condition_type!r}",
+            f"有効なcondition_type: {', '.join(sorted(valid_condition_types))}"
+        )
+    condition = details.get("condition")
+    if not isinstance(condition, dict):
+        raise ParseError(
+            f"terms[{i}]のconditionが辞書ではありません",
+            "conditionは{market_id, target_player}等の辞書である必要があります"
+        )
+    if condition_type == "market_winner":
+        req = {"market_id", "target_player"}
+    elif condition_type == "eliminated":
+        req = {"target_player"}
+    else:  # market_surge
+        req = {"market_id"}
+    missing_cond = req - set(condition.keys())
+    if missing_cond:
+        raise ParseError(
+            f"terms[{i}]のconditionにキーが不足: {', '.join(sorted(missing_cond))}",
+            f"condition_type={condition_type}には{', '.join(sorted(req))}が必要です"
+        )
+
+
 def _convert_action(
     data: dict[str, Any], player_id: str, phase: str
 ) -> Action:
@@ -940,7 +989,10 @@ def _convert_action(
             )
         # 各termの必須キーを検証
         required_keys = {"obligor", "counterparty", "ob_type", "round_num"}
-        valid_ob_types = {"type_a_payment", "type_b_market", "type_b_card", "type_b_no_market"}
+        valid_ob_types = {
+            "type_a_payment", "type_b_market", "type_b_card", "type_b_no_market",
+            "type_c_conditional",
+        }
         for i, term in enumerate(terms):
             if not isinstance(term, dict):
                 raise ParseError(
@@ -961,6 +1013,8 @@ def _convert_action(
                     f"terms[{i}]のob_typeが無効: '{ob_type}'",
                     f"有効なob_type: {', '.join(sorted(valid_ob_types))}"
                 )
+            if ob_type == "type_c_conditional":
+                _validate_type_c_term_shape(i, term)
         return ContractProposeAction(
             player_id=player_id,
             with_players=with_players,

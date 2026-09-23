@@ -708,3 +708,52 @@ at_settlement)`に切り出した。
 `doc/devlog/2026-08-30_155134.md`（サイクル9.0の棚卸し）・
 `doc/devlog/2026-08-30_180634.md`（サイクル9.1の実装）・
 `doc/analysis/free_cash_mode_sim_20260830.md`（シミュレーション比較結果）。
+
+## 型C（条件付き金銭契約）は既存の型A決済へ変換し、専用の決済系を作らない（v0.10・サイクル10.1）
+
+正式契約に第3の義務種別「型C: 条件付き金銭義務」（`doc/uso8000000_dangou_card_spec_v0_10_typec.md`）
+を追加する際、専用の決済系・預託プール・エスクローは作らず、条件成立時に既存の型A支払義務へ
+変換して既存のAtomic判定（`engine/contracts.py`）に合流させる設計にした。条件語彙はv1として
+市場勝者／脱落／市場高騰の3種のみ（全て観測可能な事実、AIに裁定させない＝原則5）。
+
+ルール文面・プロンプト（`llm/prompt_builder.py`）では「賭け」「ベット」「予測」等の用途を
+示す語彙を意図的に排除し、この汎用部品を保険・成功報酬・利益分配・予測対決のどれに使うかは
+プレイヤーの発明に委ねる（原則6: 機能追加より自然発生する戦略を優先）。用途の計測自体が
+ベンチマークの一部という位置づけ。`GameConfig.type_c_enabled`（既定False、S2既定でTrue）で
+ON/OFF可能。
+
+## 資産首位公示・順位通知は「IDのみ」「本人限定」で非対称に開示する（v0.10・サイクル10.2/10.3）
+
+「安泰問題」（資産で抜け出したプレイヤーが誰にも気づかれず逃げ切れる）への対策として2種類の
+情報開示を追加したが、開示範囲を意図的に非対称にしている。
+
+- **首位公示**（`GameConfig.leader_announce_enabled`）: 各ラウンドのMarket Openで資産
+  （`engine.player.total_assets()` = 現金＋未解決倍掛け預託額−借金残高、`free_cash`と異なり
+  負値を表現できる）が最大の**生存者全員**（同率なら複数名）のIDを**全員に**公示する。
+  金額・順位・現金・借金額そのものは非公開のまま。脱落済みプレイヤーは対象外。
+- **順位通知**（`GameConfig.rank_notice_enabled`）: 同じくMarket Open時点の資産で競技順位
+  （`engine.player.assets_ranking()`、1,2,2,4方式・脱落者を順位・分母両方から除外）を計算し、
+  **本人にのみ**`4位/6人`（同率は`同率2位/6人`）の形で通知する。他人の順位を見る経路は
+  型として存在しない（`_render_rank_self_notice()`は`player_id`引数を取らない設計）。
+
+いずれも`LEADER_ANNOUNCED`/`RANK_NOTIFIED`イベントは公開されるデータ自体を最小限
+（`player_ids`のみ／`round,player_id,rank,tied,n_alive`のみ）に絞り、`viewer/`側もgod/public
+の表示境界を踏襲する（首位公示は公開情報なのでpublicでも表示、順位通知はgod限定）。
+system prompt文字数上限に収めるため、両フラグ導入時に既存文言を追加圧縮している
+（ロジック・数値は不変）。詳細: `doc/devlog/2026-09-19_122124.md`（首位公示）・
+`doc/devlog/2026-09-19_163758.md`（順位通知・目的文強化）。
+
+## Viewerの試合一覧は「本戦かテスト走行か」を`trial_manifest.json`の`stop_after_round`で判別する（サイクル10.19）
+
+観戦Viewer（`viewer/log_parser.py::list_games()`）で試合セレクタの表示順を「新しい順」から
+「本戦優先・その中で新しい順」に変える際、本戦／テスト走行の判別に`num_rounds`や
+イベントログの実際の到達ラウンド数は使えないと判明した。`num_rounds`は全trialで12固定であり、
+「到達ラウンド数」で判定すると予算切れ等で自然に途中終了した本戦（意図的な打ち切りではない）
+を誤ってテスト扱いしてしまう。
+
+唯一の信頼できる判別材料は`trial_manifest.json`の`stop_after_round`（`scripts/llm_trial.py`の
+`--stop-after-round`由来、設定時は`1 <= stop_after_round < num_rounds`を検証、意図的な
+段階停止＝テスト走行専用オプション）。値が設定されていれば確実にテスト走行、`None`なら
+（manifestが無い旧trialも含めて）本戦として扱う。今後、試合の性質（本戦/テスト）を
+コードで判別する必要が生じた場合はこのフィールドを再利用すること。
+詳細: `~/.claude/projects/-home-uso8m-dangou-card/memory/archive_worklog_2026-09.md` #20。

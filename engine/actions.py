@@ -19,7 +19,7 @@ from engine.models import (
 from engine.config import GameConfig
 from engine.contracts import (
     can_cancel_contract, normalize_type_b_card_details, validate_type_b_card_details,
-    is_card_tradable,
+    validate_type_c_details, is_card_tradable,
 )
 from engine import player as player_ops
 
@@ -195,6 +195,10 @@ def validate_action(
             elif ob_type == ObligationType.TYPE_B_CARD.value:
                 details = normalize_type_b_card_details(details)
                 error = validate_type_b_card_details(details)
+                if error is not None:
+                    return ActionResult(False, error)
+            elif ob_type == ObligationType.TYPE_C_CONDITIONAL.value and config.type_c_enabled:
+                error = validate_type_c_details(details, valid_market_ids, set(players.keys()))
                 if error is not None:
                     return ActionResult(False, error)
             else:

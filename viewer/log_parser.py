@@ -11,6 +11,7 @@
 import json
 import re
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -91,22 +92,51 @@ class LogCache:
 _cache = LogCache()
 
 
+def _game_sort_key(latest_ts: str, llm_files: list[Path]) -> float:
+    """試合の新しさを表す epoch 秒。timestamp優先、無ければファイルmtime。"""
+    if latest_ts:
+        try:
+            return datetime.fromisoformat(latest_ts).timestamp()
+        except ValueError:
+            pass
+    return max((f.stat().st_mtime for f in llm_files), default=0.0)
+
+
+def _read_trial_manifest(trial_dir: Path) -> dict[str, Any]:
+    """trial_manifest.json を読む。無い/壊れている場合は空dict。"""
+    manifest_path = trial_dir / "trial_manifest.json"
+    if not manifest_path.exists():
+        return {}
+    try:
+        return json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
 def list_games(logs_dir: Path) -> list[dict[str, Any]]:
     """
     logs/llm/ 配下のtrial_*ディレクトリからゲーム一覧を返す。
-    新しい順にソート。
+    本戦（stop_after_round未設定）を優先し、その中で最終LLM呼び出し時刻の
+    新しい順にソート（取得不能時はファイルmtime）。段階停止（テスト走行）は
+    末尾に回す。manifest が無い場合は本戦扱い。
     """
     games: list[dict[str, Any]] = []
+    scored: list[tuple[tuple[int, float], dict[str, Any]]] = []
     if not logs_dir.exists():
         return games
 
-    for trial_dir in sorted(logs_dir.iterdir(), reverse=True):
+    for trial_dir in sorted(logs_dir.iterdir()):
         if not trial_dir.is_dir() or not trial_dir.name.startswith("trial_"):
             continue
 
         llm_logs_dir = trial_dir / "llm_logs"
         if not llm_logs_dir.exists():
             continue
+
+        # trial単位: 段階停止（テスト走行）かどうかを manifest から判定
+        manifest = _read_trial_manifest(trial_dir)
+        stop_after_round = manifest.get("stop_after_round")
+        is_test = stop_after_round is not None
 
         # game単位でグループ化（game01_P01_llm_calls.jsonl → game01）
         game_ids: set[str] = set()
@@ -132,7 +162,8 @@ def list_games(logs_dir: Path) -> list[dict[str, Any]]:
             has_events = (trial_dir / f"{game_id}_events.jsonl").exists()
             has_seat_map = (trial_dir / f"{game_id}_seat_map.json").exists()
 
-            games.append({
+            sort_key = (0 if is_test else 1, _game_sort_key(latest_ts, llm_files))
+            scored.append((sort_key, {
                 "trial_dir": trial_dir.name,
                 "game_id": game_id,
                 "players": len(llm_files),
@@ -141,8 +172,12 @@ def list_games(logs_dir: Path) -> list[dict[str, Any]]:
                 "llm_log_count": len(llm_files),
                 "total_entries": total_entries,
                 "latest_timestamp": latest_ts,
-            })
+                "is_test": is_test,
+                "stop_after_round": stop_after_round,
+            }))
 
+    scored.sort(key=lambda kv: kv[0], reverse=True)
+    games = [g for _, g in scored]
     return games
 
 
@@ -1198,7 +1233,7 @@ def get_round_states(
             result["rounds"][rn] = {
                 "markets": [], "commits": [], "cash": {}, "holdings": {},
                 "contracts": [], "messages": visible_messages, "eliminated": [],
-                "final_reflections": [],
+                "final_reflections": [], "leader_ids": [], "ranks": {},
             }
         return result
 
@@ -1208,7 +1243,7 @@ def get_round_states(
             result["rounds"][rn] = {
                 "markets": [], "commits": [], "cash": {}, "holdings": {},
                 "contracts": [], "messages": [], "eliminated": [],
-                "final_reflections": [],
+                "final_reflections": [], "leader_ids": [], "ranks": {},
             }
         return result["rounds"][rn]
 
@@ -1307,6 +1342,25 @@ def get_round_states(
                     "winners": [],
                     "prize_per_winner": None,
                 })
+
+        elif et == "LEADER_ANNOUNCED":
+            # v0.10サイクル10.2: 首位公示。IDのみ（金額・順位は含まれない）。
+            # public/godでフィルタしない（RULES_SUMMARYの公開情報）。
+            rd = rnd(r)
+            rd["leader_ids"] = list(data.get("player_ids", []))
+
+        elif et == "RANK_NOTIFIED":
+            # v0.10サイクル10.3: 本人にだけ届いた秘匿情報なのでgod viewのみ。
+            # view判定をrnd(r)より前に行い、public経路には副作用を一切与えない。
+            if view == "god":
+                rd = rnd(r)
+                pid = data.get("player_id")
+                if pid:
+                    rd["ranks"][pid] = {
+                        "rank": data.get("rank"),
+                        "tied": bool(data.get("tied", False)),
+                        "n_alive": data.get("n_alive"),
+                    }
 
         elif et == "MARKET_RESULT":
             rd = rnd(r)
@@ -1437,7 +1491,7 @@ def get_round_states(
                     if pid not in c["cancel_requested_by"]:
                         c["cancel_requested_by"].append(pid)
 
-        elif et in {"TYPE_A_EXECUTION", "TYPE_A_FAILURE", "TYPE_B_VIOLATION", "AUTO_COMMIT", "AUTO_COMMIT_FAILURE"}:
+        elif et in {"TYPE_A_EXECUTION", "TYPE_A_FAILURE", "TYPE_B_VIOLATION", "AUTO_COMMIT", "AUTO_COMMIT_FAILURE", "TYPE_C_EVALUATED"}:
             rd = rnd(r)
             # すべての履行イベントにcontract_idがあるとは限らない。
             # obligation_id からの復元も含め、判明した場合だけ契約に紐付ける
@@ -1530,6 +1584,7 @@ def get_round_states(
                 "markets": [], "commits": [], "cash": {},
                 "holdings": {pid: list(FULL_DECK) for pid in players},
                 "contracts": [], "messages": [], "eliminated": [],
+                "leader_ids": [], "ranks": {},
             }
 
     return result
